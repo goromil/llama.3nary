@@ -28,6 +28,19 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+
+// POSIX setenv / unsetenv shims for MSVC
+#ifdef _WIN32
+#  include <cstdlib>
+static inline int shim_setenv(const char *name, const char *value, int /*overwrite*/) {
+    return _putenv_s(name, value);
+}
+static inline int shim_unsetenv(const char *name) {
+    return _putenv_s(name, "");
+}
+#  define setenv  shim_setenv
+#  define unsetenv shim_unsetenv
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

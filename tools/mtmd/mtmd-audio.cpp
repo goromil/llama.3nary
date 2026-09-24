@@ -1310,19 +1310,20 @@ bool mtmd_audio_preprocessor_parakeet::preprocess(const float * samples,
     const int n_threads = 4;
     std::vector<std::thread> workers(n_threads - 1);
     for (int iw = 0; iw < n_threads - 1; ++iw) {
-        workers[iw] = std::thread(
-            worker_thread, iw + 1,
-            window_func,
-            window_size,
-            std::cref(samples_padded),
-            samples_padded.size(),
-            frame_size,
-            frame_step,
-            n_threads,
-            params.n_fft_bins,
-            std::cref(cache),
-            std::ref(out_full)
-        );
+        workers[iw] = std::thread([this, iw, window_func, window_size, &samples_padded,
+            frame_size, frame_step, n_threads, n_fft_bins = params.n_fft_bins, &out_full]() {
+            worker_thread(iw + 1,
+                window_func,
+                window_size,
+                samples_padded,
+                (int)samples_padded.size(),
+                frame_size,
+                frame_step,
+                n_threads,
+                n_fft_bins,
+                cache,
+                out_full);
+        });
     }
 
     worker_thread(0,

@@ -153,3 +153,12 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local run helpers (kept locally, not published)
+
+run-llama*
+
+# Opencode / session artifacts
+
+/.opencode/
+session-ses_*.md
