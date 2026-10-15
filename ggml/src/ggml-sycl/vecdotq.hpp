@@ -984,7 +984,7 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
     return sum0 + sum1;
 }
 
-#define VDR_PQ2_0_Q8_1_MMVQ 1
+#define VDR_PQ2_0_Q8_1_MMVQ 4
 
 template <int vdr>
 static __dpct_inline__ float vec_dot_pq2_0_q8_1_impl(
@@ -1019,7 +1019,7 @@ vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
 
     const block_pq2_0 * bpq2_0 = (const block_pq2_0 *) vbq;
-    UNUSED(iqs);
+    (void)iqs;
 
     // PQ2_0: 32 bytes qs, 4 Q8_1 sub-blocks.
     // Sub-block k uses PQ2_0 bytes k*8..k*8+7 against Q8_1 values 0..31.
@@ -1031,8 +1031,8 @@ vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
 
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        pq2_0[k][0] = get_int_from_uint8(bpq2_0->qs, k * 8);
-        pq2_0[k][1] = get_int_from_uint8(bpq2_0->qs, k * 8 + 4);
+        pq2_0[k][0] = get_int_from_uint8(bpq2_0->qs, k * 2);
+        pq2_0[k][1] = get_int_from_uint8(bpq2_0->qs, k * 2 + 1);
     }
 
     // Q8_1: 8 int32 loads per sub-block = 32 int32 total
@@ -1047,7 +1047,9 @@ vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
     }
 
     float sum = 0.0f;
-    const float d2 = bpq2_0->d;
+    // Convert ggml_half (FP16 bit pattern) to float properly
+    const float d2 = sycl::vec<sycl::half, 1>(*(const sycl::half *)&bpq2_0->d)
+        .convert<float, sycl::rounding_mode::automatic>()[0];
 
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
