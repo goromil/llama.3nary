@@ -984,6 +984,100 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
     return sum0 + sum1;
 }
 
+#define VDR_PQ2_0_Q8_1_MMVQ 1
+
+template <int vdr>
+static __dpct_inline__ float vec_dot_pq2_0_q8_1_impl(
+    const int * v,
+    const int * u,
+    const float & d2,
+    const sycl::half2 & ds8) {
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (uint8_t) ((uint32_t) v[i] >> (8 * j));
+
+            int vi = 0;
+            vi |= (((q >> 0) & 0x3) & 0xFF) << 0;
+            vi |= (((q >> 2) & 0x3) & 0xFF) << 8;
+            vi |= (((q >> 4) & 0x3) & 0xFF) << 16;
+            vi |= (((q >> 6) & 0x3) & 0xFF) << 24;
+
+            sumi = dpct::dp4a(vi, u[4 * i + j], sumi);
+        }
+    }
+
+    const sycl::float2 ds8f = ds8.convert<float, sycl::rounding_mode::automatic>();
+    return d2 * (sumi * ds8f.x() - ((float) vdr / (float) QI_PQ2_0) * ds8f.y());
+}
+
+static __dpct_inline__ float
+vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+
+    const block_pq2_0 * bpq2_0 = (const block_pq2_0 *) vbq;
+    UNUSED(iqs);
+
+    // PQ2_0: 32 bytes qs, 4 Q8_1 sub-blocks.
+    // Sub-block k uses PQ2_0 bytes k*8..k*8+7 against Q8_1 values 0..31.
+    // Each PQ2_0 byte = 4 ternary values, paired with 4 Q8_1 values via dp4a.
+    // Load everything upfront for full coverage per call.
+
+    // PQ2_0: 8 int32 loads total (2 per sub-block, 4 bytes each = 8 bytes per sub-block)
+    int pq2_0[4][2];
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        pq2_0[k][0] = get_int_from_uint8(bpq2_0->qs, k * 8);
+        pq2_0[k][1] = get_int_from_uint8(bpq2_0->qs, k * 8 + 4);
+    }
+
+    // Q8_1: 8 int32 loads per sub-block = 32 int32 total
+    int q8_1[4][8];
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            q8_1[k][j] = get_int_from_int8_aligned(bq8_1[k].qs, j);
+        }
+    }
+
+    float sum = 0.0f;
+    const float d2 = bpq2_0->d;
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int sumi = 0;
+
+        // 8 PQ2_0 bytes per sub-block: 2 int32 loads x 4 bytes each.
+        // Each byte unpacks to 4 ternary values, dp4a'd against 4 Q8_1 values.
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t qs_byte = (uint8_t)((uint32_t)pq2_0[k][i] >> (8 * j));
+
+                int vi = 0;
+                vi |= ((qs_byte >> 0) & 0x3) << 0;
+                vi |= ((qs_byte >> 2) & 0x3) << 8;
+                vi |= ((qs_byte >> 4) & 0x3) << 16;
+                vi |= ((qs_byte >> 6) & 0x3) << 24;
+
+                sumi = dpct::dp4a(vi, q8_1[k][i * 4 + j], sumi);
+            }
+        }
+
+        const sycl::float2 ds8f = bq8_1[k].ds.convert<float, sycl::rounding_mode::automatic>();
+        sum += d2 * (sumi * ds8f.x() - ds8f.y());
+    }
+
+    return sum;
+}
+
 static __dpct_inline__ float
 vec_dot_q4_1_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {

@@ -45,9 +45,15 @@ struct cli_server {
 
         th = std::thread([this, server_params]() mutable {
             // argc / argv are only used in router mode, we can skip them for now
-            int res = llama_server(server_params, 0, nullptr);
-            if (res != 0) {
-                fprintf(stderr, "llama_server exited with code %d\n", res);
+            try {
+                int res = llama_server(server_params, 0, nullptr);
+                if (res != 0) {
+                    fprintf(stderr, "llama_server exited with code %d\n", res);
+                }
+            } catch (const std::exception & e) {
+                fprintf(stderr, "llama_server threw: %s\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "llama_server threw unknown exception\n");
             }
             is_alive.store(false, std::memory_order_release);
         });

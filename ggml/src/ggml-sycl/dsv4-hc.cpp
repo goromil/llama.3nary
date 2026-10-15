@@ -2,22 +2,29 @@
 #include "dsv4-hc.hpp"
 
 #include <cmath>
+#include <type_traits>
 
 static constexpr int DSV4_HC = 4;
 
+// tunable: one work-item per (embedding element, token)
+static constexpr int dsv4_hc_pre_block_size = 256;
+
+// gated: the weight is a per-element gate [n_embd, hc, n_tokens] passed through a sigmoid.
+// otherwise it is one weight per (stream, token).
+template <bool gated>
 static void dsv4_hc_pre_f32_sycl(
         const float * x, const float * weights, float * dst,
         int64_t n_embd, int64_t hc, int64_t n_tokens,
         int64_t sx0, int64_t sx1, int64_t sx2,
-        int64_t sw0, int64_t sw1,
+        int64_t sw0, int64_t sw1, int64_t sw2,
         int64_t sd0, int64_t sd1,
+        float scale,
         queue_ptr stream) {
     const int64_t nr = n_embd * n_tokens;
-    const int64_t block_size = 256;
-    const int64_t num_blocks = (nr + block_size - 1) / block_size;
+    const int64_t num_blocks = (nr + dsv4_hc_pre_block_size - 1) / dsv4_hc_pre_block_size;
 
     stream->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(num_blocks * block_size), sycl::range<1>(block_size)),
+        sycl::nd_range<1>(sycl::range<1>(num_blocks * dsv4_hc_pre_block_size), sycl::range<1>(dsv4_hc_pre_block_size)),
         [=](sycl::nd_item<1> item) {
             const int64_t ir = item.get_global_id(0);
             if (ir >= nr) {
@@ -27,14 +34,18 @@ static void dsv4_hc_pre_f32_sycl(
             const int64_t i0 = ir % n_embd;
             const int64_t it = ir / n_embd;
 
-            float sum = x[i0*sx0 + it*sx2] * weights[it*sw1];
+            float sum = x[i0*sx0 + it*sx2] * (gated ?
+                weights[it*sw2] / (1.0f + sycl::exp(-weights[it*sw2])) :
+                weights[it*sw1]);
             for (int64_t ih = 1; ih < hc; ++ih) {
                 const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
-                const float wv = weights[ih*sw0 + it*sw1];
+                const float wv = gated ?
+                    weights[ih*sw0 + it*sw2] / (1.0f + sycl::exp(-weights[ih*sw0 + it*sw2])) :
+                    weights[ih*sw0 + it*sw1];
                 sum += xv * wv;
             }
 
-            dst[i0*sd0 + it*sd1] = sum;
+            dst[i0*sd0 + it*sd1] = sum * scale;
         });
 }
 
@@ -189,15 +200,29 @@ void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     const int64_t hc       = x->ne[1];
     const int64_t n_tokens = x->ne[2];
 
+    const int gated = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(gated == 0 || gated == 1);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
     queue_ptr stream = ctx.stream();
 
-    dsv4_hc_pre_f32_sycl(
-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
-            n_embd, hc, n_tokens,
-            nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
-            nbw0 / sizeof(float), nbw1 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float),
-            stream);
+    if (gated) {
+        dsv4_hc_pre_f32_sycl<true>(
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+                n_embd, hc, n_tokens,
+                nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+                nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                nbd0 / sizeof(float), nbd1 / sizeof(float),
+                scale, stream);
+    } else {
+        dsv4_hc_pre_f32_sycl<false>(
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+                n_embd, hc, n_tokens,
+                nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+                nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                nbd0 / sizeof(float), nbd1 / sizeof(float),
+                scale, stream);
+    }
 }
 
 void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
