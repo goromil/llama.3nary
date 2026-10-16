@@ -102,6 +102,16 @@ static float ref_float_dot(const block_pq2_0* w, float wd2, const block_q8_1* y)
     return total;
 }
 
+// ---- dequantize stub (matches dequantize.hpp dequantize_pq2_0) -------------
+static void host_dequantize_pq2_0(const block_pq2_0* x, int iqs, float& vx, float& vy) {
+    const float d = half_to_float(x->d);
+    const int byte_idx = iqs / 4;
+    const int shift = (iqs % 4) * 2;
+    const uint8_t vui = x->qs[byte_idx];
+    vx = ((float)((vui >> shift) & 3) - 1.0f) * d;
+    vy = ((float)((vui >> (shift + 2)) & 3) - 1.0f) * d;
+}
+
 // ---- test helpers ----------------------------------------------------------
 static void fill_q8_1(block_q8_1* y, float d1, int8_t val) {
     float sumq = 32.0f * val;
@@ -225,6 +235,56 @@ int main(void) {
             checks++;
         }
         printf("T5: worst_rel=%.3e\n", worst_rel);
+    }
+
+    // Test 6: dequantize_pq2_0 -- all known patterns
+    {
+        block_pq2_0 w; memset(&w, 0, sizeof(w));
+        float wd = 1.5f;
+        w.d = float_to_half_bits(wd);
+        // qs pattern: valid ternary values 0,1,2 only
+        // byte 0 = 0x55 -> ternary 1,1,1,1 -> centered 0,0,0,0
+        // byte 1 = 0x84 -> ternary 2,0,1,1 -> centered +1,-1,0,0
+        w.qs[0] = 0x55; // ternary 1,1,1,1 -> centered 0,0,0,0
+        w.qs[1] = 0x84; // ternary 2,0,1,1 -> centered +1,-1,0,0
+        w.qs[2] = 0x00; // ternary 0,0,0,0 -> centered -1,-1,-1,-1
+        for (int i = 3; i < 32; ++i) w.qs[i] = 0xAA; // ternary 2,0,2,0 -> centered +1,-1,+1,-1
+
+        // Check all 64 values (128/2 = 64 calls to dequantize since qr=2)
+        int dq_checks = 0, dq_fails = 0;
+        for (int iq = 0; iq < 64; ++iq) {
+            float vx, vy;
+            host_dequantize_pq2_0(&w, iq, vx, vy);
+
+            // Reference: read trits directly
+            int byte_idx = iq / 4;
+            int shift = (iq % 4) * 2;
+            uint8_t vui = w.qs[byte_idx];
+            float rx = ((float)((vui >> shift) & 3) - 1.0f) * wd;
+            float ry = ((float)((vui >> (shift + 2)) & 3) - 1.0f) * wd;
+
+            checks += 2;
+            dq_checks += 2;
+            if (fabs(vx - rx) > 1e-5) { printf("T6 dq[%d] vx=%.4f ref=%.4f FAIL\n", iq, vx, rx); fails++; dq_fails++; }
+            if (fabs(vy - ry) > 1e-5) { printf("T6 dq[%d] vy=%.4f ref=%.4f FAIL\n", iq, vy, ry); fails++; dq_fails++; }
+        }
+
+        // Spot-check specific values
+        // byte 0 = 0x55, iqs=0 -> ternary 1,1 -> centered 0,0 -> expect 0,0
+        { float vx, vy; host_dequantize_pq2_0(&w, 0, vx, vy);
+          checks += 2; dq_checks += 2;
+          if (fabs(vx) > 1e-5 || fabs(vy) > 1e-5) { printf("T6[0] vx=%.4f vy=%.4f expect 0,0 FAIL\n", vx, vy); fails+=2; dq_fails+=2; } }
+        // byte 1 = 0x84 = 10000100 -> ternary 0,1,0,2 (bits 0-7) -> centered -1,0,-1,+1
+        // iqs=4: byte_idx=1, shift=0 -> reads bits 0-1 (0) and 2-3 (1) -> centered -1,0 -> -wd,0
+        { float vx, vy; host_dequantize_pq2_0(&w, 4, vx, vy);
+          checks += 2; dq_checks += 2;
+          if (fabs(vx - (-wd)) > 1e-5 || fabs(vy) > 1e-5) { printf("T6[4] vx=%.4f vy=%.4f expect %.1f,0 FAIL\n", vx, vy, -wd); fails+=2; dq_fails+=2; } }
+        // byte 2 = 0x00, iqs=8 -> ternary 0,0 -> centered -1,-1 -> expect -wd,-wd
+        { float vx, vy; host_dequantize_pq2_0(&w, 8, vx, vy);
+          checks += 2; dq_checks += 2;
+          if (fabs(vx - (-wd)) > 1e-5 || fabs(vy - (-wd)) > 1e-5) { printf("T6[8] vx=%.4f vy=%.4f expect %.1f,%.1f FAIL\n", vx, vy, -wd, -wd); fails+=2; dq_fails+=2; } }
+
+        printf("T6: dequantize %d checks, %d fails\n", dq_checks, dq_fails);
     }
 
     printf("\n%d checks, %ld fails\n", checks, fails);
