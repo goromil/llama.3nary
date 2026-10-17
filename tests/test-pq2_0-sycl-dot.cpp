@@ -287,6 +287,6 @@ int main(void) {
         printf("T6: dequantize %d checks, %d fails\n", dq_checks, dq_fails);
     }
 
-    printf("\n%d checks, %ld fails\n", checks, fails);
+    printf("\n%ld checks, %ld fails\n", checks, fails);
     return fails != 0;
 }

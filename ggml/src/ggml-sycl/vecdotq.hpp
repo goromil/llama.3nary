@@ -1063,6 +1063,62 @@ vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
     return sum;
 }
 
+#define VDR_PTQ1_0_Q8_1_MMVQ 4
+
+static __dpct_inline__ float
+vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+
+    const block_ptq1_0 * bptq1_0 = (const block_ptq1_0 *) vbq;
+    (void)iqs;
+
+    // decode the block trits into a local int8 array.
+    // Order and base-3 math match CPU dequantize_row_ptq1_0.
+    static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    static const size_t  stages[3] = {32, 16, 8};
+    int8_t q[QK_PTQ1_0];
+    int o = 0;
+    size_t j = 0;
+    for (size_t st = 0; st < 3; ++st) {
+        const size_t c = stages[st];
+        for (; j + c <= sizeof(bptq1_0->qs); j += c) {
+            for (size_t nn = 0; nn < 5; ++nn) {
+                for (size_t m = 0; m < c; ++m) {
+                    const uint8_t v = bptq1_0->qs[j + m] * pow3[nn];
+                    const int16_t xi = ((uint16_t) v * 3) >> 8;
+                    q[o++] = (int8_t) (xi - 1);
+                }
+            }
+        }
+    }
+    for (size_t nn = 0; nn < 4; ++nn) {
+        for (size_t h = 0; h < sizeof(bptq1_0->qh); ++h) {
+            const uint8_t v = bptq1_0->qh[h] * pow3[nn];
+            const int16_t xi = ((uint16_t) v * 3) >> 8;
+            q[o++] = (int8_t) (xi - 1);
+        }
+    }
+
+    // Convert ggml_half (FP16 bit pattern) to float properly
+    const float d0 = sycl::vec<sycl::half, 1>(*(const sycl::half *)&bptq1_0->d)
+        .convert<float, sycl::rounding_mode::automatic>()[0];
+
+    // Q8_1: 4 sub-blocks of 32, one ds scale per sub-block
+    float sumf = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+        const sycl::float2 ds8f = bq8_1[k].ds
+            .convert<float, sycl::rounding_mode::automatic>();
+        const float d1 = ds8f.x();
+        int32_t sumi = 0;
+        for (int b = 0; b < 32; ++b) {
+            sumi += (int32_t) q[k * 32 + b] * (int32_t) bq8_1[k].qs[b];
+        }
+        sumf += d1 * (float) sumi;
+    }
+
+    return d0 * sumf;
+}
+
 static __dpct_inline__ float
 vec_dot_q4_1_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
