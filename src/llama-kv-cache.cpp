@@ -1194,6 +1194,16 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+std::vector<std::pair<uint32_t, uint32_t>> llama_kv_cache::get_cell_usage() const {
+    std::vector<std::pair<uint32_t, uint32_t>> res;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        res.emplace_back(v_cells[s].get_used(), v_cells[s].size());
+    }
+
+    return res;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

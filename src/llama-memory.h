@@ -6,6 +6,8 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <utility>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -99,6 +101,10 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // per-stream used/total cell counts for cell-based memories
+    // empty for memory types without cells
+    virtual std::vector<std::pair<uint32_t, uint32_t>> get_cell_usage() const { return {}; }
 
     //
     // ops

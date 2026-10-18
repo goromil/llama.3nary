@@ -1987,6 +1987,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
 
+                    const auto cell_usage = memory->get_cell_usage();
+                    for (size_t i = 0; i < cell_usage.size(); i++) {
+                        LLAMA_LOG_WARN("%s: kv cache stream %zu: used = %u / %u\n", __func__, i, cell_usage[i].first, cell_usage[i].second);
+                    }
                     LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
 
                     return 1;

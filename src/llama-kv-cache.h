@@ -130,6 +130,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    std::vector<std::pair<uint32_t, uint32_t>> get_cell_usage() const override;
 
     void clear(bool data) override;
 

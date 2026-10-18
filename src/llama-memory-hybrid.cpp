@@ -135,6 +135,10 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+std::vector<std::pair<uint32_t, uint32_t>> llama_memory_hybrid::get_cell_usage() const {
+    return mem_attn->get_cell_usage();
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
