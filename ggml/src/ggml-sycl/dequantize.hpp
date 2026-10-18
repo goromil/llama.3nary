@@ -69,6 +69,41 @@ static __dpct_inline__ void dequantize_pq2_0(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+static __dpct_inline__ void dequantize_ptq1_0(const void *vx, const int64_t ib,
+                                              const int iqs, dfloat2 &v) {
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+
+    const dfloat d = x[ib].d;
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+
+    // base-3 trit decode, mirrors dequantize_row_ptq1_0 in ggml-quants.c:
+    // qs is read as a 16-byte then an 8-byte chunk (5 trits per byte, digit first),
+    // qh holds the last 8 trits at 4 per byte; the uint8_t wrap makes the decode
+    // bit-exact with the CPU ref
+    auto dequantize_one = [&](const int idx) -> dfloat {
+        const uint8_t * b;
+        int n;
+        if (idx < 80) {
+            b = &x[ib].qs[idx & 15];
+            n = idx >> 4;
+        } else if (idx < 120) {
+            const int t = idx - 80;
+            b = &x[ib].qs[16 + (t & 7)];
+            n = t >> 3;
+        } else {
+            const int t = idx - 120;
+            b = &x[ib].qh[t & 1];
+            n = t >> 1;
+        }
+        const uint8_t q = (uint8_t) (*b * pow3[n]);
+        const int xi = ((uint16_t) q * 3) >> 8;
+        return (dfloat) (xi - 1) * d;
+    };
+
+    v.x() = dequantize_one(iqs + 0);
+    v.y() = dequantize_one(iqs + 1);
+}
+
 static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
