@@ -3623,7 +3623,9 @@ private:
 
             // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
-                n_batch /= 2;
+                if (n_batch > 1) {
+                    n_batch /= 2;
+                }
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
