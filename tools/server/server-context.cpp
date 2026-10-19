@@ -1091,8 +1091,14 @@ private:
                 }
 
                 if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
-                    return false;
+                    if (has_draft) {
+                        SRV_ERR("%s", "failed to create MTP context\n");
+                        return false;
+                    }
+
+                    // spec_mtp reuses the target model: without the draft ctx the server can still serve the target
+                    SRV_WRN("%s\n", "failed to create MTP context, continuing without speculative decoding");
+                    spec_init.reset();
                 }
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;

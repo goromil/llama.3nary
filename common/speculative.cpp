@@ -2080,6 +2080,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
+        GGML_ASSERT(llama_n_batch(ctx_dft) >= llama_n_batch(ctx_tgt) &&
+                "MTP draft n_batch must be >= target n_batch");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
@@ -2126,7 +2128,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        char arch[64] = {0};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -3149,6 +3153,8 @@ common_speculative_init_result::common_speculative_init_result(
     }
 
     // the draft context holds as many tokens per sequence as the target context
+    // and must keep a n_batch of at least the target one: the MTP impl mirrors
+    // the whole target batch into the draft context in a single decode
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
