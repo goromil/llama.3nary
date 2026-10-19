@@ -2,6 +2,22 @@
 
 Each item: what / why / how / exit criteria / status.
 
+> PROJECT CLOSED 2026-10-19 by user decision: "everything is cleared and
+> fixed, all objectives have got met". Disposition of the remaining items:
+> - B3 CLOSED: leave the MTP ctx failure fatal on the has_draft path,
+>   no code change.
+> - B4 CLOSED as explained: the ggml.c:1661 assert is a pressure-dependent
+>   host-malloc OOM (F1), not a deterministic code path; the pinned reruns
+>   were not pursued.
+> - B5 PARKED: the only deferred action = copy 6 files build/bin ->
+>   C:\Users\admin\.local\3nary-sycl\ the next time 61850 stops (list in
+>   STATE.md). The service runs fine on the OLD binaries.
+> - B6/B7/B8/B10 PARKED: Part-3 trigger test, Option C preemption, PQ2_0
+>   sweep, SYCL docs. Restart from this library if needed.
+> - B9: this banner is the final accounting.
+> Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
+> detached launch, N7 repro args), FINDINGS.md for conclusions.
+
 ## B1. Commit+push the private/ knowledge library
 - what: `git add private/ && git commit && git push` (ONLY private/).
 - why: user wants the knowledge base in the private repo as a restart anchor.
@@ -34,7 +50,8 @@ Each item: what / why / how / exit criteria / status.
   presets pass a draft => failure stays fatal there (existing behavior,
   unchanged). Latent, not active: 61850 runs fine with MTP (~15.5 t/s).
   Recommendation given: leave fatal (fail loudly if an explicitly requested
-  draft model cannot load). Awaiting user OK to close; likely NO code change.
+  draft model cannot load). CLOSED 10-19: user confirmed, leave fatal,
+  NO code change.
 
 ## B4. Close the assert window (F1)
 - what: read common.cpp :1230-1460 + server-context.cpp :1030-1090 (DONE);

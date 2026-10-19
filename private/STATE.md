@@ -1,6 +1,8 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-19 (after 2-GPU finding + device-semantics verification).
+Last refresh: 2026-10-19. PROJECT CLOSED by user decision: "everything is
+cleared and fixed, all objectives have got met". See BACKLOG.md banner for
+the disposition of every item.
 
 ## Environment
 
@@ -30,15 +32,15 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
 
 ## Git
 
-- branch `main`, pushed HEAD: `0589b1e1a` (MTP 3-part fix),
+- branch `main`, pushed HEAD: `7faf42ec4` (private/ refresh: 2x B70 GPUs,
+  device index semantics, maxver rerun), `0589b1e1a` (MTP 3-part fix),
   `02af668bf` (private/ knowledge library), `355b4a2b3` (KV diagnostic),
-  `a3f36885c` (KV guard).
-- Working tree:
+  `a3f36885c` (KV guard), `033a6f0ad` (PTQ1_0 prefill), `bd993a9d7`
+  (PTQ1_0 SYCL kernel).
+- Working tree: clean except
   - user's file, do not touch: `tools/ui/src/lib/stores/models/index.svelte.ts`
   - untracked strays pending user delete decision:
     `test-pq2_0-sycl-dot.obj`, `tests/test-pq2_0-sycl-dot.exe`
-  - `private/` knowledge library: committed+pushed (keep fresh; 10-19
-    status refresh F1/F9/STATE/BACKLOG pending commit+push).
 - MTP fix: rebuilt after the \n edit (build exit 0, 10-19), committed+pushed.
 
 ## Binaries
