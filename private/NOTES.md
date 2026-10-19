@@ -144,6 +144,14 @@ block = 28 B;
 - 61850 service MTP long gen (task 42323, n_gen 3400+, router clock
   143+ min): tg 15.5-15.6 t/s = ~2.2x the non-MTP 6.90 t/s baseline.
   MTP confirmed working in the service.
+- 10-19 user refresh (supersedes the table for current comparisons):
+  Q6_K SYCL TG 13-18 t/s on this machine is the current reference.
+  User memory: PTQ1_0/PQ2_0 CUDA ternary on RTX 3090 at similar ctx:
+  TG well above 50, maybe 80 t/s. PTQ1_0 vs PQ2_0: no difference here.
+- 52510 ternary service (PTQ1_0, n_ctx_slot 131072, kv_unified, 4 slots):
+  pp ~300 t/s; tg 6.59 (55.7k ctx) -> 6.14 (62.4k) -> 7.07 -> 9.24 (30.0k
+  ctx). Trend tracks KV size (effective GB/s ~constant), not warmup.
+  See F14.
 
 ## N11. Key code locations (fork line numbers)
 
@@ -180,12 +188,30 @@ block = 28 B;
 - ggml/src/ggml.c: :1628-1674 ggml_init (ctx alloc :1642 unchecked,
   ggml_aligned_malloc + GGML_ASSERT(ctx->mem_buffer != NULL) :1661).
 - tools/server/server.cpp: :152-157 n_parallel auto => 4 + kv_unified.
+- ggml/src/ggml-sycl/vecdotq.hpp: :987 VDR_PQ2_0=4, :1018 vec_dot_pq2_0_
+  q8_1 (dp4a), :1066 VDR_PTQ1_0=4, :1068 vec_dot_ptq1_0_q8_1 (scalar trit
+  decode into local int8 q[128] + 128 scalar MACs = the slow path, F14).
+- ggml/src/ggml-sycl/mmvq.cpp: :141 mul_mat_vec_q (generic), :186
+  mul_mat_vec_q_ncols (re-runs vec_dot per column), :1401-1459 PTQ1_0
+  launchers + ncols switch, :2836-2842 MoE launchers.
+- ggml/src/ggml-cuda/vecdotq.cuh: :808 vec_dot_ptq1_0_q8_1_multi (byte-
+  parallel trit decode + dp4a, decodes x once for up to 3 columns),
+  :895 vec_dot_ptq1_0_q8_1, :955 vec_dot_pq2_0_q8_1.
+- ggml/src/ggml-cuda/mmvq.cu: :719-742 PTQ1_0 special dispatch (multi
+  ncols), :670-710 GB10-only prefetch path (not for B70).
+- server-context.cpp (slot scheduling, F11): :55 slot_state enum,
+  :2288-2324 slot admission + defer (:2297, waits indefinitely, no
+  eviction), :3590-3639 decode-fail path (errors+releases ALL processing
+  slots; TODO :3595), :1927-1935 send_error, :1580 try_clear_idle_slots,
+  :2326-2342 prompt_save/prompt_cache, :2490-2533 restore-slot path.
 
 ## N12. Git / repo state notes
 
-- Branch main; committed+pushed so far (this project, recent first):
-  355b4a2b3 (KV diagnostic), a3f36885c (KV guard), 033a6f0ad (PTQ1_0
-  prefill), bd993a9d7 (SYCL kernel), + PTQ1_0 decode port commit.
+- Branch main; committed+pushed (this project, recent first):
+  11c3d328a (closure docs), 7faf42ec4 (private/ refresh), 0589b1e1a (MTP
+  3-part fix), 02af668bf (private library), 355b4a2b3 (KV diagnostic),
+  a3f36885c (KV guard), 033a6f0ad (PTQ1_0 prefill), bd993a9d7 (SYCL
+  kernel).
 - Upstream ref for Part 1: d1a92352c "speculative : only gemma4-assistant
   shares the target KV cache" (NOT in fork history).
 - `private/` = this knowledge library; keep it committed+pushed.

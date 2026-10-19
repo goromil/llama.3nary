@@ -2,19 +2,20 @@
 
 Each item: what / why / how / exit criteria / status.
 
-> PROJECT CLOSED 2026-10-19 by user decision: "everything is cleared and
-> fixed, all objectives have got met". Disposition of the remaining items:
+> PROJECT CLOSED 2026-10-19 by user decision, then REOPENED the same day
+> (F5 status, F12 actions, F11 C1/C2 plan, ternary slowness -> F14).
+> Closure disposition of the original items (still valid):
 > - B3 CLOSED: leave the MTP ctx failure fatal on the has_draft path,
 >   no code change.
 > - B4 CLOSED as explained: the ggml.c:1661 assert is a pressure-dependent
 >   host-malloc OOM (F1), not a deterministic code path; the pinned reruns
 >   were not pursued.
-> - B5 PARKED: the only deferred action = copy 6 files build/bin ->
->   C:\Users\admin\.local\3nary-sycl\ the next time 61850 stops (list in
->   STATE.md). The service runs fine on the OLD binaries.
-> - B6/B7/B8/B10 PARKED: Part-3 trigger test, Option C preemption, PQ2_0
->   sweep, SYCL docs. Restart from this library if needed.
-> - B9: this banner is the final accounting.
+> - B5: the binary copy is DONE 10-19 (89/89 SHA256 match, see STATE.md);
+>   the rest of the free-VRAM suite PARKED (services now run the new
+>   binaries anyway).
+> - B6/B8/B10 PARKED: Part-3 trigger test, PQ2_0 sweep, SYCL docs.
+> - B9: this banner is the accounting.
+> B7 REOPENED with a ready plan (F11); B11 NEW (ternary kernel, F14).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args), FINDINGS.md for conclusions.
 
@@ -78,7 +79,8 @@ Each item: what / why / how / exit criteria / status.
   VRAM and the user controls it.
 - how: user stops 61850 -> PLAN.md step 7.
 - exit: all sub-steps green; service running new binaries.
-- status: BLOCKED.
+- status: PARKED 10-19 (sub-step d done: binaries deployed 89/89 SHA256
+  match; a/b/c/e/f not run - services run the new binaries anyway).
 
 ## B6. Part-3 fallback trigger test
 - what: prove the "continuing without speculative decoding" path once.
@@ -93,11 +95,13 @@ Each item: what / why / how / exit criteria / status.
 - what: vLLM-style preemption for the 4x-KV-overcommit scenario.
 - why: user values vLLM behavior; guard (a3f36885c) only prevents
   corruption, it does not give fairness under contention.
-- how: PLAN.md phase 2; locate slot state machine first (no
-  server-slot.cpp in fork; it is in server-context.cpp + server-*.h).
-  Upstream TODO server-context.cpp:3589-3590 = design reference.
+- how: PLAN.md phase 2; slot state machine LOCATED 10-19 (server-context.
+  cpp :55 enum, :2288-2324 admission+defer, :3590-3639 decode-fail);
+  upstream TODO server-context.cpp:3589-3590 = design reference; C0/C1/C2
+  plan in F11.
 - exit: C0 committed+pushed; C1 committed+pushed; C2 optional.
-- status: OPEN (after B4/B5).
+- status: OPEN (plan ready in F11; C0 = error only the failing slot on
+  the decode-fail path, C1 = preempt the largest-KV slot).
 
 ## B8. PQ2_0 ctx sweep (fit auto)
 - what: standalone PQ2_0 load WITHOUT -c (fit auto): read computed ctx +
@@ -122,3 +126,16 @@ Each item: what / why / how / exit criteria / status.
 - SYCL1 phantom confirmation - CLOSED 10-19: SYCL1 is a real second GPU
   (F9). Do not act on the old wording.
 - User's own config fix E (remove -c from preset) - NOT agent-tracked.
+
+## B11. PTQ1_0 SYCL kernel speedup (F14)
+- what: port the CUDA byte-parallel trit decode + dp4a accumulation into
+  SYCL vec_dot_ptq1_0_q8_1 (ggml-sycl/vecdotq.hpp:1068), plus a fused
+  multi-column variant for the _ncols path (mirror ggml-cuda/mmvq.cu:719).
+- why: PTQ1_0 TG 6-9 t/s vs Q6_K 13-18 t/s despite ~3.8x fewer weight
+  bytes; the kernel is ALU/latency bound (scalar base-3 decode into a
+  local int8 q[128], 128 scalar MACs, no dp4a).
+- how: F14 fix sketch; verify with the standalone pp/tg repro (N7)
+  before/after; keep the existing host unit test green.
+- exit: PTQ1_0 standalone tg128 materially above the 6.90 baseline
+  (target: close most of the per-byte gap to Q6_K); committed+pushed.
+- status: OPEN (plan only, code not written; needs user go-ahead).

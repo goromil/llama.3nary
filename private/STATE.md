@@ -1,8 +1,9 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-19. PROJECT CLOSED by user decision: "everything is
-cleared and fixed, all objectives have got met". See BACKLOG.md banner for
-the disposition of every item.
+Last refresh: 2026-10-19. CLOSED by user decision that day, then REOPENED
+the same day (F5 status, F12 actions, F11 C1/C2 plan, ternary slowness).
+New thread: F14 ternary kernel gap + B11 kernel rewrite plan.
+Service 52510 (ternary) switched back to UD-Q5_K_S by the user.
 
 ## Environment
 
@@ -19,11 +20,17 @@ the disposition of every item.
   workspace root `C:\Users\gorom\source\ai\llama.3nary` (same tree).
 - Macube: `C:\Users\gorom\source\macube\` (DO NOT EDIT its config files).
 
-## Services (macube) - ALIVE
+## Services (macube)
 
-| Port | Instance | PID | Notes |
-|---|---|---|---|
-| 61850 | Qwen3.8-27B-UD-Q5_K_S (target + mtp draft) | model 568492, router 421716 | ctx 131072, OLD install binary, both GPUs (by design). MTP healthy: long gen task 42323 n_gen 3400+, tg 15.5-15.6 t/s (~2.2x the non-MTP 6.90 baseline) at router clock 143+ min. DO NOT KILL. All VRAM-headroom tests need the user to stop this. |
+- 61850 (Qwen3.8-27B-UD-Q5_K_S + mtp draft, model 568492, router 421716) was
+  STOPPED by the user 10-19 (port down, PIDs gone). It was healthy right before:
+  MTP tg 15.5-15.6 t/s on task 42323 (~2.2x the non-MTP 6.90 baseline).
+  User runs it when wanted; do not pressure for it to stay up.
+- After the stop, install dir was deployed with the NEW binaries (see Binaries).
+- 52510 was Ternary-Bonsai-2-27B-PTQ1_0 (n_ctx_slot 131072, kv_unified,
+  4 slots); the user switched it BACK to UD-Q5_K_S 10-19. Ternary numbers
+  from its log are historical (N10): pp ~300 t/s, tg 6.59 -> 6.14 -> 7.07
+  -> 9.24 tracking KV size (F14). Do not touch; user manages it.
 
 DEAD instances (tracked, see FINDINGS.md F11/F12):
 - 58458 gemma-4-26B-A4B-it-UD-Q5_K_XL (MTP draft) - clean device KV OOM 960 MiB under 61850 pressure, status 1.
@@ -32,27 +39,27 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
 
 ## Git
 
-- branch `main`, pushed HEAD: `7faf42ec4` (private/ refresh: 2x B70 GPUs,
-  device index semantics, maxver rerun), `0589b1e1a` (MTP 3-part fix),
-  `02af668bf` (private/ knowledge library), `355b4a2b3` (KV diagnostic),
-  `a3f36885c` (KV guard), `033a6f0ad` (PTQ1_0 prefill), `bd993a9d7`
-  (PTQ1_0 SYCL kernel).
-- Working tree: clean except
-  - user's file, do not touch: `tools/ui/src/lib/stores/models/index.svelte.ts`
-  - untracked strays pending user delete decision:
-    `test-pq2_0-sycl-dot.obj`, `tests/test-pq2_0-sycl-dot.exe`
+- branch `main`, pushed HEAD: `11c3d328a` (project closure docs),
+  `7faf42ec4` (private/ refresh: 2x B70 GPUs, device index semantics,
+  maxver rerun), `0589b1e1a` (MTP 3-part fix), `02af668bf` (private/
+  knowledge library), `355b4a2b3` (KV diagnostic), `a3f36885c` (KV guard),
+  `033a6f0ad` (PTQ1_0 prefill), `bd993a9d7` (PTQ1_0 SYCL kernel).
+- Working tree: clean except user's file, do not touch:
+  `tools/ui/src/lib/stores/models/index.svelte.ts`.
+  Stray test artifacts (test-pq2_0-sycl-dot.obj/.exe) DELETED 10-19 on
+  user command.
 - MTP fix: rebuilt after the \n edit (build exit 0, 10-19), committed+pushed.
 
 ## Binaries
 
-- `build\bin`: 9:43 AM MTP build + pending \n edit rebuild.
-  `ggml.dll`, `ggml-base.dll`, `ggml-sycl.dll`, `ggml-cpu.dll`, `llama.dll`
-  hash-identical build\bin vs install; ONLY `llama-common.dll`,
-  `llama-server-impl.dll`, `llama-cli-impl.dll` differ. No PDBs anywhere.
-- install dir: OLD 2:17 AM binaries (what 61850/58458/58186 ran).
-  6 files to copy after 61850 is stopped by user:
-  llama.dll, llama-server-impl.dll, llama-server.exe,
-  llama-cli-impl.dll, llama-cli.exe, llama.exe.
+- `build\bin`: final MTP build (includes \n edit), 89 files.
+- install dir (`C:\Users\admin\.local\3nary-sycl\`): NEW binaries DEPLOYED
+  10-19 after user stopped 61850 (89/89 files, SHA256-verified:
+  llama.dll, llama-common.dll, llama-server-impl.dll, llama-server.exe,
+  llama-cli-impl.dll, llama-cli.exe, llama.exe all match build\bin; full
+  tree also matches). No PDBs anywhere.
+- Service restarts via macube will now run the MTP fix + KV guard + KV
+  diagnostic for the first time.
 
 ## Models
 
@@ -81,3 +88,12 @@ Macube logs:
   - 58458 spawn args: :4789-4873+
   - 58186 spawn args: :4857-4914, exit line :4915
 - `C:\Users\gorom\source\macube\logs\llama.log`: srv-target lines only.
+  52510 ternary run starts line 61815 (PTQ1_0, n_slots=4, n_ctx_slot
+  131072, kv_unified, pp ~300 t/s).
+
+## Next (10-19, after reopen)
+
+1. B11: PTQ1_0 SYCL vec_dot rewrite per the F14 fix sketch (needs user
+   go-ahead; verify with the standalone pp/tg repro before/after).
+2. B7: Option C C0 then C1 per the F11 plan (state machine located).
+3. F12: divergence hygiene per the F12 action list.

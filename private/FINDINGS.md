@@ -114,11 +114,11 @@ Fixed in fork: guard `a3f36885c` + diagnostic `355b4a2b3` (both
 slot/ring-neutral), committed+pushed.
 User's config fix E (remove `-c` from preset) is the user's own task.
 
-## F5. MTP OOM 3-part fix - applied, built, NOT committed
+## F5. MTP OOM 3-part fix - committed+pushed (0589b1e1a)
 
-[certain] All three edits are in the working tree (common/speculative.cpp,
-tools/server/server-context.cpp), build GREEN at 9:43 AM; one `\n` edit at
-server-context.cpp:1100 applied AFTER the build => REBUILD PENDING.
+[certain] All three edits (common/speculative.cpp,
+tools/server/server-context.cpp): rebuilt, committed+pushed as 0589b1e1a,
+deployed to the install dir 10-19.
 - Part 1 (speculative.cpp, old line ~2129): verbatim port of upstream
   d1a92352c "speculative : only gemma4-assistant shares the target KV cache":
   `char arch[64] = {0};` + `llama_model_meta_val_str(...,
@@ -247,9 +247,27 @@ reference; the context ladder is at :3584-3633. Plan:
   resource claim, retry the failing slot, abort the victim with an explicit
   "preempted" reason.
 - C2 (optional): silent resume of the preempted slot.
-[open] server-slot.cpp does NOT exist in this fork; the slot state machine +
-abort/response-stream plumbing lives in server-context.cpp + server-*.h and
-must be located before C0.
+[certain] Located 10-19 (no server-slot.cpp in fork; everything is in
+server-context.cpp): slot_state enum :55 (IDLE, WAIT_OTHER, STARTED,
+PROCESSING_PROMPT, DONE_PROMPT, GENERATING); slot admission :2288-2324
+(get_available_slot, no slot => queue_tasks.defer :2297 - the request waits
+indefinitely, there is NO eviction today); decode-fail path :3590-3639
+(currently errors + releases ALL processing slots; TODO :3595 says terminate
+only the largest); send_error :1927-1935; try_clear_idle_slots :1580;
+prompt_save/prompt_cache :2326-2342; restore-slot path :2490-2533.
+C1 (preempt, explicit reason): when a deferred task still cannot get a slot
+or llama_decode fails at :3594 (ret==1, KV full), pick the victim = the
+GENERATING slot with the largest KV claim, send_error(slot, "preempted")
+on its response stream, slot.release() + slot.prompt_clear() to free the
+ring cells, then re-run get_available_slot for the deferred task and launch
+it. The victim client gets an explicit error and re-sends its prompt.
+C2 (silent resume): instead of erroring the victim, prompt_save it into the
+existing prompt_cache (:2326), mark the slot preempted (new slot_state or
+flag), and after the preempting request finishes, re-inject the victim task
+into the queue: re-prefill from the prompt cache (or the restore-slot path
+:2533) and continue generation. The client sees a stall, not an error.
+Needs: task re-injection plumbing and re-attaching the client response
+stream (queue_results) to the resumed slot.
 
 ## F12. Fork vs upstream divergences (never mix mappings)
 
@@ -265,6 +283,17 @@ Fork llama-cli is a thin in-process-server wrapper: `-v` is a boolean, log
 level is `-lv N`.
 llama-gguf.exe crashes 0xC0000005 pre-output on the ternary gguf -
 tool-specific; do not trust llama-gguf here.
+Actions (10-19):
+- This section is the never-mix list: any upstream patch that touches
+  GGML_TYPE_* values, ggml-quants.c block layouts, or server code that
+  assumes the upstream type table is a NO-GO until re-audited against the
+  enum table above.
+- Prefer per-feature merges over a whole-history rebase: the fork is far
+  behind, and a bulk rebase would drag in exactly the enum/layout changes
+  above.
+- After every upstream sync: re-verify the enum table + the MTP draft
+  quant list, and re-run the ternary E2E repro (N7) before trusting the
+  result.
 
 ## F13. Pre-existing / environmental issues (do not chase, note in report)
 
@@ -277,3 +306,42 @@ tool-specific; do not trust llama-gguf here.
 - nvidia-smi exists but fails with a permission error (Intel box, irrelevant).
 - This session's own local model is Qwen3.8-27B-UD-Q5_K_S (same family as
   the test model) - never confuse session logs with service logs.
+
+## F14. Ternary (PTQ1_0) SYCL kernel gap vs CUDA - root cause located
+
+[certain] The 52510 service tg trend (6.14 t/s at 62.4k ctx tokens ->
+9.24 t/s at 30.0k) is KV-size driven, not warmup: the effective read
+bandwidth comes out ~constant for both tasks. Decode reads weights + KV
+once per step; the KV read grows with context.
+[certain] Weight-byte math: PTQ1_0 ~1.75 bpw ~ 5.9 GB of 27B quantized
+weights (+ F16/F32 norms/embd/head). Q6_K ~6.6 bpw ~ 22 GB. If both were
+bandwidth-bound, PTQ1_0 should be ~3-4x FASTER than Q6_K, not slower.
+[certain] Observed: Q6_K 13-18 t/s (user, 10-19) = ~37-52% of the 768 GB/s
+peak; PTQ1_0 6-9 t/s = ~8-15%. The PTQ1_0 kernel is ALU/latency bound,
+not bandwidth bound.
+[certain] Kernel diff, per 128-weight block per output column (read both,
+10-19):
+- CUDA (ggml-cuda/vecdotq.cuh:808 vec_dot_ptq1_0_q8_1_multi): byte-
+  parallel carry-safe trit decode (4 lanes packed in one int32: x3 +
+  0x00FF00FF mask, 5 iters/byte, vsub4 -> {-1,0,+1}) fused into dp4a
+  accumulation (32 dp4a per block). No local trit array.
+- SYCL (ggml-sycl/vecdotq.hpp:1068 vec_dot_ptq1_0_q8_1): scalar base-3
+  decode per trit (pow3 table, uint8*3, uint16*3>>8) materialized into a
+  local int8_t q[128] (128 B/thread, spill-prone), then 128 scalar int32
+  MACs against scalar-loaded q8_1 bytes (128 byte loads, no dp4a).
+- Multi-column: CUDA decodes the x block ONCE and dots up to 3 y columns
+  (ggml-cuda/mmvq.cu:719-742); SYCL mul_mat_vec_q_ncols (mmvq.cpp:186)
+  re-runs the full vec_dot, including the whole decode, per column.
+- PQ2_0: SYCL already uses dp4a; only gap is the 2-bit->int8 expand
+  (shifts+ORs vs CUDA __byte_perm) - small.
+- Not applicable to B70: CUDA GB10 prefetch path (mmvq.cu:670-710,
+  GB10-only) and Hopper sm_90a wgmma prefill (3090 is sm_86).
+[high] The 3090 CUDA ternary number (50-80 t/s, user memory) is the same
+generic MMVQ + the fast vec_dot; 768 vs 936 GB/s peak cannot explain a
+7-10x gap, so the SYCL vec_dot rewrite is the expected fix, not a
+hardware limitation.
+Fix sketch (plan, not written): port the CUDA _multi approach into
+vecdotq.hpp - packed-lane x3/mask trit decode + dpct::dp4a, drop the
+local q[128]; add a multi-column variant and special-case PTQ1_0 in
+mul_mat_vec_q_ncols (mirror mmvq.cu:719). Verify: standalone pp/tg
+before/after (N7) + existing host unit test. See B11.
