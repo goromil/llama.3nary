@@ -29,12 +29,39 @@ malloc failure, NOT a device OOM.
   it reached fit and died later at the real KV device alloc (1536 MiB).
   So the trigger correlates with the draft+spec code path inside the window.
 
-[open] What exactly in the window calls ggml_init with a failing host alloc?
-NEXT: read common.cpp ~:1230-1460 (common_init_from_params / common_init_
-entry + the two "failed to create context" sites :1398/:1449) and
-server-context.cpp :1030-1090 (spec params setup). Also rerun repro with
-`--fit off` to exculpate/confirm the fit path, and with max verbosity to see
-the last lines before the assert.
+[certain] Window narrowed (10-19, common.cpp:1230-1464 +
+server-context.cpp:1030-1139 now READ):
+- server-context.cpp:1047-1049 progress callback attach, :1051
+  `llama_init = common_init_from_params(params_base);`
+- common.cpp common_init_result ctor: :1292-1293 mparams/cparams
+  conversion (pure), :1295 `if (params.fit_params)`, :1296 "fitting params
+  to device memory ..." is COM_TRC (NOT INFO - hidden at -lv 3), :1304
+  common_base_params_to_speculative (pure), :1311-1316 extra-model struct,
+  :1318 common_fit_params, :1327+ real model load.
+- fit.cpp:262 "getting device memory data for initial parameters:" is
+  LOG_TRC (hidden at -lv 3).
+- So at -lv 3 NOTHING inside the fit path prints before the first
+  llama_model_loader INFO "loaded meta data ..." line. The 8-line assert
+  log has none of those => the assert fired during/around fit's FIRST
+  metadata load + measurement-ctx creation (the only ggml_init in the
+  window), i.e. a host malloc failure inside fit measurement - but see the
+  max-verbosity rerun below: same config survived fit and hung later.
+[high] 10-19 max-verbosity rerun (mtp-server-98304-maxver-err.log,
+122504 lines, rebuilt binary, warm page cache): NO assert. Fit ran ~37 ngl
+iterations in ~1.6 s (warm cache; cold it took 28.32 s), then the process
+HUNG 118 s at `sched_reserve: reserving ...` inside fit's FINAL
+measurement ctx (candidate "offloaded 18/66 layers to GPU", tail layers
+61-65 assigned to SYCL1, recurrent RS buffers CPU 1795 MiB + SYCL1
+598 MiB). Killed at the 120 s timeout.
+=> Under 61850 pressure the draft+spec 98304 config fails DIFFERENTLY per
+run (host malloc assert vs allocation stall): pressure-dependent OOM, NOT
+a deterministic code path. Which failure appears depends on timing and on
+which physical GPU receives the tail layers (F9: no pin was active in any
+run so far).
+[open] Remaining experiments: rerun with real pin `-dev SYCL0` (a) under
+pressure, (b) on free VRAM after user stops 61850, (c) `--fit off`
+variant. If (b) loads clean => pressure theory confirmed, assert = host
+commit exhaustion under dual-GPU scatter.
 
 ## F2. Fit loop runs even with explicit -c (28.32 s, 56 iterations)
 
@@ -164,17 +191,40 @@ real KV alloc (1536 MiB), fit completed first in 28.32 s.
 => The assert exists WITHOUT the MTP edits; it is a pre-existing fork
 defect in the draft+spec window (F1).
 
-## F9. SYCL topology: two SYCL devices visible, use ONLY device 0
+## F9. SYCL topology: TWO PHYSICAL Arc Pro B70 GPUs (corrected 10-19)
 
-[high] common_params_print_info device_info lists SYCL0 AND SYCL1, both
-"Intel(R) Arc(TM) Pro B70 Graphics (31906 MiB)" (free: 8776 / 684 MiB at
-that moment, under 61850 pressure) + CPU (Ryzen 5950X, 65445 MiB).
-SYCL1 having only 684 MiB free makes no sense for a second physical card
-(someone would have to hold ~31 GB) => same physical GPU enumerated twice
-or a partition. Fit saw nd=2 (id=0 = pinned SYCL0, id=1 = CPU with
---numa distribute). Always pin GGML_SYCL_DEVICE=0.
-[open] Confirm whether SYCL1 is a real separate resource (e.g. sycl-ls) -
-low priority, do not touch it.
+[certain] The machine has TWO physical Intel Arc Pro B70 32 GB GPUs,
+enumerated SYCL0 and SYCL1, plus CPU. Proof: at the same instant the free
+MiB differ (10626 vs 1051, maxver log L4-L5) - a duplicated enumeration of
+one card would show equal free values. Under 61850 they hold ~21 GB +
+~31 GB = ~52 GB in use total, impossible on a single 32 GB card.
+61850 (no pin in its preset) spreads its model across BOTH GPUs.
+The earlier "SYCL1 is a phantom" theory is WRONG.
+[certain] GGML_SYCL_DEVICE is NOT read by this fork: the full SYCL env
+list (ggml-sycl.cpp:313-342: GGML_SYCL_DEBUG, _ENABLE_OPT, _ENABLE_GRAPH,
+_DNN, _FA_ONEDNN, _ENABLE_VMM, _FUSION, _ESIMD, _USM_SYSTEM, _MEMTRACE,
+... ) has no device selector. Every earlier `$env:GGML_SYCL_DEVICE='0'`
+was a NO-OP (it is the user's own shell variable, used with -mg; the fork
+code itself never looks at it).
+[certain] Verified device-selection semantics (10-19, user pointed out
+the index distinction - CONFIRMED):
+- `-mg/--main-gpu N` (env LLAMA_ARG_MAIN_GPU): index into the prepared
+  GPU-ONLY device list (CPU is explicitly skipped, llama.cpp:224-227),
+  and it only applies with `--split-mode none` (llama.cpp:288-299).
+  So -mg 0 = SYCL0, -mg 1 = SYCL1 - a different index space than raw
+  backend indices (which include CPU).
+- `-dev/--device` (arg.cpp:2727, parse_device_list arg.cpp:1116-1136):
+  takes device NAMES (ggml_backend_dev_by_name, e.g. "SYCL0"), not
+  indices, and rejects CPU entries.
+- Default split_mode = LLAMA_SPLIT_MODE_LAYER (common.h:476) and the
+  61850 preset passes neither -dev nor -mg => both GPUs stay in the
+  device list and layers scatter across them (this is BY DESIGN for
+  61850, and it is why our repro runs landed tail layers on SYCL1).
+- Real pin options: `-dev SYCL0`, or `--split-mode none -mg 0`, or
+  ONEAPI_DEVICE_SELECTOR=level_zero:0 (oneAPI runtime filter).
+[open] Our repro runs scattered tail layers (61-65) onto the nearly full
+SYCL1 (1051 MiB free) and stalled there (F1 rerun). Rerun repros with a
+real pin (`-dev SYCL0`) to isolate single-GPU behavior.
 
 ## F10. Ternary standalone E2E - PASS (closed)
 

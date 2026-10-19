@@ -1,15 +1,16 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-19, macube router clock ~103 min at last check.
+Last refresh: 2026-10-19 (after 2-GPU finding + device-semantics verification).
 
 ## Environment
 
 - Machine: Windows, AMD Ryzen 9 5950X 16C, 64 GB RAM.
-- GPU: Intel Arc Pro B70 32 GB. Usable VRAM ~29.3-29.5 GiB.
-- SYCL device_info shows TWO entries: SYCL0 (31906 MiB) and SYCL1 (31906 MiB,
-  684 MiB free at last check) plus CPU. SYCL1 is almost certainly the same
-  physical GPU enumerated twice (or a partition) - never select it.
-  Always: `$env:GGML_SYCL_DEVICE = '0'`.
+- GPU: TWO physical Intel Arc Pro B70 32 GB GPUs (SYCL0 + SYCL1) + 64 GB RAM.
+  61850 spreads across both (~21 GB + ~31 GB in use at last check).
+  GGML_SYCL_DEVICE is a NO-OP in this fork (user's shell var used with -mg;
+  fork never reads it). Verified pin options (F9): `-dev SYCL0` (name-based)
+  or `--split-mode none -mg 0` (-mg is a GPU-only index, CPU excluded).
+  Default split mode = layer => both GPUs used (61850 runs that way on purpose).
 - Build tree: `build/` (Ninja, Release, shared libs, tests ON).
 - Install tree (macube services run from here): `C:\Users\admin\.local\3nary-sycl\`.
 - Workspace: working dir `C:\Users\admin\source\ai\llama.3nary`,
@@ -20,7 +21,7 @@ Last refresh: 2026-10-19, macube router clock ~103 min at last check.
 
 | Port | Instance | PID | Notes |
 |---|---|---|---|
-| 61850 | Qwen3.8-27B-UD-Q5_K_S (target + mtp draft) | model 568492, router 421716 | ctx 131072, OLD install binary. MTP healthy (task 12627, tg 19.70 t/s). DO NOT KILL. All VRAM-headroom tests need the user to stop this. |
+| 61850 | Qwen3.8-27B-UD-Q5_K_S (target + mtp draft) | model 568492, router 421716 | ctx 131072, OLD install binary, both GPUs (by design). MTP healthy: long gen task 42323 n_gen 3400+, tg 15.5-15.6 t/s (~2.2x the non-MTP 6.90 baseline) at router clock 143+ min. DO NOT KILL. All VRAM-headroom tests need the user to stop this. |
 
 DEAD instances (tracked, see FINDINGS.md F11/F12):
 - 58458 gemma-4-26B-A4B-it-UD-Q5_K_XL (MTP draft) - clean device KV OOM 960 MiB under 61850 pressure, status 1.
@@ -29,15 +30,16 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
 
 ## Git
 
-- branch `main`, last pushed HEAD: `355b4a2b3` (KV guard + diagnostic).
-- Working tree (at snapshot time):
-  - EDITED, uncommitted: `common/speculative.cpp` + `tools/server/server-context.cpp`
-    = MTP 3-part fix (all applied, built OK at 9:43 AM, then ONE `\n` edit at
-    server-context.cpp:1100 AFTER the build => rebuild pending).
+- branch `main`, pushed HEAD: `0589b1e1a` (MTP 3-part fix),
+  `02af668bf` (private/ knowledge library), `355b4a2b3` (KV diagnostic),
+  `a3f36885c` (KV guard).
+- Working tree:
   - user's file, do not touch: `tools/ui/src/lib/stores/models/index.svelte.ts`
   - untracked strays pending user delete decision:
     `test-pq2_0-sycl-dot.obj`, `tests/test-pq2_0-sycl-dot.exe`
-  - NEW: `private/` knowledge library (this folder) - to be committed+pushed.
+  - `private/` knowledge library: committed+pushed (keep fresh; 10-19
+    status refresh F1/F9/STATE/BACKLOG pending commit+push).
+- MTP fix: rebuilt after the \n edit (build exit 0, 10-19), committed+pushed.
 
 ## Binaries
 
@@ -66,6 +68,7 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
 | mtp-server-98304.log | 8-line assert repro (build\bin, draft+spec, -lv 3). Ends at "loading model", then ggml.c:1661 assert. |
 | install-server-98304.log | same assert, install-dir binary + --numa distribute. |
 | mtp-server-verbose.log | 9.7 MB, NO-draft run at max verbosity (2147483647). :21 loading model, :22 local path, :23 fitting params, :2442 "no change", :135601 fit done 28.32 s, :137874 SYCL-MEMTRACE 1536 MiB FAILED (final real KV OOM). |
+| mtp-server-98304-maxver-err.log | 122504 lines, draft+spec max-verbosity rerun (10-19, warm cache). NO assert. Fit ~37 iters in ~1.6 s, then HUNG 118 s at sched_reserve in fit's final measurement ctx (tail layers 61-65 on SYCL1). Killed at 120 s. See F1. |
 | ternary-d-err.log | 27 lines, full ternary standalone E2E (PASS). |
 
 Macube logs:

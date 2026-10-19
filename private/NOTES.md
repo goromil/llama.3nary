@@ -9,8 +9,12 @@
   spawned is fine.
 - No changes to macube service files (services.json, presets). Reading OK.
 - `llama-api-keys.txt` untouched.
-- All SYCL binaries need oneAPI setvars first (N2) and
-  `$env:GGML_SYCL_DEVICE = '0'`. Never use SYCL1 (F9). No device split.
+- All SYCL binaries need oneAPI setvars first (N2).
+- MACHINE HAS 2 PHYSICAL Arc Pro B70 GPUs (F9). GGML_SYCL_DEVICE is a
+  NO-OP in this fork (user's shell var, used with -mg; fork never reads
+  it). To pin one card: `-dev SYCL0` (name-based) or
+  `--split-mode none -mg 0`. Default (layer split) scatters across both
+  GPUs - that is how 61850 is intended to run, leave it alone.
 - Small changes, ASCII only (no emdash, no unicode arrows in code/commits).
 - Commit trailer: `Assisted-by: Claude, Qwen3.8-27B`.
 - No tests/* additions, no PRs, no reviewer replies (private fork).
@@ -26,7 +30,7 @@ cmd /c """C:\Program Files (x86)\Intel\oneAPI\setvars.bat"" intel64 && set" |
   ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') {
     [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
   } }
-$env:GGML_SYCL_DEVICE = '0'
+# no $env:GGML_SYCL_DEVICE - not read by this fork (F9). Pin via -dev SYCL0.
 ```
 
 ## N3. Build recipe
@@ -137,6 +141,9 @@ block = 28 B;
 
 - Ternary under 61850 pressure: pp 10.18 / tg 3.59 t/s (still serves).
 - 61850 service MTP: tg 19.70 t/s (task 12627, healthy).
+- 61850 service MTP long gen (task 42323, n_gen 3400+, router clock
+  143+ min): tg 15.5-15.6 t/s = ~2.2x the non-MTP 6.90 t/s baseline.
+  MTP confirmed working in the service.
 
 ## N11. Key code locations (fork line numbers)
 
@@ -145,10 +152,18 @@ block = 28 B;
   :1072 `if (has_spec)`, :1093-1102 Part-3 fallback, :1104-1105
   `params_base.speculative.draft.ctx_dft = ctx_dft;`, :3584-3633 context
   ladder, :3589-3590 upstream TODO (preemption design ref).
-- common/common.cpp: :397 common_params_print_info def; :1230-1460
-  UNREAD (common_init_from_params/common_init_ entry, "fitting params"
-  site ~:1295-1322, "failed to create context" sites :1398 + :1449);
-  :1398/:1449 semantics still to read.
+- common/common.cpp: :397 common_params_print_info def; :1230-1464 READ
+  10-19 (common_init_result ctor :1290+: fit gate :1295, "fitting params"
+  COM_TRC :1296, common_fit_params call :1318, real load :1327+).
+- src/llama.cpp: :157-312 llama_prepare_model_devices (-dev list as-is
+  :159-183; default selection skips CPU :224-227, RPC+GPU list :274-284;
+  single-GPU mode `-mg` branch :288-299, GPU-only index).
+- common/arg.cpp: :1116-1136 parse_device_list (NAMES via
+  ggml_backend_dev_by_name, CPU rejected); :1138 common_print_available_
+  devices; :2727 -dev/--device; :2842 -mg/--main-gpu (env
+  LLAMA_ARG_MAIN_GPU); :4150 draft -dev.
+- common/common.h: :467 main_gpu default 0; :476 split_mode default
+  LLAMA_SPLIT_MODE_LAYER.
 - common/fit.cpp: :29-148 common_get_device_memory_data_impl (model
   no_alloc+NONE :55-57, ctx from *cparams :65); :178 common_params_fit_
   impl; :270-277 n_ctx_auto block; :453-455 explicit -c "no change";

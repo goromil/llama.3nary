@@ -4,14 +4,9 @@ Status markers: [x] done, [ ] open, [B] blocked on user.
 
 ## IMMEDIATE NEXT STEPS (fresh session starts here)
 
-1. [ ] COMMIT+PUSH `private/` knowledge library (ASCII message, trailer
-   `Assisted-by: Claude, Qwen3.8-27B`). `git add private/` ONLY (working
-   tree also has the MTP edits + user's svelte file - do not touch those).
-2. [ ] REBUILD (one \n edit at server-context.cpp:1100 pending):
-   setvars recipe (NOTES.md N2) + `cmake --build . -j 24` in build/.
-   Expect exit 1 at pre-existing test-dspark-forward LNK2019 only.
-3. [ ] COMMIT+PUSH the MTP 3-part fix (2 files: common/speculative.cpp,
-   tools/server/server-context.cpp). ASCII, concise, trailer.
+DONE 10-19: 1. private/ pushed (02af668bf). 2. rebuild after \n edit
+green. 3. MTP fix pushed (0589b1e1a). Fresh session continues at step 4.
+
 4. [ ] TELL USER: Part-3 fallback gap - Qwen3.8 AND gemma-4 presets have
    has_draft=true, so MTP ctx failure stays fatal in service runs. Offer to
    extend the fallback to the has_draft case.
