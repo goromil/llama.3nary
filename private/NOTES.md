@@ -133,12 +133,16 @@ block = 28 B;
 
 | Model | ngl | pp512 | tg128 |
 |---|---|---|---|
-| PTQ1_0 SYCL | 99 | 296.39 | 6.90 |
+| PTQ1_0 SYCL (B11 kernel) | 99 | 293.75 | 26.72 |
+| PTQ1_0 SYCL (old scalar) | 99 | 296.39 | 6.90 |
 | PTQ1_0 SYCL | 0 | 223.60 | 0.45 |
 | PQ2_0 SYCL | 99 | 237.13 | 5.40 |
 | PQ2_0 SYCL | 0 | 208.62 | 0.98 |
 | Q6_K SYCL | 0 | 141.48 | 1.58 |
 
+- 10-20 B11 (commit 5b80a3bb1): PTQ1_0 SYCL ngl 99 standalone tg128
+  6.90 -> 26.72 t/s (3.9x); pp512 unchanged (293.75). Current PTQ1_0
+  reference; the old scalar-kernel row is historical. F14 resolved.
 - Ternary under 61850 pressure: pp 10.18 / tg 3.59 t/s (still serves).
 - 61850 service MTP: tg 19.70 t/s (task 12627, healthy).
 - 61850 service MTP long gen (task 42323, n_gen 3400+, router clock
@@ -189,11 +193,16 @@ block = 28 B;
   ggml_aligned_malloc + GGML_ASSERT(ctx->mem_buffer != NULL) :1661).
 - tools/server/server.cpp: :152-157 n_parallel auto => 4 + kv_unified.
 - ggml/src/ggml-sycl/vecdotq.hpp: :987 VDR_PQ2_0=4, :1018 vec_dot_pq2_0_
-  q8_1 (dp4a), :1066 VDR_PTQ1_0=4, :1068 vec_dot_ptq1_0_q8_1 (scalar trit
-  decode into local int8 q[128] + 128 scalar MACs = the slow path, F14).
+  q8_1 (dp4a), :1066 VDR_PTQ1_0=4, :1075 vec_dot_ptq1_0_q8_1_multi
+  (byte-parallel carry-safe trit decode + dp4a, x decoded once for up to
+  3 y columns; B11 port of CUDA :808, F14), :1175 vec_dot_ptq1_0_q8_1
+  (wrapper -> _multi<1>).
 - ggml/src/ggml-sycl/mmvq.cpp: :141 mul_mat_vec_q (generic), :186
-  mul_mat_vec_q_ncols (re-runs vec_dot per column), :1401-1459 PTQ1_0
-  launchers + ncols switch, :2836-2842 MoE launchers.
+  mul_mat_vec_q_ncols (re-runs vec_dot per column), :1401 PTQ1_0 single-
+  col launcher, :1423 PTQ1_0 fused multi-column kernel (x decoded once,
+  up to 3 y cols), :1481 fused launcher, :1502 generic ncols launcher,
+  :1523-1537 ncols switch (2-3 fused, 4-8 generic, 1 single),
+  :2781-2788 dispatch, :2923 MoE launcher.
 - ggml/src/ggml-cuda/vecdotq.cuh: :808 vec_dot_ptq1_0_q8_1_multi (byte-
   parallel trit decode + dp4a, decodes x once for up to 3 columns),
   :895 vec_dot_ptq1_0_q8_1, :955 vec_dot_pq2_0_q8_1.
@@ -208,18 +217,26 @@ block = 28 B;
 ## N12. Git / repo state notes
 
 - Branch main; committed+pushed (this project, recent first):
-  11c3d328a (closure docs), 7faf42ec4 (private/ refresh), 0589b1e1a (MTP
-  3-part fix), 02af668bf (private library), 355b4a2b3 (KV diagnostic),
-  a3f36885c (KV guard), 033a6f0ad (PTQ1_0 prefill), bd993a9d7 (SYCL
-  kernel).
+  5b80a3bb1 (PTQ1_0 SYCL byte-parallel kernel, B11), e844b224a (private
+  library reopen), 11c3d328a (closure docs), 7faf42ec4 (private/
+  refresh), 0589b1e1a (MTP 3-part fix), 02af668bf (private library),
+  355b4a2b3 (KV diagnostic), a3f36885c (KV guard), 033a6f0ad (PTQ1_0
+  prefill), bd993a9d7 (SYCL kernel).
 - Upstream ref for Part 1: d1a92352c "speculative : only gemma4-assistant
   shares the target KV cache" (NOT in fork history).
 - `private/` = this knowledge library; keep it committed+pushed.
 
 ## N13. Working assumptions to re-verify after compaction
 
-- 61850 still alive (was at snapshot time). Check ports before any
-  VRAM work: `Get-NetTCPConnection -LocalPort 61850 -State Listen`.
-- build\bin is one \n-edit behind source (rebuild, PLAN step 2).
-- Install dir still has OLD binaries (copy after 61850 stop, PLAN step 7d).
+- No llama service listening as of 10-20 03:40 (61850 stopped by user
+  10-19; 52510 down too). Check ports before any VRAM work:
+  `Get-NetTCPConnection -LocalPort 61850,52510 -State Listen`.
+- build\bin is CURRENT (10-20 03:20 B11 build): byte-parallel PTQ1_0
+  kernel + all 10-19 fixes.
+- Install dir (C:\Users\admin\.local\3nary-sycl\) is BEHIND build\bin by
+  the B11 commit (5b80a3bb1): it has the 10-19 build (MTP fix + KV guard
+  + PTQ1_0 prefill), NOT the B11 kernel. Copy build\bin when the user
+  restarts a service (user manages services).
 - $env:TEMP\opencode\ logs persist on disk (re-read, don't assume memory).
+  B11 logs: ptq10-b11-bench.log, ptq10-e2e2.log (+ .comp-sycl.txt /
+  .comp-cpu.txt).

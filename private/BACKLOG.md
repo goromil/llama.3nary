@@ -15,7 +15,8 @@ Each item: what / why / how / exit criteria / status.
 >   binaries anyway).
 > - B6/B8/B10 PARKED: Part-3 trigger test, PQ2_0 sweep, SYCL docs.
 > - B9: this banner is the accounting.
-> B7 REOPENED with a ready plan (F11); B11 NEW (ternary kernel, F14).
+> B11 DONE 10-20 (5b80a3bb1: PTQ1_0 tg128 6.90 -> 26.72 t/s, F14
+> resolved); B7 REOPENED with a ready plan (F11).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args), FINDINGS.md for conclusions.
 
@@ -138,4 +139,10 @@ Each item: what / why / how / exit criteria / status.
   before/after; keep the existing host unit test green.
 - exit: PTQ1_0 standalone tg128 materially above the 6.90 baseline
   (target: close most of the per-byte gap to Q6_K); committed+pushed.
-- status: OPEN (plan only, code not written; needs user go-ahead).
+- status: DONE 10-20 (commit 5b80a3bb1, pushed). CUDA byte-parallel
+  decode + fused multi-column dot ported (vecdotq.hpp:1075/:1175,
+  mmvq.cpp:1423-1537). Standalone tg128 6.90 -> 26.72 t/s (3.9x), pp512
+  unchanged (293.75). Host tests T1-T5 + element map + cuda-dot: 0
+  mismatches; deterministic SYCL vs CPU completion text-identical.
+  Test-only store-index bug found+fixed in lockstep (F14 debugging
+  note).

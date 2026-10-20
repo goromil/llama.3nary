@@ -345,3 +345,34 @@ vecdotq.hpp - packed-lane x3/mask trit decode + dpct::dp4a, drop the
 local q[128]; add a multi-column variant and special-case PTQ1_0 in
 mul_mat_vec_q_ncols (mirror mmvq.cu:719). Verify: standalone pp/tg
 before/after (N7) + existing host unit test. See B11.
+
+RESOLVED 10-20 (B11, commit 5b80a3bb1):
+[certain] The sketch was ported as written:
+- vecdotq.hpp:1075 vec_dot_ptq1_0_q8_1_multi<ncols_dst>: byte-parallel
+  carry-safe trit decode of the packed 16-bit lanes (x3 + 0x00FF00FF
+  mask, no cross-lane carry) fused into dpct::dp4a; x decoded ONCE per
+  block for up to 3 y columns; local q[128] gone. :1175 vec_dot_ptq1_0_
+  q8_1 = wrapper to _multi<1>.
+- mmvq.cpp:1423 fused kernel (row check, i stride WARP_SIZE, per-column
+  xor reduce, literal iqs 0) + :1481 launcher; :1523-1537 switch:
+  cases 2-3 fused, 4-8 generic, 1 single (mirrors mmvq.cu:719-742).
+[certain] Result, standalone (no service pressure, ngl 99, t 56, b/ub
+  6144, ctk/ctv q8_0, fa on): tg128 6.90 -> 26.72 t/s (3.9x); pp512
+  296.39 -> 293.75 (unchanged, prefill path untouched). New tg128 is
+  ~1.7-2x the Q6_K 13-18 t/s reference with ~3.8x fewer weight bytes.
+[certain] Verification: host dot test T1-T5 (1029385 checks) + element
+  map (2560000 positions) + cuda-dot exact int checks: 0 mismatches.
+  Deterministic SYCL vs CPU 192-token completion: TEXT IDENTICAL,
+  answers correct (temp 0, seed 42).
+Debugging note (do not re-derive):
+[certain] The early T1/T2 host-test failures were a TEST-ONLY store-
+  index bug in the test kernel_decode: out[120 + t + l] with t in {0,2}
+  made the t=2 group write 122..125 (overwrote 122/123, never wrote
+  126/127) - fixed to out[120 + 2*t + l] in test-ptq1_0-sycl-dot.cpp.
+  The DEVICE KERNEL WAS CORRECT FROM THE START: it stores nothing
+  (dp4a accumulation), which is exactly why T3/T4/T5 passed while T1
+  failed. The stale-exe hypothesis was DISPROVEN - the binary was always
+  faithful to the source.
+[certain] sim_qh.py (Python emulation) is BUGGY (unbounded shifts,
+  broken sign-fill, print mismatch); use the compiled C sim
+  (sim_qh.cpp, icx) for C-arithmetic emulation of the trit decode.

@@ -1,9 +1,11 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-19. CLOSED by user decision that day, then REOPENED
-the same day (F5 status, F12 actions, F11 C1/C2 plan, ternary slowness).
-New thread: F14 ternary kernel gap + B11 kernel rewrite plan.
-Service 52510 (ternary) switched back to UD-Q5_K_S by the user.
+Last refresh: 2026-10-20. B11 DONE (commit 5b80a3bb1, pushed): PTQ1_0
+SYCL byte-parallel decode + fused multi-column dot; standalone tg128
+6.90 -> 26.72 t/s; F14 RESOLVED. Remaining threads: B7 (F11 C0->C1),
+F12 hygiene.
+No llama service listening as of 10-20 03:40 (61850 stopped by user
+10-19; 52510 - UD-Q5_K_S - down too).
 
 ## Environment
 
@@ -39,7 +41,9 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
 
 ## Git
 
-- branch `main`, pushed HEAD: `11c3d328a` (project closure docs),
+- branch `main`, pushed HEAD: `5b80a3bb1` (PTQ1_0 SYCL byte-parallel
+  kernel, B11), `e844b224a` (private library reopen: F14, F11 C1/C2
+  plan, F12 actions, F5 status), `11c3d328a` (project closure docs),
   `7faf42ec4` (private/ refresh: 2x B70 GPUs, device index semantics,
   maxver rerun), `0589b1e1a` (MTP 3-part fix), `02af668bf` (private/
   knowledge library), `355b4a2b3` (KV diagnostic), `a3f36885c` (KV guard),
@@ -48,18 +52,21 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
   Stray test artifacts (test-pq2_0-sycl-dot.obj/.exe) DELETED 10-19 on
   user command.
-- MTP fix: rebuilt after the \n edit (build exit 0, 10-19), committed+pushed.
+- B11 full build 10-20 03:20: ninja log shows 300/300 tasks done, zero
+  errors. The batch wrapper reported exit 1 - ARTIFACT (same class as
+  the %ERRORLEVEL% misreport); verify binary mtimes, not the wrapper
+  code.
 
 ## Binaries
 
-- `build\bin`: final MTP build (includes \n edit), 89 files.
-- install dir (`C:\Users\admin\.local\3nary-sycl\`): NEW binaries DEPLOYED
-  10-19 after user stopped 61850 (89/89 files, SHA256-verified:
-  llama.dll, llama-common.dll, llama-server-impl.dll, llama-server.exe,
-  llama-cli-impl.dll, llama-cli.exe, llama.exe all match build\bin; full
-  tree also matches). No PDBs anywhere.
+- `build\bin`: B11 build (10-20 03:20): byte-parallel PTQ1_0 kernel +
+  all 10-19 fixes (MTP 3-part, KV guard + diagnostic, PTQ1_0 prefill).
+- install dir (`C:\Users\admin\.local\3nary-sycl\`): 10-19 build
+  (SHA256-verified 89/89 at deploy), BEHIND build\bin by the B11 commit
+  (5b80a3bb1) - has the MTP fix + KV guard + prefill, NOT the B11
+  kernel. Copy build\bin when the user restarts a service.
 - Service restarts via macube will now run the MTP fix + KV guard + KV
-  diagnostic for the first time.
+  diagnostic (+ B11 kernel once redeployed).
 
 ## Models
 
@@ -79,6 +86,8 @@ DEAD instances (tracked, see FINDINGS.md F11/F12):
 | mtp-server-verbose.log | 9.7 MB, NO-draft run at max verbosity (2147483647). :21 loading model, :22 local path, :23 fitting params, :2442 "no change", :135601 fit done 28.32 s, :137874 SYCL-MEMTRACE 1536 MiB FAILED (final real KV OOM). |
 | mtp-server-98304-maxver-err.log | 122504 lines, draft+spec max-verbosity rerun (10-19, warm cache). NO assert. Fit ~37 iters in ~1.6 s, then HUNG 118 s at sched_reserve in fit's final measurement ctx (tail layers 61-65 on SYCL1). Killed at 120 s. See F1. |
 | ternary-d-err.log | 27 lines, full ternary standalone E2E (PASS). |
+| ptq10-b11-bench.log | B11 after-bench (10-20): PTQ1_0 SYCL ngl 99 pp512 293.75 / tg128 26.72 (old kernel: 296.39 / 6.90). |
+| ptq10-e2e2.log | B11 E2E rerun (10-20): comp-sycl exit 0, comp-cpu exit 0, TEXT: IDENTICAL (192 tok deterministic, answers correct). |
 
 Macube logs:
 - `C:\Users\gorom\source\macube\logs\llama-error.log` (~4931 lines at snapshot):
@@ -91,9 +100,11 @@ Macube logs:
   52510 ternary run starts line 61815 (PTQ1_0, n_slots=4, n_ctx_slot
   131072, kv_unified, pp ~300 t/s).
 
-## Next (10-19, after reopen)
+## Next (10-20, after B11)
 
-1. B11: PTQ1_0 SYCL vec_dot rewrite per the F14 fix sketch (needs user
-   go-ahead; verify with the standalone pp/tg repro before/after).
-2. B7: Option C C0 then C1 per the F11 plan (state machine located).
-3. F12: divergence hygiene per the F12 action list.
+1. B7: Option C C0 then C1 per the F11 plan (C0 = error only the failing
+   slot on the decode-fail path server-context.cpp:3590-3639, TODO :3595;
+   C1 = preempt the largest-KV generating slot).
+2. F12: divergence hygiene per the F12 action list.
+3. If the user restarts a service: deploy build\bin (B11) to the install
+   dir first - it is behind by 5b80a3bb1.
