@@ -1065,37 +1065,92 @@ vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
 
 #define VDR_PTQ1_0_Q8_1_MMVQ 4
 
-static __dpct_inline__ float
-vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
-                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+// PTQ1_0 x Q8_1. One decode of the 128-weight block, dp4a dots for up to
+// ncols_dst y columns. A stored byte is the rescaled base-3 code of its trits;
+// trit n comes from the recurrence v = (v*3) & 0xFF, t = (v*3) >> 8 - 1,
+// same as the CPU codec. Bytes widen to 16-bit lanes so *3 cannot carry
+// between lanes.
+template <int ncols_dst>
+static __dpct_inline__ void
+vec_dot_ptq1_0_q8_1_multi(const void *__restrict__ vbq,
+                          const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                          const int stride_col_y, float *result) {
 
     const block_ptq1_0 * bptq1_0 = (const block_ptq1_0 *) vbq;
-    (void)iqs;
 
-    // decode the block trits into a local int8 array.
-    // Order and base-3 math match CPU dequantize_row_ptq1_0.
-    static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
-    static const size_t  stages[3] = {32, 16, 8};
-    int8_t q[QK_PTQ1_0];
-    int o = 0;
-    size_t j = 0;
-    for (size_t st = 0; st < 3; ++st) {
-        const size_t c = stages[st];
-        for (; j + c <= sizeof(bptq1_0->qs); j += c) {
-            for (size_t nn = 0; nn < 5; ++nn) {
-                for (size_t m = 0; m < c; ++m) {
-                    const uint8_t v = bptq1_0->qs[j + m] * pow3[nn];
-                    const int16_t xi = ((uint16_t) v * 3) >> 8;
-                    q[o++] = (int8_t) (xi - 1);
-                }
+    int sumi[ncols_dst][4] = {};
+
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = (uint32_t) get_int_b4(bptq1_0->qs, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed & 0xFF0000) >> 16) | ((packed & 0xFF000000) >> 8);
+
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            // trit codes of the 4 bytes in packed, byte order
+            const uint32_t codes = ((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8)
+                                 | (((w_hi >> 8) & 0xFF) << 16) | (((w_hi >> 24) & 0xFF) << 24);
+            const int q = byte_sub_4((int) codes, 0x01010101);
+            const int e = t * 16 + 4 * g;
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u = get_int_from_int8_aligned(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = dpct::dp4a(q, u, sumi[j][e >> 5]);
             }
         }
     }
-    for (size_t nn = 0; nn < 4; ++nn) {
-        for (size_t h = 0; h < sizeof(bptq1_0->qh); ++h) {
-            const uint8_t v = bptq1_0->qh[h] * pow3[nn];
-            const int16_t xi = ((uint16_t) v * 3) >> 8;
-            q[o++] = (int8_t) (xi - 1);
+
+    // qs[16..23]: elements 80..119
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = (uint32_t) get_int_b4(bptq1_0->qs + 16, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed & 0xFF0000) >> 16) | ((packed & 0xFF000000) >> 8);
+
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t codes = ((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8)
+                                 | (((w_hi >> 8) & 0xFF) << 16) | (((w_hi >> 24) & 0xFF) << 24);
+            const int q = byte_sub_4((int) codes, 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u = get_int_from_int8_aligned(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = dpct::dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+    // qh: 2 bytes, 4 trits per byte, 2 trit steps per dp4a
+    uint32_t v = (uint32_t) bptq1_0->qh[0] | ((uint32_t) bptq1_0->qh[1] << 16);
+#pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v = w1 & 0x00FF00FF;
+
+        const uint32_t codes = ((w0 >> 8) & 0xFF) | (((w0 >> 24) & 0xFF) << 8)
+                             | (((w1 >> 8) & 0xFF) << 16) | (((w1 >> 24) & 0xFF) << 24);
+        const int q = byte_sub_4((int) codes, 0x01010101);
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int u = get_int_from_int8_aligned(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
+            sumi[j][3] = dpct::dp4a(q, u, sumi[j][3]);
         }
     }
 
@@ -1103,20 +1158,25 @@ vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
     const float d0 = sycl::vec<sycl::half, 1>(*(const sycl::half *)&bptq1_0->d)
         .convert<float, sycl::rounding_mode::automatic>()[0];
 
-    // Q8_1: 4 sub-blocks of 32, one ds scale per sub-block
-    float sumf = 0.0f;
-    for (int k = 0; k < 4; ++k) {
-        const sycl::float2 ds8f = bq8_1[k].ds
-            .convert<float, sycl::rounding_mode::automatic>();
-        const float d1 = ds8f.x();
-        int32_t sumi = 0;
-        for (int b = 0; b < 32; ++b) {
-            sumi += (int32_t) q[k * 32 + b] * (int32_t) bq8_1[k].qs[b];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const sycl::float2 ds8f = bq8_1[j * stride_col_y + iqs + k].ds
+                .convert<float, sycl::rounding_mode::automatic>();
+            acc += ds8f.x() * (float) sumi[j][k];
         }
-        sumf += d1 * (float) sumi;
+        result[j] = d0 * acc;
     }
+}
 
-    return d0 * sumf;
+static __dpct_inline__ float
+vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    float result;
+    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, iqs, 0, &result);
+    return result;
 }
 
 static __dpct_inline__ float

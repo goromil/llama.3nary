@@ -1,8 +1,9 @@
 // Verifies vec_dot_ptq1_0_q8_1 math against float reference.
 // Stubs the fp16 conversions for host execution.
 //
-// The decode loop and the dot loop are transcribed from
-// ggml/src/ggml-sycl/vecdotq.hpp, split at the kernel's own decode/dot boundary.
+// The byte-parallel decode and the dp4a dot are transcribed from
+// ggml/src/ggml-sycl/vecdotq.hpp (vec_dot_ptq1_0_q8_1_multi), with host
+// stubs for the dp4a/byte_sub_4 intrinsics.
 // They are cross-checked against independent paths:
 //   - element-wise trit reference (different derivation of the codec mapping)
 //   - round-trip through the CPU quantizer/dequantizer (ggml-quants.c)
@@ -48,52 +49,155 @@ struct block_ptq1_0 { uint8_t qs[24]; uint8_t qh[2]; uint16_t d; };
 static_assert(sizeof(block_q8_1) == 36, "wrong q8_1 block size");
 static_assert(sizeof(block_ptq1_0) == 28, "wrong ptq1_0 block size");
 
-// ---- kernel transcription (matches vecdotq.hpp vec_dot_ptq1_0_q8_1) ---------
-// decode loop, verbatim
-static void kernel_decode(const block_ptq1_0 * bptq1_0, int8_t * q) {
-    static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
-    static const size_t  stages[3] = {32, 16, 8};
-    int o = 0;
-    size_t j = 0;
-    for (size_t st = 0; st < 3; ++st) {
-        const size_t c = stages[st];
-        for (; j + c <= sizeof(bptq1_0->qs); j += c) {
-            for (size_t nn = 0; nn < 5; ++nn) {
-                for (size_t m = 0; m < c; ++m) {
-                    const uint8_t v = bptq1_0->qs[j + m] * pow3[nn];
-                    const int16_t xi = ((uint16_t) v * 3) >> 8;
-                    q[o++] = (int8_t) (xi - 1);
-                }
-            }
+// ---- kernel transcription (matches vecdotq.hpp vec_dot_ptq1_0_q8_1_multi) ---
+// host stubs for the SIMD intrinsics the kernel uses
+static int32_t dp4a(int32_t a, int32_t b, int32_t d) {
+    int32_t s = d;
+    for (int i = 0; i < 4; ++i)
+        s += (int32_t)(int8_t)((a >> (8 * i)) & 0xFF) * (int32_t)(int8_t)((b >> (8 * i)) & 0xFF);
+    return s;
+}
+
+static int byte_sub_4(int a, int b) {
+    const uint32_t ua = (uint32_t) a;
+    const uint32_t ub = (uint32_t) b;
+    return (int) (((ua | 0x80808080u) - ub) ^ 0x80808080u);
+}
+
+static uint32_t get_int_b4(const uint8_t * x, int i32) {
+    uint32_t v; memcpy(&v, x + 4 * i32, 4); // kernel assumes 4-byte alignment
+    return v;
+}
+
+static int get_int_from_int8_aligned(const int8_t * x8, int i32) {
+    return *(const int *)(x8 + sizeof(int) * i32);
+}
+
+// byte-parallel decode, verbatim; stores the 4 trits of each step
+static void kernel_decode(const block_ptq1_0 * bptq1_0, int8_t * out) {
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bptq1_0->qs, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed & 0xFF0000) >> 16) | ((packed & 0xFF000000) >> 8);
+
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t codes = ((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8)
+                                 | (((w_hi >> 8) & 0xFF) << 16) | (((w_hi >> 24) & 0xFF) << 24);
+            const int q = byte_sub_4((int) codes, 0x01010101);
+            const int e = t * 16 + 4 * g;
+            for (int l = 0; l < 4; ++l) out[e + l] = (int8_t) ((q >> (8 * l)) & 0xFF);
         }
     }
-    for (size_t nn = 0; nn < 4; ++nn) {
-        for (size_t h = 0; h < sizeof(bptq1_0->qh); ++h) {
-            const uint8_t v = bptq1_0->qh[h] * pow3[nn];
-            const int16_t xi = ((uint16_t) v * 3) >> 8;
-            q[o++] = (int8_t) (xi - 1);
+
+    // qs[16..23]: elements 80..119
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bptq1_0->qs + 16, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed & 0xFF0000) >> 16) | ((packed & 0xFF000000) >> 8);
+
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t codes = ((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8)
+                                 | (((w_hi >> 8) & 0xFF) << 16) | (((w_hi >> 24) & 0xFF) << 24);
+            const int q = byte_sub_4((int) codes, 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+            for (int l = 0; l < 4; ++l) out[e + l] = (int8_t) ((q >> (8 * l)) & 0xFF);
         }
+    }
+
+    // qh: 2 bytes, 4 trits per byte, 2 trit steps per group
+    uint32_t v = bptq1_0->qh[0] | ((uint32_t) bptq1_0->qh[1] << 16);
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v = w1 & 0x00FF00FF;
+
+        const uint32_t codes = ((w0 >> 8) & 0xFF) | (((w0 >> 24) & 0xFF) << 8)
+                             | (((w1 >> 8) & 0xFF) << 16) | (((w1 >> 24) & 0xFF) << 24);
+        const int q = byte_sub_4((int) codes, 0x01010101);
+        for (int l = 0; l < 4; ++l) out[120 + 2 * t + l] = (int8_t) ((q >> (8 * l)) & 0xFF);
     }
 }
 
-// dot loop, verbatim; d0 is the stubbed fp16->fp32 of bptq1_0->d
-static float kernel_dot(const int8_t * q, const float d0, const block_q8_1 * bq8_1) {
-    float sumf = 0.0f;
+// fused decode + dot, verbatim; one y column (the multi version)
+static float vec_dot_ptq1_0_q8_1(const block_ptq1_0 * bptq1_0, const block_q8_1 * bq8_1) {
+    int32_t sumi[4] = {0};
+
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bptq1_0->qs, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed & 0xFF0000) >> 16) | ((packed & 0xFF000000) >> 8);
+
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t codes = ((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8)
+                                 | (((w_hi >> 8) & 0xFF) << 16) | (((w_hi >> 24) & 0xFF) << 24);
+            const int q = byte_sub_4((int) codes, 0x01010101);
+            const int e = t * 16 + 4 * g;
+
+            const int u = get_int_from_int8_aligned(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = dp4a(q, u, sumi[e >> 5]);
+        }
+    }
+
+    // qs[16..23]: elements 80..119
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bptq1_0->qs + 16, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed & 0xFF0000) >> 16) | ((packed & 0xFF000000) >> 8);
+
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t codes = ((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8)
+                                 | (((w_hi >> 8) & 0xFF) << 16) | (((w_hi >> 24) & 0xFF) << 24);
+            const int q = byte_sub_4((int) codes, 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+
+            const int u = get_int_from_int8_aligned(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = dp4a(q, u, sumi[e >> 5]);
+        }
+    }
+
+    // qh: 2 bytes, 4 trits per byte, 2 trit steps per dp4a
+    uint32_t v = bptq1_0->qh[0] | ((uint32_t) bptq1_0->qh[1] << 16);
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v = w1 & 0x00FF00FF;
+
+        const uint32_t codes = ((w0 >> 8) & 0xFF) | (((w0 >> 24) & 0xFF) << 8)
+                             | (((w1 >> 8) & 0xFF) << 16) | (((w1 >> 24) & 0xFF) << 24);
+        const int q = byte_sub_4((int) codes, 0x01010101);
+
+        const int u = get_int_from_int8_aligned(bq8_1[3].qs, 6 + t / 2);
+        sumi[3] = dp4a(q, u, sumi[3]);
+    }
+
+    float acc = 0.0f;
     for (int k = 0; k < 4; ++k) {
         const float d1 = half_to_float(bq8_1[k].ds & 0xFFFF); // ds8f.x(), low half
-        int32_t sumi = 0;
-        for (int b = 0; b < 32; ++b) {
-            sumi += (int32_t) q[k * 32 + b] * (int32_t) bq8_1[k].qs[b];
-        }
-        sumf += d1 * (float) sumi;
+        acc += d1 * (float) sumi[k];
     }
-    return d0 * sumf;
-}
-
-static float vec_dot_ptq1_0_q8_1(const block_ptq1_0 * bptq1_0, const block_q8_1 * bq8_1) {
-    int8_t q[QK_PTQ1_0];
-    kernel_decode(bptq1_0, q);
-    return kernel_dot(q, half_to_float(bptq1_0->d), bq8_1);
+    return half_to_float(bptq1_0->d) * acc;
 }
 
 // ---- element-wise reference (independent mapping derivation) ----------------

@@ -1418,6 +1418,86 @@ static void mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * vy,
     });
 }
 
+// PTQ1_0 x Q8_1, fused: one decode per weight block, dots for all columns
+template <int ncols_dst>
+static void mul_mat_vec_q_ptq1_0_q8_1_fused(
+        const void * __restrict__ vx,
+        const void * __restrict__ vy,
+        float * __restrict__ dst,
+        const int ncols,
+        const int nrows,
+        const int stride_col_y,
+        const int stride_col_dst,
+        const sycl::nd_item<3> & item_ct1) {
+
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1)
+                  + item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / QK_PTQ1_0;
+
+    // partial sums: one per output column
+    float tmp[ncols_dst] = {0.0f};
+
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+    const block_q8_1   * y = (const block_q8_1 *) vy;
+
+    // each thread takes a whole 128-weight block (qi/vdr = 1)
+    for (int i = item_ct1.get_local_id(2); i < blocks_per_row; i += WARP_SIZE) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = i * (QK_PTQ1_0 / QK8_1);
+
+        float dots[ncols_dst];
+        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(&x[ibx], &y[iby], 0, stride_col_y, dots);
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] += dots[j];
+        }
+    }
+
+    // reduce within subgroup
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+            tmp[j] += dpct::permute_sub_group_by_xor(
+                item_ct1.get_sub_group(), tmp[j], mask);
+        }
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            dst[j * stride_col_dst + row] = tmp[j];
+        }
+    }
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_ptq1_0_q8_1_sycl_fused_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_ptq1_0_q8_1_fused<ncols_dst>(
+                     vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, item_ct1);
+            });
+    });
+}
+
 template <int ncols_dst>
 static void mul_mat_vec_ptq1_0_q8_1_sycl_ncols(
         const void * vx, const void * vy, float * dst,
@@ -1447,8 +1527,9 @@ static void mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
         dpct::queue_ptr stream) {
     switch (ncols_dst) {
         case 1: mul_mat_vec_ptq1_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
-        case 2: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
-        case 3: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        // fused decode, one per weight block; capped like the CUDA path
+        case 2: mul_mat_vec_ptq1_0_q8_1_sycl_fused_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 3: mul_mat_vec_ptq1_0_q8_1_sycl_fused_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
         case 4: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
         case 5: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
         case 6: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
