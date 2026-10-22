@@ -6,14 +6,16 @@ Status markers: [x] done, [ ] open, [B] blocked on user.
 
 Context: pivot to tensor-mode ternary compatibility (user direction
 10-22: "make ternary code tensor compatible and then ... port it back
-to the min llama.cpp fork"). Investigation is COMPLETE (F19-F25); the
-lead fix H-A is designed (F23) and AWAITING USER CONFIRMATION.
+to the min llama.cpp fork"). Investigation is COMPLETE (F19-F25).
+USER DECISIONS 10-22 (evening): (1) H-A APPROVED - implement in this
+fork first, then port; (2) B7 startup-side (B7a) APPROVED; (3) B7
+runtime preemption C0/C1 DROPPED/CLOSED. Clone git state verified
+(no local commits; 3 uncommitted user mods to preserve - F25/B13).
 
-1. [B] PRESENT + GET OK: root-cause report (F20) + H-B death (F22) +
-   H-A design (F23) vs D1 mirror fallback. Required: new pattern /
-   large change. Also confirm: B7 C0/C1 keep/drop (demoted, not
-   cancelled); whether the B13 clone is the final port target.
-2. [ ] ON OK: implement H-A (B12) in this fork:
+1. [x] PRESENT + GET OK: root-cause report (F20) + H-B death (F22) +
+   H-A design (F23) vs D1 mirror fallback. User OK 10-22. B7
+   C0/C1 dropped; B7a approved; B13 clone confirmed as port target.
+2. [ ] IN PROGRESS: implement H-A (B12) in this fork:
    a. llama-model-loader.h: pre-transform callback member on
       llama_model_loader; llama-model-loader.cpp load loop (:1551-1672):
       branch forces the read_buf path for target tensors, calls the
@@ -46,9 +48,12 @@ lead fix H-A is designed (F23) and AWAITING USER CONFIRMATION.
 
 ## PARKED (do not start without user re-scoping, 10-22)
 
-- B7 preemption C0/C1/C2: DEMOTED (twin-server data-parallel design
-  DROPPED; C0/C1 "may be"). Plan intact in F11; B7 startup-side
-  commits 1+2 stay pending confirmation.
+- B7 preemption C0/C1/C2: CLOSED 10-22 (twin-server data-parallel
+  design DROPPED; C0/C1 DROPPED per user). Plan intact in F11 for the
+  record only.
+- B7a (startup-side loud-fail on unfittable ctx/KV + closed --dev
+  gate): APPROVED 10-22, NOT parked - implement after B12 lands (same
+  fork; see BACKLOG B7a).
 - B5 free-VRAM suite / B6 Part-3 trigger / B8 PQ2_0 sweep / B9 final
   report / B10 small follow-ups: status as in BACKLOG.md (parked /
   open-low). The final report (B9) should include the tensor-mode work
@@ -64,3 +69,7 @@ lead fix H-A is designed (F23) and AWAITING USER CONFIRMATION.
 - [x] 10-22: tensor-mode root cause pinned (F20), meta model mapped
   (F21), H-B dead (F22), H-A designed (F23), PQ2_0/PTQ1_0 codec facts
   (F24), port-target clone located (F25). F15-F18 reconstructed/retained.
+- [x] 10-22 (evening): user decisions recorded - H-A APPROVED (3nary
+  first), B7a APPROVED, B7 preemption CLOSED; clone git state verified
+  (no local commits, 3 user mods to preserve). Docs: BACKLOG (B7a),
+  STATE, PLAN refreshed.

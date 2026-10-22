@@ -541,10 +541,10 @@ hadamard falls through to generic dense matmul EVEN in single-device
 mode. So H-B would have cost only ~1.5x the existing dense H matmul -
 but it is dead regardless.
 
-## F23. H-A (LEAD FIX DESIGN, awaiting user confirmation): load-time
+## F23. H-A (LEAD FIX, APPROVED by user 10-22, IMPLEMENTING): load-time
 weight fold W''
 
-[certain] Design (NOT yet implemented): tensor mode only; at load time
+[certain] Design: tensor mode only; at load time
 fold the ENTIRE transform (perm + signs + rot) into the ssm_out weight:
 
     W''[r,n] = s[p^-1(r)] * ( sum_k H[k, p^-1(r)] * W[k,n] )

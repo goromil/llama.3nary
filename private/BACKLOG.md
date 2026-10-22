@@ -16,13 +16,14 @@ Each item: what / why / how / exit criteria / status.
 > - B6/B8/B10 PARKED: Part-3 trigger test, PQ2_0 sweep, SYCL docs.
 > - B9: this banner is the accounting.
 > B11 DONE 10-20 (5b80a3bb1: PTQ1_0 tg128 6.90 -> 26.72 t/s, F14
-> resolved); B7 REOPENED with a ready plan (F11), then DEMOTED 10-22
-> (user: data-parallel twin servers dropped; runtime preemption "may
-> be" - confirm before touching).
+> resolved); B7 REOPENED with a ready plan (F11), then RESCOOPED 10-22
+> (user decision: twin-server data parallel DROPPED; runtime preemption
+> C0/C1 DROPPED => B7-C0/C1 CLOSED; B7 startup-side loud-fail + closed
+> --dev gate APPROVED for implementation in 3nary, see B7a below).
 > 10-22 PIVOT: user direction = make ternary code tensor-compatible in
-> THIS fork first (B12), then port the ternary work to the upstream
-> clone at C:\Users\admin\source\ai\llama.cpp (B13, target confirmed
-> 10-22).
+> THIS fork first (B12, H-A design APPROVED by user 10-22, implement in
+> 3nary then port), then port the ternary work to the upstream clone at
+> C:\Users\admin\source\ai\llama.cpp (B13, target confirmed 10-22).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -108,12 +109,26 @@ Each item: what / why / how / exit criteria / status.
   upstream TODO server-context.cpp:3589-3590 = design reference; C0/C1/C2
   plan in F11.
 - exit: C0 committed+pushed; C1 committed+pushed; C2 optional.
-- status: DEMOTED 10-22 (user: "I do not need data parallel (twin
-  servers) anymore. Even preemption KV cache is'n't needed. may be." =>
-  twin-server/router data-parallel design DROPPED; runtime preemption
-  C0/C1 "may be" = confirm explicitly before implementing; B7 startup-
-  side commits 1+2 stay pending confirmation). Do NOT implement without
-  the user re-scoping. Plan still valid in F11 if resurrected.
+- status: CLOSED 10-22 (user decision: runtime preemption C0/C1 DROPPED
+  => this item closed; twin-server data parallel also dropped). Plan in
+  F11 preserved for the record. The B7 STARTUP-SIDE work (loud-fail on
+  unfittable ctx/KV + closed --dev gate) is tracked separately as B7a
+  and was APPROVED 10-22.
+
+## B7a. Startup-side loud fail + closed --dev gate (APPROVED 10-22)
+- what: (1) at startup, LOUDLY fail (clear error, not silent degrade)
+  when the requested ctx/KV does not fit the device; (2) closed --dev
+  gate: reject unknown/invalid device names instead of silently
+  ignoring. This is the class of failure F16 (silent bad placement ->
+  GDN fused disabled) was.
+- why: user approved 10-22; directly prevents silent mis-placement
+  like F16. Small and independent of B12.
+- how: locate the fit/placement + device-parsing sites (common.cpp
+  common_init_* / common_fit; -dev parse in common-params), add the
+  loud error paths. Read the existing code first; keep it minimal.
+- exit: a bad ctx/KV and a bad --dev each produce a clear startup error
+  (no silent degrade); committed+pushed.
+- status: OPEN, APPROVED 10-22 (implement after B12 lands, same fork).
 
 ## B8. PQ2_0 ctx sweep (fit auto)
 - what: standalone PQ2_0 load WITHOUT -c (fit auto): read computed ctx +
@@ -169,7 +184,7 @@ Each item: what / why / how / exit criteria / status.
   (B13). The perm reshape on the GDN output is unrepresentable at any
   even split; H-A folds the perm+signs+rot into the ssm_out weight at
   load time so the graph skips the perm entirely.
-- how (F23, AWAITING USER CONFIRMATION - new pattern/large change):
+- how (F23, APPROVED by user 10-22, implement in 3nary first then port):
   (a) `llama_model_loader` pre-transform callback member + load-loop
       branch (force read_buf path for target tensors, skip normal set,
       no-op when unset);
@@ -188,8 +203,10 @@ Each item: what / why / how / exit criteria / status.
 - exit: PQ2_0 AND PTQ1_0 27B run `-sm tensor` on SYCL0,SYCL1 with no
   assert and sane output (expect ~sqrt(2)x quant error from the extra
   requant pass); committed+pushed; private/ updated.
-- status: OPEN, BLOCKED on user confirming the H-A design (F23) before
-  any code is written.
+- status: APPROVED 10-22, IMPLEMENTING (user confirmed H-A, 3nary first).
+  Implementation order: (a) loader hook, (b) model transform, (c) graph
+  `folded` flag; then rebuild (N3) + verify (N14) + test PQ2_0 then
+  PTQ1_0.
 
 ## B13. Port ternary work to the upstream clone (C:\Users\admin\source\ai\llama.cpp)
 - what: port the tensor-compatible ternary kernels + tensor-mode support

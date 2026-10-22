@@ -1,13 +1,14 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-22. PIVOT to tensor-mode ternary compatibility
-(user direction): root cause of the PQ2_0 `-sm tensor` assert FULLY
-pinned (F20), meta execution model mapped (F21), activation-side fix
-H-B proven dead (F22), lead fix H-A designed (F23) - implementation
-AWAITING USER CONFIRMATION. Port target located: the upstream clone at
-C:\Users\admin\source\ai\llama.cpp (F25, B13). Twin-server data
-parallel DROPPED by user; B7 preemption DEMOTED (confirm before
-touching).
+Last refresh: 2026-10-22 (evening). PIVOT to tensor-mode ternary
+compatibility: root cause FULLY pinned (F20), meta model mapped (F21),
+H-B dead (F22), H-A designed (F23). USER DECISIONS 10-22: (1) H-A
+APPROVED - implement in THIS fork first (3nary), then port; (2) B7
+startup-side (loud-fail unfittable ctx/KV + closed --dev gate) APPROVED
+(B7a); (3) B7 runtime preemption C0/C1 DROPPED/CLOSED. Now IMPLEMENTING
+H-A (B12). Port target = upstream clone C:\Users\admin\source\ai\
+llama.cpp (F25/B13), git state verified (no local commits; 3 uncommitted
+user mods to preserve).
 
 ## Environment
 
@@ -41,16 +42,18 @@ touching).
 ## Active work
 
 - B12 (LEAD): make ternary PTQ1_0/PQ2_0 `-sm tensor` compatible in this
-  fork. Status: investigation COMPLETE, design READY, BLOCKED on user
-  confirming the H-A design (F23) before code. Crash repro: N14
+  fork. Status: APPROVED 10-22, IMPLEMENTING (H-A). Crash repro: N14
   (deterministic, warmup, block 0; trace in
   $env:TEMP\opencode\pq2_meta_debug.txt, assert at :4378).
+- B7a: startup-side loud-fail (unfittable ctx/KV) + closed --dev gate.
+  Status: APPROVED 10-22, OPEN (implement after B12 lands, same fork).
 - B13: port the (fixed) ternary work to the upstream clone
   `C:\Users\admin\source\ai\llama.cpp` (F25). Status: recon NOT started
   (delta unmeasured; upstream meta backend diverged from 3nary's).
-  BLOCKED on B12 landing first.
-- B7: DEMOTED 10-22 (twin-server design dropped; C0/C1 "may be" -
-  explicit user confirmation required before implementing).
+  BLOCKED on B12 landing first. Clone git state verified: no local
+  commits; 3 uncommitted user mods (chat.cpp, ui-assets.cmake,
+  server-context.cpp) to PRESERVE.
+- B7 (runtime preemption C0/C1): CLOSED 10-22 (user dropped).
 
 ## Git
 
@@ -95,18 +98,14 @@ block; grep by port 8080/58452.
 
 ## Next (10-22)
 
-1. PRESENT to user: corrected root-cause report (F20: no GDN
-   corruption; crash = unrepresentable perm reshape, 1.5 rep-slab at any
-   even split) + H-B death proof (F22) + H-A design (F23: load-time
-   W'' fold, ~15 GFLOP, one extra requant pass ~sqrt(2)x error, size
-   unchanged) vs the D1 mirror fallback. Get explicit OK (new pattern /
-   large change).
-2. ON CONFIRMATION: implement H-A per F23/B12 (loader callback hook,
-   model-side transform, `folded` flag + build_lora_mm gate); rebuild
-   (N3); verify with N14 (assert gone, SPLIT_STATE ssm_out chain =
-   {axis 0, 2048x3}); test PQ2_0 then PTQ1_0 in tensor mode; refresh
-   private/ + commit+push.
-3. B13 recon (only after B12 lands): diff upstream vs 3nary meta
-   backend, upstream ternary type enum, missing-work map (F25).
-4. Optional: user to confirm B7 C0/C1 keep/drop; clone "true fork"
-   (GitHub) step only if the user asks.
+1. [IN PROGRESS] Implement H-A (B12) per F23 in this fork:
+   (a) loader pre-transform callback + loop branch, (b) model-side
+   ssm_out transform (dequant -> FWHT butterfly -> gather -> sign flip
+   -> requant), (c) `folded` flag + build_lora_mm gate. Rebuild (N3),
+   verify (N14: no assert; SPLIT_STATE ssm_out = {axis 0, 2048x3}),
+   test PQ2_0 then PTQ1_0 in tensor mode.
+2. B7a (after B12): startup loud-fail on unfittable ctx/KV + closed
+   --dev gate (common.cpp / common-params sites).
+3. B13 recon (after B12): diff upstream vs 3nary meta backend, upstream
+   ternary type enum, missing-work map (F25). THEN port commit-by-commit.
+4. Refresh private/ + commit+push at each milestone.
