@@ -16,9 +16,16 @@ Each item: what / why / how / exit criteria / status.
 > - B6/B8/B10 PARKED: Part-3 trigger test, PQ2_0 sweep, SYCL docs.
 > - B9: this banner is the accounting.
 > B11 DONE 10-20 (5b80a3bb1: PTQ1_0 tg128 6.90 -> 26.72 t/s, F14
-> resolved); B7 REOPENED with a ready plan (F11).
+> resolved); B7 REOPENED with a ready plan (F11), then DEMOTED 10-22
+> (user: data-parallel twin servers dropped; runtime preemption "may
+> be" - confirm before touching).
+> 10-22 PIVOT: user direction = make ternary code tensor-compatible in
+> THIS fork first (B12), then port the ternary work to the upstream
+> clone at C:\Users\admin\source\ai\llama.cpp (B13, target confirmed
+> 10-22).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
-> detached launch, N7 repro args), FINDINGS.md for conclusions.
+> detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
+> for conclusions.
 
 ## B1. Commit+push the private/ knowledge library
 - what: `git add private/ && git commit && git push` (ONLY private/).
@@ -101,8 +108,12 @@ Each item: what / why / how / exit criteria / status.
   upstream TODO server-context.cpp:3589-3590 = design reference; C0/C1/C2
   plan in F11.
 - exit: C0 committed+pushed; C1 committed+pushed; C2 optional.
-- status: OPEN (plan ready in F11; C0 = error only the failing slot on
-  the decode-fail path, C1 = preempt the largest-KV slot).
+- status: DEMOTED 10-22 (user: "I do not need data parallel (twin
+  servers) anymore. Even preemption KV cache is'n't needed. may be." =>
+  twin-server/router data-parallel design DROPPED; runtime preemption
+  C0/C1 "may be" = confirm explicitly before implementing; B7 startup-
+  side commits 1+2 stay pending confirmation). Do NOT implement without
+  the user re-scoping. Plan still valid in F11 if resurrected.
 
 ## B8. PQ2_0 ctx sweep (fit auto)
 - what: standalone PQ2_0 load WITHOUT -c (fit auto): read computed ctx +
@@ -146,3 +157,59 @@ Each item: what / why / how / exit criteria / status.
   mismatches; deterministic SYCL vs CPU completion text-identical.
   Test-only store-index bug found+fixed in lockstep (F14 debugging
   note).
+
+## B12. Make ternary (PTQ1_0/PQ2_0) `-sm tensor` compatible (10-22 LEAD)
+- what: fix the deterministic PQ2_0 tensor-mode assert
+  `GGML_ASSERT(split_state.ne[j] % div == 0)` (ggml-backend-meta.cpp:1086,
+  warmup forward, block 0, GDN `build_lora_mm(ssm_out)` hadamard perm).
+  Root cause + the chosen fix design are in F20 (root cause), F21 (meta
+  model), F22 (H-B dead), F23 (H-A lead fix), F24 (codecs).
+- why: user wants ternary models to run in tensor mode in THIS fork, as
+  the prerequisite for porting the ternary work to the upstream clone
+  (B13). The perm reshape on the GDN output is unrepresentable at any
+  even split; H-A folds the perm+signs+rot into the ssm_out weight at
+  load time so the graph skips the perm entirely.
+- how (F23, AWAITING USER CONFIRMATION - new pattern/large change):
+  (a) `llama_model_loader` pre-transform callback member + load-loop
+      branch (force read_buf path for target tensors, skip normal set,
+      no-op when unset);
+  (b) model-side transform: dequant PQ2_0 -> f32, per-1024-row FWHT
+      butterfly (W8 x W128), gather 128-row blocks grouped -> tiled
+      (t_b = 3*(b%16) + b/16) with per-row sign flip, requant via
+      EXISTING quantize_row_pq2_0_ref, ggml_backend_tensor_set with the
+      EXISTING {2048,3} segment table; gated on tensor mode +
+      hadamard_gdn_v_grouped + `.ssm_out.` names;
+  (c) `bool folded = false;` on llama_hadamard_transform (llama-graph.
+      h:23-32) + build_lora_mm (llama-graph.cpp:1546-1603) skips the
+      whole transform block when folded.
+  Then rebuild (N3) + verify with N14 (assert gone; SPLIT_STATE for the
+  ssm_out chain = {axis 0, 2048x3}; K pairing consistent); test PQ2_0
+  THEN PTQ1_0 in tensor mode; refresh private/ + commit+push.
+- exit: PQ2_0 AND PTQ1_0 27B run `-sm tensor` on SYCL0,SYCL1 with no
+  assert and sane output (expect ~sqrt(2)x quant error from the extra
+  requant pass); committed+pushed; private/ updated.
+- status: OPEN, BLOCKED on user confirming the H-A design (F23) before
+  any code is written.
+
+## B13. Port ternary work to the upstream clone (C:\Users\admin\source\ai\llama.cpp)
+- what: port the tensor-compatible ternary kernels + tensor-mode support
+  from THIS 3nary fork into the recent UPSTREAM clone the user wants to
+  use as the forward working copy (F25).
+- why: user (10-22) will keep the local copy for us and "create a true
+  fork" later if needed; working on the clone avoids fork-inconvenience
+  now. The 3nary fork is far behind upstream (F12), so the port delta is
+  large and UNMEASURED.
+- how (RECON FIRST, no porting until recon is done + user confirms scope):
+  1. diff upstream ggml-backend-meta.cpp vs the 3nary meta backend
+     (the 4th/tensor split mode) - they DIVERGED;
+  2. confirm upstream ggml type enum values for PQ2_0/PTQ1_0 (upstream
+     ternary types; numeric values likely differ from the 3nary fork -
+     F12 never-mix rule);
+  3. map which 3nary work is missing/divergent in the clone: ternary
+     SYCL/CUDA kernels (F14/B11), GDN hadamard builder, prism hadamard,
+     tensor-mode options, the H-A fold (B12) once landed;
+  4. only then stage the port commit-by-commit.
+- exit: recon notes written to private/ (F25 expansion); user confirms
+  port scope; port staged.
+- status: OPEN, BLOCKED on (a) B12 landing in this fork (port the FIXED
+  ternary, not the asserting one) and (b) the recon in `how` above.

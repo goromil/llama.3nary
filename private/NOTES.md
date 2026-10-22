@@ -4,9 +4,10 @@
 
 ## N1. Hard constraints (user rules)
 
-- User stops/starts macube services. NEVER kill a PID the user owns
-  (61850: model 568492, router 421716). Killing PIDs of processes WE
-  spawned is fine.
+- User stops/starts macube services. NEVER kill a PID the user owns.
+  CURRENT (10-22, re-verify after reboots): 24252 router :8080 + 26876
+  child :58452 (Q5_K_S + MTP). Killing PIDs of processes WE spawned is
+  fine.
 - No changes to macube service files (services.json, presets). Reading OK.
 - `llama-api-keys.txt` untouched.
 - All SYCL binaries need oneAPI setvars first (N2).
@@ -22,6 +23,13 @@
   (`E:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PTQ1_0\`), it fits the
   scarce free VRAM reliably.
 - User does NOT use `--n-spec`.
+- Tensor-mode runs INTENTIONALLY use both GPUs (`-dev SYCL0,SYCL1`,
+  F19/N14) - that is the feature under development, not a pin
+  violation.
+- No DFlash2 content: the model dirs contain DFlash2 gguf files; never
+  process, document, or commit anything about them.
+- Small ctx tensor-mode debug runs are safe alongside the live service
+  (deterministic warmup crash dies before long generation).
 
 ## N2. setvars recipe (pwsh, oneAPI for SYCL builds/runs)
 
@@ -33,10 +41,17 @@ cmd /c """C:\Program Files (x86)\Intel\oneAPI\setvars.bat"" intel64 && set" |
 # no $env:GGML_SYCL_DEVICE - not read by this fork (F9). Pin via -dev SYCL0.
 ```
 
-## N3. Build recipe
+## N3. Build recipe (full, each fresh pwsh)
 
 - Tree: `build/` (Ninja, Release, shared libs, tests ON).
-- `cmake --build . -j 24` in build/ after N2.
+- 1. oneAPI setvars (N2).
+- 2. VS env: parse `cmd /c '"C:\Program Files (x86)\Microsoft Visual
+  Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" && set'`
+  with the same regex trick as N2.
+- 3. Prepend `C:\Program Files (x86)\Intel\oneAPI\compiler\2026.1\lib`
+  to `$env:LIB`.
+- 4. `cmake --build build -j 24` (in the repo root or `cd build`).
+- Running the exe also needs the oneAPI env for SYCL.
 - FULL builds exit 1 at pre-existing `test-dspark-forward` LNK2019 -
   HARMLESS. Verify the failing target is that one before worrying.
 - No PDBs anywhere (stack traces via cdb need a RelWithDebInfo build).
@@ -109,7 +124,8 @@ block = 28 B;
 ## N8. Fork-specific mappings (NEVER use upstream)
 
 - ggml type enum (ggml.h:389-417): F32=0, Q4_0=2, Q5_1=7, Q8_0=8,
-  Q3_K=11, Q4_K=12, Q6_K=14.
+  Q3_K=11, Q4_K=12, Q6_K=14, PQ2_0=142 (ternary; PTQ1_0 is the
+  separate ternary type, F24).
 - `src/llama.h` does not exist. Fork is far behind upstream (do not port
   by line number).
 - MTP draft gguf quants: output/embd=Q3_K, ffn/eh_proj=Q4_K,
@@ -133,6 +149,7 @@ block = 28 B;
 
 | Model | ngl | pp512 | tg128 |
 |---|---|---|---|
+| Q5_K_S -sm tensor (SYCL0,SYCL1, -c 160000) | - | - | 31.9 |
 | PTQ1_0 SYCL (B11 kernel) | 99 | 293.75 | 26.72 |
 | PTQ1_0 SYCL (old scalar) | 99 | 296.39 | 6.90 |
 | PTQ1_0 SYCL | 0 | 223.60 | 0.45 |
@@ -213,30 +230,123 @@ block = 28 B;
   eviction), :3590-3639 decode-fail path (errors+releases ALL processing
   slots; TODO :3595), :1927-1935 send_error, :1580 try_clear_idle_slots,
   :2326-2342 prompt_save/prompt_cache, :2490-2533 restore-slot path.
+- Tensor mode (F19-F24, 10-22):
+  - ggml/src/ggml-backend-meta.cpp: :577-608 handle_mul_mat,
+    :610-662 handle_reshape, :813-828 handle_gated_delta_net,
+    :830-861 calculate_split_state (callback only non-compute non-view
+    :834), :1066-1105 post-pass (div assert :1085-1087),
+    :1181-1299 init_tensor_impl (local = global ne, split axis scaled),
+    :1188 n_segments<=16 cap, :1410-1474 write path.
+  - ggml/src/ggml-backend.h: :378-415 split-state struct/semantics,
+    :498-505 split_states_equal (axis + per-device SUMS only).
+  - src/llama-model.cpp: :368 split-state callback, :540-560 QWEN35
+    segment table (ssm_out {{2048,3}} :541-542), :1190-1344 prism
+    hadamard kvs, :1532-1541 mmap gate (SYCL => use_mmap=false),
+    :1940 ml.load_all_data call, :1951-2109 hadamard builder (rot
+    :2010-2034, signs :2043-2087 shared per width, transform +
+    perm_hd/nk/rep :2089-2100).
+  - src/llama-model-loader.cpp: :1551-1672 load loop (mmap-alloc :1582,
+    mmap-set :1592, host read :1599, async chunked 1/64 MB pinned
+    :1607-1658, plain read_buf->set :1660-1663).
+  - src/llama-model-loader.h: :31 llama_model_loader (plain struct, NO
+    split-mode knowledge), :33-50 llama_tensor_weight, :204
+    load_all_data.
+  - src/llama-graph.cpp: :1546-1603 build_lora_mm (memo :1556, perm
+    gate :1561, perm ops :1563-1567, signs :1569-1571, rot :1572,
+    mul_mat :1578). src/llama-graph.h: :23-32 llama_hadamard_transform
+    (H-A adds `folded` here), :33 hadamard_rotations map.
+  - src/llama-impl.h: :57-72 llama_mul_mat_hadamard.
+  - src/models/qwen35.cpp: :89 ssm_out weight [K=6144, N=5120],
+    :403-624 GDN block graph, :576 build_lora_mm(ssm_out, final_output,
+    ssm_out_s). GDN hparams: head_k/v_dim=128, n_k_heads=16,
+    n_v_heads=48, key_dim=2048, value_dim=6144, conv_dim=10240,
+    ssm_d_conv=4, ssm_dt_rank=48, ssm_n_group=16.
+  - ggml/src/ggml-quants.c: :113 quantize_row_pq2_0_ref, :494
+    dequantize_row_pq2_0, :2183 quantize_pq2_0. ggml-cpu/quants.c:33
+    cpu wrapper. ggml-common.h: :202-207 block_pq2_0 (34 B), :214-220
+    block_ptq1_0.
+  - ggml/src/ggml-sycl/fwht.cpp + fwht.hpp: FWHT fast path ONLY n in
+    {64,128,256,512}; ggml-sycl.cpp:4528 HADAMARD-hint MUL_MAT dispatch.
+  - GDN pairing (MODULO both backends): CPU ops.cpp:10849, SYCL
+    gated_delta_net.cpp:41.
 
 ## N12. Git / repo state notes
 
 - Branch main; committed+pushed (this project, recent first):
-  5b80a3bb1 (PTQ1_0 SYCL byte-parallel kernel, B11), e844b224a (private
-  library reopen), 11c3d328a (closure docs), 7faf42ec4 (private/
-  refresh), 0589b1e1a (MTP 3-part fix), 02af668bf (private library),
-  355b4a2b3 (KV diagnostic), a3f36885c (KV guard), 033a6f0ad (PTQ1_0
-  prefill), bd993a9d7 (SYCL kernel).
+  48e9082ca (fit-params: include speculative draft model in the fit),
+  835d728b3 (docs: close B11 in private library), 5b80a3bb1 (PTQ1_0
+  SYCL byte-parallel kernel, B11), e844b224a (private library reopen),
+  11c3d328a (closure docs), 7faf42ec4 (private/ refresh), 0589b1e1a
+  (MTP 3-part fix), 02af668bf (private library), 355b4a2b3 (KV
+  diagnostic), a3f36885c (KV guard), 033a6f0ad (PTQ1_0 prefill),
+  bd993a9d7 (SYCL kernel).
 - Upstream ref for Part 1: d1a92352c "speculative : only gemma4-assistant
   shares the target KV cache" (NOT in fork history).
 - `private/` = this knowledge library; keep it committed+pushed.
 
 ## N13. Working assumptions to re-verify after compaction
 
-- No llama service listening as of 10-20 03:40 (61850 stopped by user
-  10-19; 52510 down too). Check ports before any VRAM work:
-  `Get-NetTCPConnection -LocalPort 61850,52510 -State Listen`.
-- build\bin is CURRENT (10-20 03:20 B11 build): byte-parallel PTQ1_0
-  kernel + all 10-19 fixes.
-- Install dir (C:\Users\admin\.local\3nary-sycl\) is BEHIND build\bin by
-  the B11 commit (5b80a3bb1): it has the 10-19 build (MTP fix + KV guard
-  + PTQ1_0 prefill), NOT the B11 kernel. Copy build\bin when the user
-  restarts a service (user manages services).
-- $env:TEMP\opencode\ logs persist on disk (re-read, don't assume memory).
-  B11 logs: ptq10-b11-bench.log, ptq10-e2e2.log (+ .comp-sycl.txt /
-  .comp-cpu.txt).
+(Refreshed 10-22; re-verify PIDs after any reboot.)
+- LIVE service (do not disturb, user-owned): 24252 = llama-server
+  router 0.0.0.0:8080; 26876 = llama-server child 127.0.0.1:58452
+  (Q5_K_S + MTP). Check before VRAM work:
+  `Get-NetTCPConnection -LocalPort 8080,58452 -State Listen`.
+  (Old 52416/61850/52510/65463/54447 entries are history; the service
+  was restarted, PIDs changed.)
+- build\bin is CURRENT as of the 10-20 B11 build + 48e9082ca fit tool.
+  Any tensor-mode (B12) build updates this.
+- Install dir (C:\Users\admin\.local\3nary-sycl\): state unknown after
+  the service restart; re-check before advising a redeploy.
+- $env:TEMP\opencode\ logs persist on disk (re-read, don't assume
+  memory). Key tensor-mode artifacts: pq2_meta_debug.txt (4379-line
+  GGML_META_DEBUG trace; assert at :4378) + run_pq2_debug.ps1. B11
+  logs: ptq10-b11-bench.log, ptq10-e2e2.log.
+- Model paths (verified 10-22): C:\DataVolume\TernaryModels\Ternary-
+  Bonsai-2-27B-PQ2_0\ (PQ2_0 gguf 6.71 GB + mmproj, the crashing
+  model) and E:\DataVolume\TernaryModels\ (full family: 27B PTQ1_0
+  5.54 GB + PQ2_0, 2B/4B/9B ternary, small MTP Q8_0 variants).
+  TernaryModels.presets.ini in both roots = macube presets, DO-NOT-
+  EDIT.
+- C:\Users\admin\source\ai\llama.cpp = the UPSTREAM clone (B13 port
+  target, F25); C:\Users\admin\... and C:\Users\gorom\... paths are the
+  SAME tree for llama.3nary (one build, shared build\bin).
+
+## N14. Tensor-mode repro (PQ2_0 assert, F20)
+
+```
+$env:GGML_META_DEBUG='1'   # SPLIT_STATE prints need BOTH of these
+build\bin\llama-cli.exe -m C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_0\Ternary-Bonsai-2-27B-PQ2_0.gguf -mm C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_0\Ternary-Bonsai-2-27B-mmproj-BF16.gguf -ngl all -sm tensor -c 160000 -dev SYCL0,SYCL1 -lv 5 -p "What time is it"
+```
+- Deterministic crash at warmup forward, block 0 (assert
+  ggml-backend-meta.cpp:1086) - safe to run alongside the live service
+  (small ctx, dies before any long generation).
+- The runner script in $env:TEMP\opencode\run_pq2_debug.ps1 wraps this
+  with setvars (N3 env).
+- Expected post-fix (B12/H-A): no assert; SPLIT_STATE for the ssm_out
+  chain = {axis 0, 2048x3, 1024/1024}; output sane (slight degradation
+  from the extra requant pass is EXPECTED).
+
+## N15. Port-target clone (B13, F25)
+
+- Path: `C:\Users\admin\source\ai\llama.cpp`. Clone of UPSTREAM
+  ggml-org/llama.cpp (origin), branch master, HEAD 6fcaa16f4 (2026-09-21).
+- Git state (verified 10-22): NO local user commits; the "[origin/
+  master: ahead 53]" marker is a STALE fetch ref, not local work.
+  Working tree has 3 uncommitted tracked-file mods from earlier
+  sessions (DO NOT OVERWRITE): common/chat.cpp (tool-args JSON throw ->
+  warn), scripts/ui-assets.cmake (npm.ps1 in find_program),
+  tools/server/server-context.cpp (~:3444 recurrent-memory seq_rm
+  refusal: clear seq + re-process full prompt).
+- Build: `build-sycl.ps1` (in clone root). It runs oneAPI setvars,
+  checks icx, `sycl-ls`, then cmake in build/ with Ninja:
+  GGML_SYCL=ON, GGML_SYCL_F16=ON, GGML_OPENMP=ON, C=cl, CXX=icx,
+  BUILD_SHARED_LIBS=ON, Release, LLAMA_OPENSSL (auto-installs via
+  winget if absent). Flags: -Clean (wipe build/), -Portable (copy to
+  ~/.local), -InstallOnly. Build: `cmake --build build -j 8`.
+- Run: `run-llama-sycl.ps1 <tool> [args...]` (e.g. `run-llama-sycl.ps1
+  cli -m model.gguf -ngl 99`). It re-runs oneAPI setvars and prepends
+  ~/.local\llama-sycl to PATH (portable bin dir). Binaries also in
+  clone build\bin\.
+- Do NOT confuse with the 3nary repo remotes: 3nary's "origin" =
+  goromil/llama.3nary (private), 3nary's "prism" = PrismML-Eng/llama.
+  cpp. The clone's "origin" = upstream ggml-org/llama.cpp.

@@ -272,7 +272,7 @@ stream (queue_results) to the resumed slot.
 ## F12. Fork vs upstream divergences (never mix mappings)
 
 [certain] Fork ggml type enum is NON-STANDARD (ggml.h:389-417):
-F32=0, Q4_0=2, Q5_1=7, Q8_0=8, Q3_K=11, Q4_K=12, Q6_K=14.
+F32=0, Q4_0=2, Q5_1=7, Q8_0=8, Q3_K=11, Q4_K=12, Q6_K=14, PQ2_0=142.
 Fork is far behind upstream (upstream line 1414 ~ fork line 2129 for the MTP
 ctor). `src/llama.h` does NOT exist in the fork.
 MTP draft gguf quant types: output/embd=Q3_K(11), ffn/eh_proj=Q4_K(12),
@@ -376,3 +376,287 @@ Debugging note (do not re-derive):
 [certain] sim_qh.py (Python emulation) is BUGGY (unbounded shifts,
   broken sign-fill, print mismatch); use the compiled C sim
   (sim_qh.cpp, icx) for C-arithmetic emulation of the trit decode.
+
+## F15. 52416 user depth curve: tg tracks ctx, "9.4x collapse" CLOSED
+
+[high] (Entry reconstructed 10-22 from STATE.md refs + 65463/54447 log
+blocks; the original write-up was lost in a compaction.)
+- 54447 (UD-Q5_K_S + MTP) tg 1.47-1.50 looked like a 4.5-9.4x collapse
+  vs 65463's 6.31 at 71.3K ctx. WRONG framing: 54447 had fused GDN
+  disabled (F16), and the comparison confounded small-ctx vs long-ctx
+  operating points.
+- 65463 raw curve: tg 6.31 rock-stable at 71271 prompt tokens. The raw
+  depth curve predicts ~6.6 at the 54447 depth with fused GDN enabled.
+- B11 PTQ1_0 standalone (26.72 tg128) was verified at production ctx by
+  the user depth curve (52416 class runs).
+
+## F16. 54447 tg collapse: fit placed layer 0 on CPU mid-race, GDN
+fused off for ALL 48 layers
+
+[certain] 54447 spawned at router-clock 29.43 while 65463 was still
+resident. fit placed layer 0 on CPU. resolve_fused_ops is all-or-
+nothing: one CPU-placed layer disables the fused Gated Delta Net
+(chunked) for ALL 48 linear-attention layers. Warnings at macube
+llama.log :79831-79833 ("layer 0 is assigned to device CPU but fused
+Gated Delta Net (chunked) is assigned to device SYCL0 ... not
+supported, set to disabled"). Result: tg 1.47-1.50 (4.5x collapse).
+Lesson: the F13 "pre-existing warning" is actually the F16 poison pill
+- it is the SMOKE for a broken fit placement, not a harmless note.
+User cancelled the 54447 task at 10.23.
+
+## F17. Co-residency: NO room for a second 27B-class while 52416 runs
+
+[certain] Fit probes 10-20 (52416 resident, draft-aware tool from
+48e9082ca; logs $env:TEMP\fitprobeA/B/C.txt, 12 MB at -lv 5, grep
+"printing fitted|^-c |free|MiB|target="):
+- A = 52416 clone (Q5_K_S + mtp draft): projected 51523 MiB vs 10906
+  free => fit gives -c 131072 -ngl 6 (90% CPU, unusable).
+- B = PTQ1_0 plain q8_0 KV: -c 131072 -ngl 20 (~1-2 t/s class).
+- C = PTQ1_0 --spec-type draft-mtp: -c 131072 -ngl 17 (same, bad).
+- Big consumers at ctx 131072 / batch 6144: weights ~17.8 GB + KV ~3 GB
+  + graph/sched compute reserve ~20-27 GB (comparable to the weights).
+  Reserve scales with ctx x batch (65536 probe not yet run).
+[certain] KV math CORRECTED (supersedes the old 6.27 GB / 9.7 GB
+estimates): qwen35-27B has 16 full-attn layers (full_attention_interval
+= 4 of 65 blocks). KV q5_1 @131072 = 3072 MiB (K 1536 + V 1536). Draft
+KV q4_0 = 144 MiB. GDN recurrent state 598.50 MiB (64 layers, NO
+per-token growth).
+[high] Only a small model (4B-class ternary, ~1.3 GB weights) could
+plausibly co-reside. Idle-unload is the only way to make room for a
+second 27B (user accepted that as a future router option, 10-20).
+
+## F18. MTP mechanics mapped (stub - detail lost in compaction)
+
+[high] (Original detail lost; key retained facts, cross-referenced.)
+- MTP = ONE nextn block (blk.64, nextn_predict_layers = 1), iterated
+  for depth (mtp-Qwen3.8-27B-Q4_0.gguf, 18 tensors, 1306 MiB).
+- Mode map (F5 Part 1): Qwen3.8-27B => is_mem_shared = FALSE (mirror KV
+  active); only gemma4-assistant arch shares the target KV.
+- Draft ctx: ctx_type MTP, n_ctx = llama_n_ctx(ctx_tgt),
+  ctx_other = ctx_tgt (N11 speculative.cpp refs).
+- MTP multiplier in service: ~2.0x raw decode (52416: tg 13.2-13.6 at
+  73.6K ctx vs ~6.5 raw estimate).
+- MTP under tensor mode (-sm tensor) WORKS (verified 10-22, Q5_K_S).
+- [open] Full mechanics write-up (acceptance loops, chain_heads) was
+  lost; re-derive from N11 code refs if needed.
+
+## F19. Tensor mode (-sm tensor) facts
+
+[certain] The fork has a 4th split mode, EXPERIMENTAL: one Meta device
+wrapping the real backends; weights AND KV are split across devices;
+per-subgraph all-reduce (vLLM-TP style).
+- Run: `--split-mode tensor --fit off -ngl all -dev SYCL0,SYCL1`.
+  An all-zero tensor_split = even split. `--fit off` is effectively
+  mandatory (fit does not understand the meta device).
+- MTP under tensor mode works. GDN output QUALITY in tensor mode is
+  correct for the non-ternary Q5_K_S (user runs fine, 31.9 t/s at 160K
+  ctx, 10-22).
+- This finding set (F19-F25) targets making the ternary PTQ1_0/PQ2_0
+  models tensor-mode compatible; the blocker is F20.
+
+## F20. PQ2_0 tensor-mode assert - ROOT CAUSE (confirmed)
+
+[certain] Crash: deterministic, warmup forward, block 0, the GDN
+`build_lora_mm(ssm_out)` hadamard perm.
+`GGML_ASSERT(split_state.ne[j] % div == 0)` at
+ggml/src/ggml-backend-meta.cpp:1086.
+- The failing node is the RESHAPE of the memo-MISS hadamard perm in
+  build_lora_mm (llama-graph.cpp:1546-1603):
+  `ggml_reshape_4d(x, 128, 16, 3, T)` on the GDN output (K = 6144).
+- GDN output split state: {axis 0, ne {2048,3}, nr 1, n_seg 1},
+  per-device extent 3072 rows (derived by the post-pass from srcs, see
+  F21).
+- handle_reshape (ggml-backend-meta.cpp:610-662) returns {axis 2, scale
+  1}: the first dim where the cumulative OUT extent is a multiple of
+  6144 is dim 2 (128*16 = 2048, x3 = 6144).
+- The post-pass (:1066-1105) then computes div for that axis:
+  3072 (per-device extent) x 3 (rep size) / 6144 = 1.5 => not integral:
+  9216 % 6144 = 3072 => assert fires at :1086.
+- T-INDEPENDENT (T cancels). UNREPRESENTABLE at ANY even split:
+  dev0's row union = {(hd, nk in 0-7, rep 0-2)} = 1.5 rep-slabs of the
+  6144-row axis; no segment table can express a half-slab.
+Row/order math (both orderings, do not re-derive):
+- TILED (GDN output / activation) row r: hd = r%128,
+  nk = (r/128)%16, rep = r/2048, vhead = nk + 16*rep.
+- GROUPED (weight K axis) row k: t = k/128, nk = t/3, rep = t%3.
+- dev0 (eff rotation 0) holds vheads {0-7, 16-23, 32-39}, local order
+  [v0-7 | v16-23 | v32-39]; dev1 = mirrored, +8 offset.
+- H = W3 x W7 Kronecker (1024-row blocks = 8 vheads); H_local =
+  P x H_bd x P^T, device-invariant (u = (3h+c) mod 8 is
+  device-independent).
+[certain] GDN kernel pairing is MODULO in BOTH backends (CPU ops.cpp
+:10849, SYCL gated_delta_net.cpp:41) => the earlier "silent GDN
+corruption" finding is VOID: no corruption, only the perm reshape is
+unrepresentable. Plain {3072,1}/{2048,1} contiguous splits of the GDN
+output are WRONG (they break the nk/rep interleaving). A rotation-at-
+load of the weight alone is a NO-OP (it must travel with the perm +
+signs to be meaningful).
+
+## F21. Meta backend execution model (ggml-backend-meta.cpp)
+
+[certain] init_tensor_impl (:1181-1299): creates a per-device local
+tensor with GLOBAL ne but the split axis SCALED:
+`ne[split_dim] = sum_s ne[s*n_bufs + j] * nr[s]`; nb rescaled
+proportionally; the SAME op is enqueued on each device with srcs
+rewired to local tensors. Consequence: every op must be
+shape-consistent per device on the scaled tensor.
+Split-state semantics (ggml-backend.h:378-415): axis + n_segments;
+segment s = nr[s] reps, each rep split across devices, device j holds
+ne[s*n_bufs + j]. Invariant: `sum_s (sum_j ne[s,j]) * nr[s] ==
+ne[axis]`. `split_states_equal` (:498-505) compares axis + per-device
+SUMS only. Axis enum: 0..3, MIRRORED = 10, PARTIAL = 11, NONE = 98,
+UNKNOWN = 99. Hard cap n_segments <= 16 (ggml-backend-meta.cpp:1188).
+- handle_gated_delta_net (:813-828): all-6-srcs-MIRRORED => MIRRORED
+  out; else asserts srcs 0-4 axis 1, src5 axis in {0,1,2}, and returns
+  a placeholder {axis 0, ne 0, nr 1, n_seg 1}; the real per-device
+  extents (3072/dev, 2048x3 structure) are filled by the post-pass from
+  srcs.
+- calculate_split_state (:830-861): the model callback is consulted
+  only for non-compute non-view tensors (:834).
+- QWEN35 segment table (llama-model.cpp:540-560): ssm_out = {{2048,3}}
+  (:541-542); split-state callback registered at :368.
+- Assert + post-pass: :1066-1105 (div check :1085-1087).
+
+## F22. H-B (runtime activation-side hadamard) is DEAD
+
+[certain] Proof that no representable graph subgraph applies H on the
+activation side in tensor mode:
+- (a) Direct matmul H[3072,3072] MIRRORED x xs[6144,T]{axis 0}: ggml K-
+  mismatch (3072 != 6144) + meta abort (MIRRORED src0 x axis-0 src1 is
+  unsupported in handle_mul_mat :577-608).
+- (b) Reshape round-trip [6144,T] -> [3072,2T] -> matmul -> [3072,2T]
+  -> [6144,T]: the middle matmul IS representable (src1 axis 1 + src0
+  MIRRORED => out {axis 1, T}; local [3072,T]; local compute =
+  H_local x x_local = EXACTLY correct), but the FINAL reshape fails:
+  T=1 => meta local shape [1536,1] != real [3072,1] => downstream
+  split_states_equal assert; T>1 => post-pass assert (ne = T/2 vs div
+  = 2T).
+- No other form works: the only ops representable on xs[6144,T]{axis 0}
+  are elementwise ops with matching states and TP K-reduction matmuls.
+- H-C (fuse H into the GDN kernel) = SYCL + CPU kernel rewrite;
+  rejected as too invasive for the gain.
+Context: the SYCL FWHT fast path (ggml_sycl_op_fwht, fwht.cpp/.hpp)
+only serves n in {64,128,256,512} (n = src ne[0]); the 1024-wide
+hadamard falls through to generic dense matmul EVEN in single-device
+mode. So H-B would have cost only ~1.5x the existing dense H matmul -
+but it is dead regardless.
+
+## F23. H-A (LEAD FIX DESIGN, awaiting user confirmation): load-time
+weight fold W''
+
+[certain] Design (NOT yet implemented): tensor mode only; at load time
+fold the ENTIRE transform (perm + signs + rot) into the ssm_out weight:
+
+    W''[r,n] = s[p^-1(r)] * ( sum_k H[k, p^-1(r)] * W[k,n] )
+
+r = tiled row, j = p^-1(r) = grouped row; H = 1024-block normalized
+Sylvester (same as the on-spot rot, scale 1/sqrt(1024)); s = signs in
+GROUPED order.
+Implementation steps:
+- Dequant PQ2_0 -> f32 (125.8 MB scratch per layer).
+- FWHT butterfly per 1024-row H block: WHT-1024 = W8 x W128 (iterative
+  butterfly), ~15.1 GFLOP over all 48 layers. NOT a dense GEMM (that
+  would be ~3 TFLOP).
+- Gather 128-row blocks grouped -> tiled: tiled vhead b <- grouped
+  t-unit t_b = 3*(b%16) + b/16; the H block for it is t_b/8.
+- Per-row sign flip in f32 BEFORE requant (the codec is asymmetric
+  {-1,0,+1,+2} x d with NO -2 level; flipping in the quant domain is
+  impossible).
+- Requant with the EXISTING quantize_row_pq2_0_ref (F24).
+- ggml_backend_tensor_set with the EXISTING {2048,3} segment table.
+- Weight size UNCHANGED (401 MB total across 48 layers). Precision:
+  one extra PQ2_0 pass (error ~ sqrt(2) x single pass).
+- The graph then skips perm + signs + rot entirely: res = mul_mat(W'',
+  x).
+Loader hook design:
+- llama_model_loader is a plain struct (llama-model-loader.h:31) with
+  NO split-mode knowledge; load_all_data(ctx, bufs, lmlocks,
+  progress_cb, ud) at :204.
+- Add an optional pre-transform callback member:
+  `std::function<bool(const ggml_tensor *, const llama_tensor_weight &)>`
+  (return true = handled), set by the model BEFORE load_all_data.
+  The load loop branch forces the read_buf path for target tensors and
+  skips the normal set. No-op when the callback is unset (non-tensor
+  modes untouched).
+- Load-loop data paths (llama-model-loader.cpp:1551-1672): mmap-alloc
+  :1582 (zero-copy, NOT taken - SYCL has no mmap_support so use_mmap =
+  false via llama-model.cpp:1532-1541), mmap-set :1592, non-mmap host
+  read :1599, non-mmap async chunked upload via
+  ggml_backend_tensor_set_async in 1/64 MB pinned chunks :1607-1658
+  (taken when device has async + host_buffer + events caps; SYCL likely
+  qualifies), non-mmap plain read_buf -> set :1660-1663.
+Gating (the hadamard builder runs AFTER ml.load_all_data,
+llama-model.cpp:1940 -> builder :1951-2109, so the loader-side hook
+cannot read the built transforms):
+- Use hadamard_weight_blocks (name -> block_size map) +
+  hadamard_gdn_v_grouped flag + split mode, all available before the
+  load loop.
+- Signs: ONE shared signs[6144] f32 tensor for all 48 ssm_out layers
+  (keyed by (width, buft); hadamard_sign_data.find(width)); rot: one
+  rot[1024,1024] f32 per (block_size, buft), computed on spot.
+  Transform emplaced per weight :2100.
+Graph gate:
+- build_lora_mm (llama-graph.cpp:1546-1603): memo key (cur, t.rot)
+  :1556; perm gate t.perm_rep > 1 :1561 (reshape_4d -> cont(permute
+  (0,2,1,3)) -> reshape back :1563-1567); signs mul :1569-1571;
+  llama_mul_mat_hadamard :1572; memo store :1573; ggml_mul_mat(w,
+  cur_mm) :1578.
+- Add `bool folded = false;` to llama_hadamard_transform
+  (llama-graph.h:23-32); the builder sets it in tensor mode;
+  build_lora_mm skips the whole transform block when folded (cur_mm =
+  cur). Signs/rot tensors still get created in tensor mode (harmless:
+  24.5 KB + 4 MB mirrored) - only their graph use is skipped.
+- split_states_equal HARDENING: DROPPED from scope - with H-A both
+  matmul srcs carry identical states {axis 0, 2048x3, 1024/1024}; keep
+  the change minimal.
+
+## F24. PQ2_0 / PTQ1_0 codec facts (committed knowledge)
+
+[certain] PQ2_0 codec: 2-bit codes {00=-1, 01=0, 10=+1, 11=+2};
+d = amax per 128-group stored as fp16; quant `q = round(w/d) + 1`
+clamped to [0,3]; quant runs along ne[0] (K axis, contiguous blocks,
+layout data[r + 6144*n] for ssm_out).
+- Full existing pair: quantize_row_pq2_0_ref (ggml-quants.c:113),
+  dequantize_row_pq2_0 (:494), quantize_pq2_0 (:2183), cpu wrapper
+  (ggml-cpu/quants.c:33). H-A needs NO new quant code.
+- block_pq2_0 (ggml-common.h:202-207): QK = 128, ggml_half d +
+  uint8_t qs[32] = 34 B per block. block_ptq1_0 at :214-220.
+- ssm_out weight [K=6144, N=5120] PQ2_0: 245760 blocks x 34 B =
+  8.36 MB per layer, 401 MB total.
+- Fork ggml type enum: PQ2_0 = 142 (extends the F12 table; PTQ1_0 is
+  the separate ternary type used by the PTQ1_0 family).
+
+## F25. Port-target clone located (the "min llama.cpp fork" question)
+
+[certain] `C:\Users\admin\source\ai\llama.cpp` exists: a CLONE of
+UPSTREAM ggml-org/llama.cpp (remote origin, branch master, HEAD
+6fcaa16f4 - recent upstream). It is NOT a 3nary-derivative and NOT the
+PrismML-Eng remote (that lives in the 3nary repo as remote "prism").
+- Contents: full upstream tree + build/ + build-gtx/, user scripts
+  (build-sycl.ps1, run-llama-sycl.ps1/.bat/.sh, build-gtx.ps1,
+  build-nv.ps1, build-vulkan.ps1, disable-vulkan-validation.ps1,
+  PORTABLE-SETUP.md), session notes (session-ses_f2a3_MTP_vs_
+  concurrency.md, session-ses_f381.md, session-ses_f458.md).
+- The user proposed (10-22) to work directly on this clone as the port
+  target ("keep the copy for us and create a true fork" later if
+  needed).
+[certain] Git state verified 10-22: branch master, HEAD 6fcaa16f4
+(2026-09-21, recent upstream). NO local user commits - the "[origin/
+master: ahead 53]" marker is a STALE local fetch ref, not local work.
+Working tree HAS 3 uncommitted tracked-file modifications from earlier
+sessions (DO NOT OVERWRITE, F25 user deltas):
+- common/chat.cpp: tool-call args JSON parse failure downgraded from
+  throw to LOG_WRN (keep string).
+- scripts/ui-assets.cmake: npm.ps1 added to the npm find_program list.
+- tools/server/server-context.cpp (~:3444): recurrent-memory (hybrid/
+  GDN) seq_rm refusal handling - if rollback fails, clear the sequence
+  and re-process the full prompt.
+[open] The port delta is UNMEASURED: the clone is recent UPSTREAM while
+the 3nary work sits on a fork far behind upstream (F12). Upstream has
+its own meta / tensor-split path (check its ggml-backend-meta.cpp) that
+DIVERGED from the 3nary one. Before any porting: diff upstream meta
+backend vs 3nary meta backend, confirm upstream type enum values for
+PQ2_0/PTQ1_0 (upstream has ternary types; numeric values likely differ
+from the 3nary fork - F12 never-mix rule), and map which 3nary work
+(ternary kernels, GDN hadamard builder, prism hadamard, tensor-mode
+options) is missing or divergent.

@@ -2,85 +2,65 @@
 
 Status markers: [x] done, [ ] open, [B] blocked on user.
 
-## IMMEDIATE NEXT STEPS (fresh session starts here)
+## IMMEDIATE NEXT STEPS (fresh session starts here, 10-22)
 
-DONE 10-19: 1. private/ pushed (02af668bf). 2. rebuild after \n edit
-green. 3. MTP fix pushed (0589b1e1a). Fresh session continues at step 4.
+Context: pivot to tensor-mode ternary compatibility (user direction
+10-22: "make ternary code tensor compatible and then ... port it back
+to the min llama.cpp fork"). Investigation is COMPLETE (F19-F25); the
+lead fix H-A is designed (F23) and AWAITING USER CONFIRMATION.
 
-4. [ ] TELL USER: Part-3 fallback gap - Qwen3.8 AND gemma-4 presets have
-   has_draft=true, so MTP ctx failure stays fatal in service runs. Offer to
-   extend the fallback to the has_draft case.
-5. [ ] Assert window (F1): read common.cpp :1230-1460 (common_init_from_
-   params / common_init_ entry, "fitting params" site, the two "failed to
-   create context" sites :1398 + :1449; check if caller sets
-   cparams.no_alloc before fit) AND server-context.cpp :1030-1090 (spec
-   params setup between "loading model" and common_init_from_params).
-   Update FINDINGS.md F1/F3 with the result.
-6. [ ] Assert exculpation test: rerun draft+spec 98304 repro args (NOTES.md
-   N7) + `--fit off`, port 18999, detached launch (N4), poll stderr.
-   If assert persists => fit fully exculpated, window is in spec setup /
-   common_init_ entry. Also do one repro at MAX verbosity (-lv 6 or
-   2147483647) to capture the last lines before the assert.
-7. [B] NEEDS USER: stop 61850 (PID 568492) to free VRAM. Then:
-   - rerun draft+spec 98304 on FREE VRAM (assert persists => deterministic
-     host-side defect; gone => host commit exhaustion under pressure)
-   - standalone MTP E2E: 98304 draft+spec (verify "loading draft model" +
-     MTP acceptance stats) and 262144 short gen (razor-thin fit)
-   - copy the 6 files build\bin -> C:\Users\admin\.local\3nary-sycl\
-     (llama.dll, llama-server-impl.dll, llama-server.exe,
-     llama-cli-impl.dll, llama-cli.exe, llama.exe)
-   - user starts service + runs 2-client repro; then grep
-     C:\Users\gorom\source\macube\logs\llama.log for "kv cache stream" at
-     next FAILED_PREPARE, expect `used == size` (KV-guard verification).
-8. [ ] Part-3 fallback test: pick a trigger (model WITHOUT nextn tensors /
-   forced OOM / skip with note).
+1. [B] PRESENT + GET OK: root-cause report (F20) + H-B death (F22) +
+   H-A design (F23) vs D1 mirror fallback. Required: new pattern /
+   large change. Also confirm: B7 C0/C1 keep/drop (demoted, not
+   cancelled); whether the B13 clone is the final port target.
+2. [ ] ON OK: implement H-A (B12) in this fork:
+   a. llama-model-loader.h: pre-transform callback member on
+      llama_model_loader; llama-model-loader.cpp load loop (:1551-1672):
+      branch forces the read_buf path for target tensors, calls the
+      callback, skips the normal set; no-op when unset.
+   b. Model side (llama-model.cpp, qwen35 arch): transform function
+      (dequant PQ2_0 -> f32, per-1024-row FWHT butterfly W8 x W128,
+      gather 128-row blocks grouped -> tiled t_b = 3*(b%16) + b/16,
+      per-row sign flip, requant quantize_row_pq2_0_ref); wire it as
+      the callback before ml.load_all_data (:1940); gate = tensor mode
+      + hadamard_gdn_v_grouped + `.ssm_out.` names (builder runs AFTER
+      load, so use hadamard_weight_blocks + the flag + split mode).
+   c. llama-graph.h:23-32: add `bool folded = false;` to
+      llama_hadamard_transform; builder sets it in tensor mode;
+      build_lora_mm (llama-graph.cpp:1546-1603) skips the whole
+      transform block when folded.
+3. [ ] Rebuild (N3). Verify with N14: no assert; SPLIT_STATE for the
+   ssm_out chain = {axis 0, 2048x3, 1024/1024}; output sanity.
+4. [ ] Test PQ2_0 in tensor mode (N14), then PTQ1_0
+   (`-m E:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PTQ1_0\Ternary-
+   Bonsai-2-27B-PTQ1_0.gguf -mm ...-mmproj-BF16.gguf -ngl all -sm
+   tensor -c 160000 -dev SYCL0,SYCL1`). Expect slight degradation from
+   the extra requant pass.
+5. [ ] Refresh private/ (F19-F25 + results) and commit+push (private/
+   ONLY, ASCII message + `Assisted-by: Claude, Qwen3.8-27B`).
+6. [ ] B13 recon (after B12 lands): diff upstream vs 3nary meta
+   backend (ggml-backend-meta.cpp), upstream PQ2_0/PTQ1_0 type enum
+   values, map missing 3nary work in the clone (F25 `how` 1-3). Write
+   recon notes to private/. THEN port commit-by-commit, scope
+   user-confirmed.
 
-## PHASE 2 - Option C preemption (staged, after assert + MTP are done)
+## PARKED (do not start without user re-scoping, 10-22)
 
-9. [ ] Locate the slot state machine + abort/response-stream plumbing
-   (server-context.cpp + server-*.h; server-slot.cpp does NOT exist).
-10. [ ] C0: error only the failing slot on alloc failure. Build, commit,
-    push.
-11. [ ] C1: victim = largest active slot; prompt_clear + rebuild + retry
-    failing slot; explicit "preempted" abort for the victim. Build, commit,
-    push.
-12. [ ] C2 (optional): silent resume.
-
-## PHASE 3 - remaining items
-
-13. [ ] PQ2_0 sweep: standalone load WITHOUT -c (fit auto) - read computed
-    ctx + load time; then run pq2-ctx-sweep.ps1 (service down, setvars in
-    script). Part A baselines are in the script comments.
-14. [ ] 58186 follow-up (F7): only if user asks - re-spawn ternary service
-    with NEW binary, capture its own stderr.
-15. [ ] Blocker B (ngl=0 comparison basis) - awaiting user choice:
-    (a) accept SYCL-vs-SYCL-host + host unit test, (b) separate
-    GGML_SYCL=OFF build dir, (c) skip.
-16. [ ] Stray artifacts test-pq2_0-sycl-dot.obj /
-    tests/test-pq2_0-sycl-dot.exe - pending user delete decision.
-17. [ ] SYCL docs (user-facing build/usage notes for the fork).
-18. [ ] FINAL REPORT with all open items: E2E numbers incl. ternary "pong"
-    run; KV root cause + fix + guard/diagnostic commits; pre-existing
-    test-dspark-forward LNK2019; stray artifacts; blocker B; ggml-sycl
-    NULL-copy crash; MTP razor-thin-fit finding; fused Gated Delta Net
-    warning; has_draft fallback gap; ggml.c:1661 assert status + window;
-    llama-gguf 0xC0000005 crash; 58458 clean-OOM tracking entry (spawn args
-    + classification); 58186 unconfirmed exit.
+- B7 preemption C0/C1/C2: DEMOTED (twin-server data-parallel design
+  DROPPED; C0/C1 "may be"). Plan intact in F11; B7 startup-side
+  commits 1+2 stay pending confirmation.
+- B5 free-VRAM suite / B6 Part-3 trigger / B8 PQ2_0 sweep / B9 final
+  report / B10 small follow-ups: status as in BACKLOG.md (parked /
+  open-low). The final report (B9) should include the tensor-mode work
+  when it lands.
 
 ## DONE (reference)
 
-- [x] PTQ1_0 SYCL decode port + prefill: committed+pushed, E2E PASS.
-- [x] KV bug root cause + guard a3f36885c + diagnostic 355b4a2b3:
-  committed+pushed.
-- [x] SYCL kernel bd993a9d7 + PTQ1_0 prefill 033a6f0ad: committed+pushed.
-- [x] MTP 3-part fix: all edits applied, build green (rebuild after \n
-  edit pending).
-- [x] Assert repro matrix (3 runs): MTP edits exonerated twice.
-- [x] Ternary standalone E2E: PASS, exit-code-1 mystery closed.
-- [x] 58458 gemma-4 OOM chain: tracked + classified (clean device KV OOM
-  under pressure, status 1, NOT the assert).
-- [x] Fit loop resolved: explicit -c => n_ctx no-op, but 56-iteration ngl
-  loop still runs (28.32 s, metadata loads only).
-- [x] Verbosity mapping resolved: -lv 3 = INFO; SRV_TRC invisible there;
-  assert window corrected to :994 -> "fitting params" (F1).
-- [x] pq2-ctx-sweep.ps1 fixed.
+- [x] 10-19/10-20: KV ring overcommit guard + diagnostic (a3f36885c,
+  355b4a2b3); MTP 3-part fix (0589b1e1a); PTQ1_0 SYCL byte-parallel
+  kernel B11 (bd993a9d7 + 033a6f0ad + 5b80a3bb1, tg128 6.90 -> 26.72);
+  fit-params draft-aware fix (48e9082ca); private/ knowledge library
+  (02af668bf, e844b224a, 11c3d328a, 7faf42ec4, 835d728b3).
+- [x] 10-22: tensor-mode root cause pinned (F20), meta model mapped
+  (F21), H-B dead (F22), H-A designed (F23), PQ2_0/PTQ1_0 codec facts
+  (F24), port-target clone located (F25). F15-F18 reconstructed/retained.
