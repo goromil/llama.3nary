@@ -60,6 +60,9 @@ then B13 port to the clone.
   lines, no :537 assert, SPLIT_STATE ssm_out {1024x3,1024x3} /
   ffn_down {8704x1,8704x1}, sane tokens. Unit test
   tests/test-hadamard-fold.cpp pins the formula (all checks pass).
+  Kernel-level fusion fallback (H-C, zero requant noise) documented in
+  F29 - adopt only if the fold's requant noise shows up in real
+  workloads.
 - B7a: startup-side loud-fail (unfittable ctx/KV) + closed --dev gate.
   Status: APPROVED 10-22, OPEN - NEXT in this fork. Target site:
   common/fit.cpp:182-183 (SPLIT_MODE_TENSOR fit throw, currently

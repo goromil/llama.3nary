@@ -533,8 +533,9 @@ activation side in tensor mode:
   = 2T).
 - No other form works: the only ops representable on xs[6144,T]{axis 0}
   are elementwise ops with matching states and TP K-reduction matmuls.
-- H-C (fuse H into the GDN kernel) = SYCL + CPU kernel rewrite;
-  rejected as too invasive for the gain.
+- H-C (fuse H into the kernel) = SYCL + CPU kernel rewrite;
+  rejected as too invasive for the gain. Now documented in full as the
+  fallback option: F29.
 Context: the SYCL FWHT fast path (ggml_sycl_op_fwht, fwht.cpp/.hpp)
 only serves n in {64,128,256,512} (n = src ne[0]); the 1024-wide
 hadamard falls through to generic dense matmul EVEN in single-device
@@ -609,6 +610,8 @@ Graph gate:
 - split_states_equal HARDENING: DROPPED from scope - with H-A both
   matmul srcs carry identical states {axis 0, 2048x3, 1024/1024}; keep
   the change minimal.
+- If the requant noise ever proves unacceptable, the kernel-level
+  fallback (H-C) is documented in F29.
 
 ## F24. PQ2_0 / PTQ1_0 codec facts (committed knowledge)
 
@@ -780,3 +783,105 @@ llama-error.log, grep by PID/port) until the user says otherwise.
 [open] Whether the same failure mode exists in the 3nary build (the
 clone's server-context.cpp seq_rm fix is a USER MOD, F25 - the 3nary
 fork may lack it or differ). Relevant to B13 porting scope.
+
+## F29. H-C kernel-level fusion - DOCUMENTED FALLBACK (10-23, user
+request: keep it documented in any case)
+
+Escalation path for B12 if the fold's one extra requant pass on the 128
+weights ever proves unacceptable (user clause 10-23: "if this proves
+[defect] above acceptable we must look for other solution"). NOT
+adopted now: B12 (H-A, 7cb134632) ships the load-time fold and is
+verified. H-C removes the requant entirely: the 128 weights stay
+verbatim from the GGUF; the activation transform runs at runtime, fused
+inside the ternary matmul kernel.
+
+Problem shape (why this is possible now, and what it must not break):
+- The meta backend only ever failed to place the STANDALONE signs +
+  hadamard ops on axis-split activations (F22: an axis-split tensor can
+  only flow through elementwise + K-reduction matmul; block-mixing is
+  neither). A plain matmul on the RAW activation IS placeable - the
+  folded B12 graph proves it (same shapes, same splits).
+- So H-C keeps the exact same graph as B12: res = mul_mat(W, x_raw).
+  No new placement rules, no meta backend change. All of the work is in
+  the SYCL ternary dot kernel + how it learns a given weight is
+  rotated.
+
+Design:
+1. Graph: build_lora_mm (llama-graph.cpp:1546-1603) skips the transform
+   block exactly as it does today for folded weights (B12 `folded`
+   flag). The only difference: the weight is NOT pre-transformed at
+   load (no dequant -> FWHT -> signs -> scatter -> requant), and a
+   "rotated" marker (the B12 `folded` set, renamed/repurposed) is
+   propagated to the op.
+2. Op/kernels: the matmul op must carry a rotation attribute (1024-block
+   FWHT + signs + optional ssm_out scatter) so backends apply it.
+   Representation options, in increasing invasiveness:
+   (a) a ggml op attribute / extra src on ggml_op_mul_mat set by the
+       graph builder;
+   (b) a thin dedicated op (e.g. ggml_op_mul_mat_rotated) that
+       ggml-backend-meta.cpp maps 1:1 to the mul_mat placement rules
+       (one new case, same split-state outputs: N-split -> axis-0 out,
+       K-split -> mirrored out with the existing cross-device
+       reduction).
+   (a) is smaller; (b) is cleaner if the rotation ever grows more
+   parameters.
+3. SYCL kernel (the actual work): inside the ternary dot kernel (the
+   B11 byte-parallel PQ2_0/PTQ1_0 x q8_1 family), per 1024-block of the
+   K (activation) axis:
+   - cooperatively load s * x_block (1024 f32 = 4 KB local memory);
+   - in-place FWHT (10 stages, n*log2(n) = 10240 ops);
+   - dot the transformed block against the (dequantized) W row chunk.
+   The transform is amortized per work-group over all N rows the group
+   covers - NOT re-run per row. The ssm_out scatter (grouped <-> tiled)
+   is applied to the x_block indices at load time (cheap index gather,
+   per 128-row group), ffn_down/attn_output use the identity.
+4. Straddling blocks under an EVEN split (the one real hazard - this is
+   the F22/F26 geometry): the in-kernel transform needs the FULL 1024
+   block, but under the current even split ffn_down devices hold 8704
+   (8.5 blocks) and attn_output 2560 (2.5 blocks) - one block straddles
+   the device boundary and needs 512 elements from the other device.
+   Two mitigations:
+   (i)  PREFERRED: block-aware UNEven split - ffn_down 8192/9216 (8/9
+        blocks), attn_output 2048/3072 (2/3), ssm_out stays 3072/3072.
+        Whole blocks per device, ZERO cross-device traffic. Cost: 12.5%
+        / 20% load imbalance on those weights only (4.2 vs 4.7 MiB
+        f32-equiv for ffn_down; trivial), plus a placement change in
+        llama-model.cpp (segment computation must emit uneven
+        block-aligned segments; SPLIT_STATE already supports arbitrary
+        per-device ne). NOTE: this also revives F26 option B in the
+        form actually needed - F26 only ruled out resplitting an EVEN
+        split (5 whole blocks cannot stay 50/50 as whole blocks); an
+        odd 2/3 split was never considered.
+   (ii) keep the even split + a boundary-block exchange: each device
+        fetches the other's 512 x T f32 for the straddling block
+        (2 KB at T=1 per layer) and transforms the full block locally.
+        Tiny volume, but per-token P2P latency + fence complexity on
+        every ffn_down/attn_output call. Rejected unless (i) proves
+        problematic.
+5. Cost estimate (runtime, per token, transform only): 10 flops/element
+   (log2 1024): ffn_down 17408 x 10 x 64 layers = ~11.1 M, attn_output
+   5120 x 10 x 16 = ~0.8 M, ssm_out 6144 x 10 x 48 = ~3.0 M; total
+   ~15 MFLOP/token - comparable to or smaller than the dequant + MAC
+   work the same kernels already do; expected to hide behind the
+   existing memory bandwidth, to be MEASURED (tg + t/s vs the B12 fold
+   run, same prompt, temp 1.0 for quality comparison).
+6. Trade vs B12 (the decision axis):
+   - B12 (shipped): +1 requant pass on 128/401 weights (PQ2_0/PTQ1_0
+     error ~ sqrt(2) x single pass, F23); zero runtime cost; zero
+     kernel/graph changes beyond the flag.
+   - H-C: zero added quantization noise (weights verbatim); cost =
+     kernel work above + graph op plumbing + (i) placement change.
+   - Decision criterion (user 10-23): adopt H-C only if the B12
+     fold's requant noise shows up in real workloads (temp 1.0,
+     long-context, the user's traffic). Quality A/B: same prompts,
+     -sm tensor (B12) vs the H-C build vs -sm layer baseline; judge
+     task accuracy, not token identity (temp 1.0 is non-deterministic).
+7. Scope estimate if ever started: graph flag propagation (small), op
+   attribute or thin op + meta case (small), SYCL kernel transform
+   (the bulk - one kernel family, 3 weight families), placement
+   uneven-split (small-medium), CPU/other-backend fallback = REFUSE
+   rotated matmul on non-SYCL backends in tensor mode (fail loud, like
+   B7a) since only the SYCL ternary kernel implements the transform.
+8. Port note (B13): the clone's SYCL ternary kernels diverge from the
+   3nary fork's (B11 byte-parallel rework is fork-only, F25). H-C would
+   be designed per-tree, not ported.
