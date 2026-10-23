@@ -323,8 +323,9 @@ build\bin\llama-cli.exe -m C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_
 - The runner script in $env:TEMP\opencode\run_pq2_debug.ps1 wraps this
   with setvars (N3 env).
 - Expected post-fix (B12/H-A): no assert; SPLIT_STATE for the ssm_out
-  chain = {axis 0, 2048x3, 1024/1024}; output sane (slight degradation
-  from the extra requant pass is EXPECTED).
+  chain = {axis 0, {1024x3, 1024x3}} (CORRECTED 10-23, was written as
+  2048x3 - the segment is 1024); output sane (slight degradation from
+  the extra requant pass is EXPECTED). VERIFIED 10-23: see F26/F27.
 
 ## N15. Port-target clone (B13, F25)
 
@@ -350,3 +351,41 @@ build\bin\llama-cli.exe -m C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_
 - Do NOT confuse with the 3nary repo remotes: 3nary's "origin" =
   goromil/llama.3nary (private), 3nary's "prism" = PrismML-Eng/llama.
   cpp. The clone's "origin" = upstream ggml-org/llama.cpp.
+- 10-23: the LIVE macube service is now deployed from the CLONE build
+  (compile-time path in its logs; child 50630 serving Q5_K_S in TENSOR
+  mode, after 62743 died - F28). The old PIDs 24252/26876 are STALE;
+  re-derive live PIDs via Get-NetTCPConnection -LocalPort 8080,58452.
+
+## N16. Fork CLI facts learned 10-23 (B12 verification)
+
+- llama-cli in this fork is a CLIENT-SERVER HYBRID (tools/cli/): it
+  spawns an IN-PROCESS llama_server on a random 127.0.0.1 port
+  (cli-server.h) and drives it over HTTP. Its log therefore contains
+  `srv llama_server` + `slot print_timing` lines, and the "answer"
+  arrives as streamed chat chunks (reasoning_content first for
+  thinking models - 16-token budgets get EATEN by the thinking block,
+  use >= 128 tokens to see the actual answer).
+- Exit code from the hybrid is UNRELIABLE (observed 253 at REPL EOF
+  after a fully successful run). Judge by the log, not the exit code.
+- The small 10752-B tool exes in build\bin (llama-cli, llama-server,
+  llama-bench, llama-completion, ...) are thin dispatch stubs; heavy
+  code is in llama.exe / the shared libs. llama-cli.exe TIMESTAMP STAYS
+  STALE across builds - judge by behavior, not mtime (the N3 note
+  about incremental builds).
+- NO sampling args in this fork's common args (no -temp in
+  common/arg.cpp): server-side default temp = 0.80 (common.h:236).
+  llama-server DOES take --temp (see tools/server/tests/utils.py:160).
+  For a deterministic (greedy) comparison run llama-server + HTTP, or
+  compare token SANITY, not exact tokens.
+- -sm (split mode) values parse in common/arg.cpp:2804 (tensor there;
+  none/layer/row standard). -sm none pins ALL layers to the first
+  device - do NOT use it while the live service occupies SYCL0 (only
+  ~5 GB free there); use -sm layer for a two-GPU baseline.
+- Verify-run log capture: pwsh in-memory capture (`2>&1` into a
+  variable) can be LOST when the runner dies (the verify2 log-missing
+  incident). Direct file redirection survives: `cmd /c "exe args > file
+  2>&1"` (runner: $env:TEMP\opencode\run_verify_direct.ps1; token
+  dumper: dump_tokens.ps1).
+- Live-service log lines: 5th column = level (D/I/W/E). LCP slot
+  selection lines (`selected slot by LCP similarity, f_sim_best = ...`)
+  are INFO, not warnings - they report warm-slot KV reuse.

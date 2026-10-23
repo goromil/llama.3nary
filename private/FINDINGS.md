@@ -660,3 +660,123 @@ PQ2_0/PTQ1_0 (upstream has ternary types; numeric values likely differ
 from the 3nary fork - F12 never-mix rule), and map which 3nary work
 (ternary kernels, GDN hadamard builder, prism hadamard, tensor-mode
 options) is missing or divergent.
+
+## F26. :537 UNKNOWN-axis assert - RESOLVED (10-23)
+
+[certain] The `ggml-backend-meta.cpp:537` UNKNOWN-axis assert hit after
+B12 (first failing node: blk.0 ffn_down signs-MUL) is PRE-EXISTING, not a
+fold regression: tensor mode cannot represent axis-split activations whose
+K extent is not a whole number of Hadamard blocks on each device, and
+ffn_down K=17408 = 8.5 x 1024 is one.
+[certain] FULL 401-weight audit (GGUF metadata dump, prism_names.py):
+exactly THREE weight families receive axis-split activations in tensor
+mode; all other 273 rotations take MIRRORED activations (runtime transform
+fine):
+- ssm_out x48  [K=6144, N=5120], split {1024x3, 1024x3} -> folded (B12).
+- ffn_down x64 [N=5120, K=17408], split {8704, 8704} on axis 0 = 8.5
+  blocks per device -> :537 assert (blk.0, first node after ssm_out).
+- attn_output x16 [5120, 5120] -> LATENT, same assert at blk.3 (the first
+  full-attn block; no tensor run ever reached it before).
+Break mechanics (attn_output, dump+code verified): flash-attn op q is 4D
+[n_embd_head, T, n_head, n_stream] (build_attn_mha permute 0,2,1,3, heads
+axis 2); handle_flash_attn_ext (:773) returns axis 1 for the 4D out;
+reshape_2d (llama-graph.cpp:2712) to [5120, T] gives axis-0 {2560, 2560};
+the sigmoid gate is a view of the QG-joint Qcur_full [10240, T]
+(interleaved head slots of 320 rows: q 160 + gate 160) so it carries the
+same split; the gated MUL keeps it. 2560 = 2.5 blocks.
+[certain] Option B (re-placement) is DEAD for attn_output: 5120 = 5 whole
+blocks cannot be split into whole-block counts across 2 devices (2.5
+each). Option A (meta-backend rules / sliced views) is dead at the
+rotation reshape step (F22). Folding (option C) is the ONLY viable shape.
+Fold formula for the new families (no perm): the graph transform is
+T(x) = H (s . x) (build_lora_mm order verified: perm-if-ssm_out -> signs
+MUL -> rotation), so W'' = W H diag(s): per output row dequant -> in-place
+FWHT per 1024 block -> multiply signs[k] (global K index) -> requant.
+Weight-domain order = FWHT THEN signs (transpose of activation-domain
+signs-then-H).
+Scope decision (user-approved 10-23): fold ONLY ssm_out + ffn_down +
+attn_output = 128 weights. Do NOT fold the other 273: their activations
+are MIRRORED, and folding all would add requant noise to every FFN/proj
+weight for zero gain.
+Total folds in tensor mode after B12 fix + extension: 128 (48 + 64 + 16).
+Expected SPLIT_STATE on folded leaves: ssm_out {1024x3, 1024x3} axis 0,
+ffn_down {8704x1, 8704x1} axis 0, attn_output {2560x1, 2560x1} axis 0.
+(Exit criterion CORRECTION: ssm_out is {1024x3}, not {2048x3} as F23/
+STATE said.)
+
+## F27. ssm_out fold gather bug (PROVEN) + B12 fix (10-23)
+
+[certain] The B12 (H-A) fold as first implemented had a PROVEN bug: the
+pre-gather `gcol[l] = col[perm_t[l]]` is a SPURIOUS permutation of the
+weight rows. W K-storage is GROUPED (F20 row/order math + kernel evidence:
+gated_delta_net.cpp:41 `iq1 = fastmodulo(h_idx, neqk1)` pairs v head i
+with k head i%16; kernel output written at `h + 128*h_idx` = TILED
+order), so the dequantized row is already in grouped order and must NOT
+be permuted before the FWHT.
+Proof (numeric mini-model, $env:TEMP\opencode\fold_order_test.py;
+n_hd=4 n_k=2 n_rep=4 K=32 block 8, true Sylvester H, cross-block perm):
+- code as implemented (gather p^-1 + scatter p): max err 5.58 WRONG
+- F23 design-doc formula (no gather, scatter p^-1): err 4.62 WRONG
+- FIXED (no gather, per-block FWHT, signs, scatter p = perm_g): EXACT
+  (diff 0.000000) vs required W'' = W H diag(s) P.
+The bug was LATENT: every tensor run died at :537 (blk.0 ffn_down) before
+any token, so the wrong 48 ssm_out folds never produced output; and the
+verifier (llama-context.cpp:36-120) is topology-only (folded = no
+activation transform), it cannot catch a numeric fold error. perm p is
+NOT self-inverse (p(128)=384, p(384)=1152 in the real 128/16/3 geometry),
+so "swap the gather direction" was also wrong - the gather must be DELETED.
+Fixed formula (implemented in fold_hadamard_weight, llama-model.cpp:1519):
+per row: dequant (grouped) -> in-place FWHT per 1024 block -> multiply
+signs (grouped index) -> ssm_out only: out[r] = col[perm_g[r]]; requant.
+ffn_down/attn_output: same pipeline minus the scatter (identity).
+Rotation-tensor build (load_tensors :2158-2171, popcount parity x
+1/sqrt(block_size)) verified == the fold's FWHT matrix exactly.
+B12 verification (10-23, PQ2_0 27B, -sm tensor, -c 4096): 128 fold lines
+(48 perm + 80 signs), "loaded 402 Hadamard-folded weight(s) (1
+inverse-lookup) using 1 rotation(s) and 3 sign vector(s)", SPLIT_STATE
+ssm_out {1024x3, 1024x3} / ffn_down {8704x1, 8704x1}, NO :537 assert,
+prompt eval 64 tok 20.68 t/s, 16+ sane reasoning tokens, full-attn blocks
+3,7,... first exercised (attn_output folds fire on blk.3/7).
+Formula pinned by unit test tests/test-hadamard-fold.cpp (added 10-23,
+user-approved): transcribed FWHT/signs/scatter pipeline checked against
+an independent dense Sylvester reference (butterfly == dense at n=4/8/
+16/1024; pipeline == W H diag(s) at small scale and == W H diag(s) P at
+the real 6144/1024 geometry, exact 0.0; perm bijection + spot values +
+not-self-inverse). Self-contained host test (pattern:
+test-ptq1_0-element-map.cpp), no model load. Scope note: it pins the
+formula contract, not the 20-line function body (private member, no
+public hook); the body is covered by the live B12 runs + this mini-model.
+PTQ1_0 tensor 128-tok: Paris found in thinking + temp-0.8 repeat loop;
+`-sm layer` baseline clean Paris. User 10-23: production sampling is
+temp 1.0 and never loops -> loop = sampling artifact, fold exonerated,
+greedy isolation dropped.
+
+## F28. Live service (CLONE build) state restore failure, 88K tok (OPEN)
+
+[observed] 10-23, user pasted live-service log: the macube service is now
+deployed from the CLONE tree `C:\Users\admin\source\ai\llama.cpp`
+(compile-time path in the error line; old child PID 62743, new child
+50630, LCP lines from 59148). It runs Qwen3.8-27B-UD-Q5_K_S in TENSOR
+mode (fit warning "llama_params_fit is not implemented for
+SPLIT_MODE_TENSOR" at child boot - so the clone HAS the tensor mode enum
++ meta backend: de-risks B13, but recon must confirm scope).
+Failure sequence (slot 3, task 15109, n_tokens = 88212):
+`E slot iterate: got exception: bad allocation` -> `state_seq_set_data:
+error loading state: bad allocation` -> `common/common.cpp:2350:
+checkpoint size mismatch: expected 102694248, got 0`. 102694248 B =
+97.94 MiB. This is the sequence-state (recurrent memory) save/restore
+path - the same area as the user's clone fix in
+tools/server/server-context.cpp (~:3444, seq_rm refusal: on rollback
+failure clear the sequence and re-process the full prompt).
+[certain] Interpretation: a state SAVE must have failed (bad allocation)
+and left a 0-byte checkpoint; the subsequent restore then hit the size
+mismatch. Root cause of the save failure NOT yet pinned: candidates are
+device-side allocation pressure at 88K tokens (KV + GDN state + a ~98 MiB
+state blob copy) or a code path bug in state save/restore. The child
+recovered (50630 relaunched, model loaded, serving).
+[constraint] Do not disturb the service. Investigation is read-only
+(macube logs: C:\Users\gorom\source\macube\logs\llama.log +
+llama-error.log, grep by PID/port) until the user says otherwise.
+[open] Whether the same failure mode exists in the 3nary build (the
+clone's server-context.cpp seq_rm fix is a USER MOD, F25 - the 3nary
+fork may lack it or differ). Relevant to B13 porting scope.
