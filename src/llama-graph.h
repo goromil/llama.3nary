@@ -23,6 +23,9 @@ struct ggml_tensor;
 struct llama_hadamard_transform {
     ggml_tensor * rot;
     ggml_tensor * signs; // nullptr for identity sign mode
+    // true when the transform was folded into the weight at load time:
+    // the activation then arrives already in the folded order, apply no ops
+    bool folded = false;
     // when perm_rep > 1 the activation arrives with its feature axis in tiled
     // head order [hd, nk, rep] and must be permuted to the grouped order
     // [hd, rep, nk] the fold was computed in, before signs and rotation

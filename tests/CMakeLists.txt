@@ -341,6 +341,9 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
+# hadamard fold formula for tensor-mode ternary weights (host only)
+llama_build_and_test(test-hadamard-fold.cpp)
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)

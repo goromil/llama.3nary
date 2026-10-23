@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <cassert>
@@ -36,6 +37,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1514,6 +1516,143 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+bool llama_model_base::fold_hadamard_weight(
+        ggml_tensor * cur,
+        const llama_model_loader::llama_tensor_weight & weight,
+        std::set<const ggml_tensor *> & folded) const {
+    // in tensor split mode the ssm_out perm and the ffn_down/attn_output K
+    // axes cannot be represented across device segments, so fold the
+    // activation-side transform into the weight at load time
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        return false;
+    }
+    const char * name = ggml_get_name(cur);
+    if (cur->type != GGML_TYPE_PQ2_0 && cur->type != GGML_TYPE_PTQ1_0) {
+        return false;
+    }
+    const auto wb = hadamard_weight_blocks.find(name);
+    if (wb == hadamard_weight_blocks.end()) {
+        return false;
+    }
+    const int64_t n_feat = cur->ne[0];
+    const uint32_t block_size = wb->second;
+    if (n_feat % block_size != 0) {
+        return false;
+    }
+    const bool is_ssm_out = hadamard_gdn_v_grouped && std::string(name).find(".ssm_out.") != std::string::npos;
+    if (!is_ssm_out && std::string(name).find(".ffn_down.") == std::string::npos
+                          && std::string(name).find(".attn_output.") == std::string::npos) {
+        return false;
+    }
+    // ssm_out rows are stored grouped (head, rep, n) while the raw activation
+    // is tiled (head, n, rep); map each tiled slot r to the grouped slot l
+    // holding the same feature: r = h + n_hd*n + n_hd*n_k*v ->
+    // l = h + n_hd*v + n_hd*n_rep*n
+    std::vector<int32_t> perm_g;
+    if (is_ssm_out) {
+        const int64_t n_v = hparams.ssm_dt_rank;
+        const int64_t n_k = hparams.ssm_n_group;
+        if (n_k <= 0 || n_v <= 0 || n_v % n_k != 0 || n_feat % n_v != 0) {
+            return false;
+        }
+        const int64_t n_rep = n_v / n_k;
+        if (n_rep <= 1) {
+            return false;
+        }
+        const int64_t n_hd = n_feat / n_v;
+        perm_g.resize(n_feat);
+        for (int64_t r = 0; r < n_feat; ++r) {
+            const int64_t h = r % n_hd;
+            const int64_t n = (r / n_hd) % n_k;
+            const int64_t v = r / (n_hd * n_k);
+            perm_g[r] = (int32_t) (h + n_hd * v + n_hd * n_rep * n);
+        }
+    }
+    const auto signs = hadamard_sign_data.find((uint32_t) n_feat);
+    if (signs != hadamard_sign_data.end() && (int64_t) signs->second.size() != n_feat) {
+        return false;
+    }
+
+    // fold W'' = W * H * diag(s); for ssm_out the rows are read in grouped
+    // storage order and the result scattered to tiled order (slot r takes
+    // grouped slot perm_g[r]) so the raw activation can be multiplied
+    // against it as-is
+    const size_t n_size = ggml_nbytes(cur);
+    std::vector<uint8_t> raw(n_size);
+    llama_file & file = *ml->files.at(weight.idx);
+    file.seek(weight.offs, SEEK_SET);
+    file.read_raw(raw.data(), n_size);
+    if (ml->check_tensors && !ggml_validate_row_data(cur->type, raw.data(), n_size)) {
+        throw std::runtime_error(format("tensor '%s' has invalid data", name));
+    }
+
+    const int64_t n_cols  = ggml_nelements(cur) / n_feat;
+    const size_t col_size = n_size / n_cols;
+    const float had_scale = 1.0f / sqrtf((float) block_size);
+
+    std::vector<float> col(n_feat), out(n_feat);
+    std::vector<uint8_t> data(n_size);
+
+    for (int64_t c = 0; c < n_cols; ++c) {
+        const uint8_t * src = raw.data()  + c * col_size;
+        uint8_t * dst = data.data() + c * col_size;
+
+        switch (cur->type) {
+        case GGML_TYPE_PQ2_0:  dequantize_row_pq2_0((const block_pq2_0 *) src, col.data(), n_feat); break;
+        case GGML_TYPE_PTQ1_0: dequantize_row_ptq1_0((const block_ptq1_0 *) src, col.data(), n_feat); break;
+        default: GGML_UNREACHABLE();
+        }
+
+        // in-place FWHT per Hadamard block: the same product as the
+        // normalized Sylvester matrix built in load_tensors
+        for (int64_t b0 = 0; b0 < n_feat; b0 += block_size) {
+            float * v = col.data() + b0;
+            for (uint32_t h = block_size / 2; h > 0; h >>= 1) {
+                for (uint32_t i = 0; i < block_size; i += 2 * h) {
+                    for (uint32_t j = i; j < i + h; ++j) {
+                        const float a = v[j];
+                        const float b = v[j + h];
+                        v[j]     = a + b;
+                        v[j + h] = a - b;
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < block_size; ++i) {
+                v[i] *= had_scale;
+            }
+        }
+
+        if (signs != hadamard_sign_data.end()) {
+            for (int64_t k = 0; k < n_feat; ++k) {
+                col[k] *= (float) signs->second[k];
+            }
+        }
+
+        if (is_ssm_out) {
+            for (int64_t r = 0; r < n_feat; ++r) {
+                out[r] = col[perm_g[r]];
+            }
+        }
+
+        const float * fin = is_ssm_out ? out.data() : col.data();
+        switch (cur->type) {
+        case GGML_TYPE_PQ2_0:  quantize_row_pq2_0_ref(fin, (block_pq2_0 *) dst, n_feat); break;
+        case GGML_TYPE_PTQ1_0: quantize_row_ptq1_0_ref(fin, (block_ptq1_0 *) dst, n_feat); break;
+        default: GGML_UNREACHABLE();
+        }
+    }
+
+    ggml_backend_tensor_set(cur, data.data(), 0, n_size);
+    folded.insert(cur);
+
+    if (is_ssm_out) {
+        LLAMA_LOG_INFO("%s: folded perm + signs + Hadamard into %s\n", __func__, name);
+    } else {
+        LLAMA_LOG_INFO("%s: folded signs + Hadamard into %s\n", __func__, name);
+    }
+    return true;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (params.dspark_head_source && arch != LLM_ARCH_DSPARK) {
         throw std::runtime_error("Shared target head is supported only for DSpark");
@@ -1935,6 +2074,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
+    // in tensor split mode the activation-side Hadamard transform cannot be
+    // represented across devices for the ssm_out, ffn_down and attn_output K
+    // axes, so fold it into the weights at load time and skip the transform
+    // in the graph
+    std::set<const ggml_tensor *> folded_hadamard_weights;
+    ml.pre_transform = [this, &folded_hadamard_weights](ggml_tensor * cur, const llama_model_loader::llama_tensor_weight & weight) {
+        return fold_hadamard_weight(cur, weight, folded_hadamard_weights);
+    };
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -2097,6 +2245,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 transform.perm_nk  = n_k;
                 transform.perm_rep = n_v / n_k;
             }
+            transform.folded = folded_hadamard_weights.count(weight) != 0;
             target->emplace(weight, transform);
         }
 

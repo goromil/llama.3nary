@@ -1563,6 +1563,11 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+        if (pre_transform && pre_transform(cur, *weight)) {
+            size_done += n_size;
+            continue;
+        }
+
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;

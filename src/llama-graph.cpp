@@ -1552,25 +1552,27 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
             const auto & t = it->second;
-            // another folded weight on this same activation already built the transform
-            const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
-            const auto memo_it  = hadamard_memo.find(memo_key);
-            if (memo_it != hadamard_memo.end()) {
-                cur_mm = memo_it->second;
-            } else {
-            if (t.perm_rep > 1) {
-                // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
-                ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
-                const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
-                x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
-                x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
-                cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
-            }
-            if (t.signs) {
-                cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
-            }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
-            hadamard_memo[memo_key] = cur_mm;
+            if (!t.folded) {
+                // another folded weight on this same activation already built the transform
+                const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+                const auto memo_it  = hadamard_memo.find(memo_key);
+                if (memo_it != hadamard_memo.end()) {
+                    cur_mm = memo_it->second;
+                } else {
+                if (t.perm_rep > 1) {
+                    // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
+                    ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
+                    const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+                    x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+                    x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+                    cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+                }
+                if (t.signs) {
+                    cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+                }
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+                hadamard_memo[memo_key] = cur_mm;
+                }
             }
         }
     }
@@ -1612,25 +1614,27 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
             const auto & t = it->second;
-            // another folded weight on this same activation already built the transform
-            const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
-            const auto memo_it  = hadamard_memo.find(memo_key);
-            if (memo_it != hadamard_memo.end()) {
-                cur_mm = memo_it->second;
-            } else {
-            if (t.perm_rep > 1) {
-                // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
-                ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
-                const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
-                x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
-                x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
-                cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
-            }
-            if (t.signs) {
-                cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
-            }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
-            hadamard_memo[memo_key] = cur_mm;
+            if (!t.folded) {
+                // another folded weight on this same activation already built the transform
+                const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+                const auto memo_it  = hadamard_memo.find(memo_key);
+                if (memo_it != hadamard_memo.end()) {
+                    cur_mm = memo_it->second;
+                } else {
+                if (t.perm_rep > 1) {
+                    // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
+                    ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
+                    const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+                    x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+                    x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+                    cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+                }
+                if (t.signs) {
+                    cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+                }
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+                hadamard_memo[memo_key] = cur_mm;
+                }
             }
         }
     }

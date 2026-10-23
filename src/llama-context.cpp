@@ -74,6 +74,17 @@ static void llama_verify_hadamard_graph(
         const bool transformed = src && src->op == GGML_OP_MUL_MAT &&
             ((const int32_t *) src->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD &&
             src->src[0] == it->second.rot;
+        if (it->second.folded) {
+            // transform already in the weight values: a rotation here would
+            // apply it twice
+            if (transformed) {
+                throw std::runtime_error(format(
+                    "Hadamard-folded weight '%s' already carries the transform in its values; "
+                    "the graph must not apply the activation transform again",
+                    node->src[0]->name));
+            }
+            continue;
+        }
         if (!transformed) {
             throw std::runtime_error(format(
                 "Hadamard-folded weight '%s' is consumed without its activation transform; "

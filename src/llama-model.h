@@ -5,10 +5,12 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-model-loader.h"
 #include "llama-vocab.h"
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,7 +18,6 @@
 
 struct llama_cparams;
 struct llama_ubatch;
-struct llama_model_loader;
 
 // available models
 enum llm_type {
@@ -819,6 +820,13 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    // folds the activation-side transform (perm for ssm_out, signs and block
+    // Hadamard for ssm_out/ffn_down/attn_output) into the weight at load time
+    // so tensor split mode needs no transform in the graph; returns true when
+    // the weight was folded and the default load path must be skipped
+    bool fold_hadamard_weight(ggml_tensor * cur, const llama_model_loader::llama_tensor_weight & weight,
+            std::set<const ggml_tensor *> & folded) const;
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
@@ -96,6 +97,8 @@ struct llama_model_loader {
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
+    // optional pre-load hook: return true to replace the default load path
+    std::function<bool(ggml_tensor *, const llama_tensor_weight &)> pre_transform;
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;
