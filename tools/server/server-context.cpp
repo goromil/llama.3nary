@@ -61,6 +61,12 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+enum decode_result {
+    DECODE_OK    = 1,  // tokens were decoded, advance the batch
+    DECODE_RETRY = 0,  // retry the same position, n_batch may have been updated
+    DECODE_SKIP  = -1, // tokens were not decoded, the owning slot was ended, skip them
+};
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -2764,21 +2770,26 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                const int ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
 
-                if (ok) {
-                    // move the head of the batch forward with the number of tokens we just processed
-                    off_next = off + n_tokens;
-
-                    // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
-                } else {
+                if (ok == DECODE_RETRY) {
                     // try again with the updated n_batch
                     continue;
                 }
+
+                // move the head of the batch forward with the number of tokens we just processed
+                off_next = off + n_tokens;
+
+                if (ok == DECODE_SKIP) {
+                    // the tokens were not decoded, the owning slot was ended inside decode()
+                    continue;
+                }
+
+                // on successful decode, restore the original batch size
+                n_batch = llama_n_batch(ctx_tgt);
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
@@ -3544,9 +3555,8 @@ private:
         }
     }
 
-    // returns true = success ; false = retry with smaller batch size
-    // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+    // returns a decode_result, throw std::runtime_error on fatal error
+    int decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -3558,7 +3568,7 @@ private:
                 GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
             }
 
-            return true; // nothing to decode
+            return DECODE_OK; // nothing to decode
         } else {
             n_empty_consecutive = 0;
         }
@@ -3588,55 +3598,80 @@ private:
         });
 
         if (ret != 0) {
-            {
-                std::string err;
+            std::string err;
 
-                if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
-                    err = "Context size has been exceeded.";
-                }
+            if (ret == -1) {
+                err = "Invalid input batch.";
+            }
 
-                if (ret == -1) {
-                    err = "Invalid input batch.";
-                }
+            if (ret < -1) {
+                // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
+                err = "Compute error.";
+            }
 
-                if (ret < -1) {
-                    // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
-                    err = "Compute error.";
-                }
+            // TODO: handle ret == 2 (abort) when we start aborting
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+            if (!err.empty()) {
+                SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
-                if (!err.empty()) {
-                    SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, err);
+                        slot.release();
 
-                    for (auto & slot : slots) {
-                        if (slot.is_processing()) {
-                            send_error(slot, err);
-                            slot.release();
-
-                            // note: it's complicated to keep track of how much of the current batch has been
-                            //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
-                        }
+                        // note: it's complicated to keep track of how much of the current batch has been
+                        //       processed before the error occurred, so we simply clear the entire context
+                        slot.prompt_clear();
                     }
-
-                    // stop, do not retry with smaller batch size
-                    throw std::runtime_error(err);
                 }
+
+                // stop, do not retry with smaller batch size
+                throw std::runtime_error(err);
+            }
+
+            // KV cache exhausted (ret == 1): the token(s) could not be allocated
+
+            if (n_batch == 1) {
+                // the half-batch retries are exhausted, a single token still does not fit
+                // note: freeing an idle slot only helps with a unified KV cache, see try_clear_idle_slots()
+                if (try_clear_idle_slots()) {
+                    return DECODE_RETRY;
+                }
+
+                // nothing left to free: end the failing slot only, the server keeps running
+                // note: with n_batch == 1 the view holds a single token, its seq id is the owning slot id
+                server_slot * fail_slot = nullptr;
+                for (auto & slot : slots) {
+                    if (slot.id == batch_view.seq_id[0][0]) {
+                        fail_slot = &slot;
+                        break;
+                    }
+                }
+
+                if (fail_slot != nullptr && fail_slot->is_processing()) {
+                    SLT_WRN(*fail_slot, "KV cache is exhausted, ending the slot, the server keeps running\n");
+
+                    send_error(*fail_slot,
+                               string_format("KV cache is exhausted: the context size of %d tokens has been exceeded", fail_slot->n_ctx),
+                               ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                    fail_slot->release();
+                    fail_slot->prompt_clear();
+
+                    return DECODE_SKIP;
+                }
+
+                SRV_ERR("KV cache exhausted, no failing slot found, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
+                throw std::runtime_error("KV cache exhausted, no failing slot found");
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
-                if (n_batch > 1) {
-                    n_batch /= 2;
-                }
+                n_batch /= 2;
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
-            return false; // retry with the updated n_batch
+            return DECODE_RETRY;
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
@@ -3682,7 +3717,7 @@ private:
             }
         }
 
-        return true;
+        return DECODE_OK;
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
