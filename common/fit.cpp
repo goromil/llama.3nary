@@ -8,6 +8,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <numeric>
 #include <set>
 #include <string>
 #include <vector>
@@ -178,7 +179,7 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -303,6 +304,58 @@ static void common_params_fit_impl(
         }
         for (std::string & dn : dev_names) {
             dn.insert(dn.end(), max_length - dn.length(), ' ');
+        }
+    }
+
+    // optional: grow the context into the free memory up to n_ctx_max_user
+    // note: runs before the margin check below, so the grown context is what gets checked
+    if (n_ctx_max_user > 0 && nd > 0 && cparams->n_ctx > 0) {
+        const uint32_t cur = cparams->n_ctx;
+        const uint32_t cap = std::min(n_ctx_max_user, n_ctx_max);
+
+        if (cap > cur) {
+            LOG_TRC("%s: growing the context from %" PRIu32 ", up to %" PRIu32 ":\n", __func__, cur, cap);
+
+            const uint32_t n_ctx_saved = cparams->n_ctx;
+            cparams->n_ctx = cap;
+            dmds_t dmds_cap = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            cparams->n_ctx = n_ctx_saved;
+            add_extra_memory(dmds_cap);
+
+            // context growth in bytes per token, main and extra models together
+            std::vector<int64_t> ctx_rate(nd, 0);
+            uint64_t limit = UINT64_MAX;
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t b = (int64_t) dmds_cap[id].mb.context - (int64_t) dmds_full[id].mb.context;
+                ctx_rate[id] = b > 0 ? b / (int64_t) (cap - cur) : 0;
+                if (ctx_rate[id] <= 0) {
+                    continue; // this device does not grow with the context
+                }
+                const int64_t used = (int64_t) dmds_full[id].mb.total();
+                const int64_t budget = dmds_full[id].free - used - margins[id];
+                if (budget < 0) {
+                    limit = 0;
+                    break; // this device is already over budget at the current context
+                }
+                limit = std::min(limit, (uint64_t) cur + (uint64_t) (budget / ctx_rate[id]));
+            }
+
+            if (limit > cur) {
+                const uint32_t align = (uint32_t) std::lcm<uint32_t>(16384, n_streams);
+                const uint32_t grown = (uint32_t) ((std::min(limit, (uint64_t) cap) / align) * align);
+                if (grown > cur) {
+                    cparams->n_ctx = grown;
+                    // keep the initial measurement consistent, the margin check below applies to the grown context
+                    for (size_t id = 0; id < nd; id++) {
+                        dmds_full[id].mb.context += (size_t) ctx_rate[id] * (grown - cur);
+                    }
+                    LOG_TRC("%s: growing the context from %" PRIu32 " to %" PRIu32 "\n", __func__, cur, grown);
+                }
+            }
+
+            if (extra != nullptr) {
+                extra->cparams->n_ctx = cparams->n_ctx; // add_extra_memory above synced it to the measured size
+            }
         }
     }
 
@@ -883,12 +936,13 @@ enum common_params_fit_status common_fit_params(
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
         uint32_t n_ctx_min,
+        uint32_t n_ctx_max_user,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, n_ctx_max_user, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

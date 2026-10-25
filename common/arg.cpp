@@ -2908,6 +2908,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
     add_opt(common_arg(
+        { "-fitm", "--fit-ctx-max" }, "N",
+        string_format("maximum total ctx size that --fit may grow -c to, 0 = do not grow, default: %" PRIu32, params.fit_params_max_ctx),
+        [](common_params & params, int value) {
+            params.fit_params_max_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_FIT_CTX_MAX"));
+    add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
         [](common_params & params) {
