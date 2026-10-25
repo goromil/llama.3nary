@@ -1110,97 +1110,132 @@ Findings:
 Commit: 1011b639d (fit.cpp +260, ggml-backend.h +4,
 ggml-backend-meta.cpp 8 +/-), pushed 10-25.
 
-## F33. Per-slot runtime context growth (DESIGN ONLY, no code)
+## F33. Runtime context growth (design CONFIRMED 10-25, implementing)
 
 Goal: when a slot hits the KV wall (F31 stage 1 ends it) and the
-cards demonstrably have headroom, grow THAT slot's context instead
-of ending it. Runtime counterpart of -fitm (F31 stage 2, fit-time):
-the model stays loaded, the other slots keep decoding, only one
-slot's context is recreated larger. PENDING USER CONFIRMATION -
-nothing implemented.
+cards have headroom, grow the context IN PLACE instead of ending
+the slot. Runtime counterpart of -fitm (F31 stage 2, fit-time): the
+model stays loaded, no restart, no slot loss, no output reset.
 
-Grounding (verified in tree 10-25):
-- Slots have PER-SLOT contexts: server_slot.ctx_tgt/ctx_dft
-  (server-context.cpp:203-204), slot.n_ctx is per-slot. Growth =
-  one new llama_context on the same loaded model, not a server
-  restart.
-- Wall path today (F31 stage 1): decode() n_batch == 1 && ret == 1
-  -> try_clear_idle_slots() (:1586) -> else end ONLY the failing
-  slot with EXCEED_CONTEXT_SIZE (:3632-3664). Growth slots in
-  between the idle-clear and the end. Second site: the task-start
-  check n_tokens > slot.n_ctx (:3085-3116) - a big prompt that does
-  not fit the pinned n_ctx could be grown at assignment time
-  instead of erroring.
-- The restore primitive exists and is in production use: the per-seq
-  state export/import (llama_state_seq_get/set_data_ext,
-  llama-context.cpp:4411-4420, impl :3267/:3286). The server
-  already saves/restores slot state this way (prompt_save
-  :259-283, handle_slots_restore :5253).
-- COVERAGE VERIFIED: both memory types are seq-scoped in this fork
-  (the earlier guess that the export covered full-attn KV only is
-  WRONG):
-  - full-attn KV: llama-kv-cache.cpp:2176 state_write; per-cell
-    positions are stored (state_write_meta :2295) -> position-keyed
-    restore into the larger ring;
-  - GDN recurrent R/S: llama-memory-recurrent.cpp:743 state_write;
-    cells carry seq_id, R/S buffers are fixed size per cell (no
-    n_ctx dependence) -> size-invariant restore.
-- Sizing: reuse the tensor-fit per-card math (F32: fixed + rate,
-  budget = free - used - margin) against the CURRENT per-card free
-  memory; floor to 16384, capped at n_ctx_train.
+CORRECTION 10-25 (pivot, verified in tree): the original F33 draft
+assumed PER-SLOT contexts (slot.ctx_tgt/ctx_dft, "recreate one
+slot's ctx", "the other slots keep decoding"). That premise is
+WRONG:
+- ONE shared ctx per server: ctx_tgt/ctx_dft are created exactly
+  once in load_model (server-context.cpp:1057-1060) via
+  common_init_result; slots hold only pointers (server-context.
+  cpp:203-204). n_ctx = llama_n_ctx(ctx_tgt) (:1074) is the TOTAL;
+  n_ctx_slot = llama_n_ctx_seq(ctx_tgt) (:1170, capped at
+  n_ctx_train) is the per-slot share.
+- "Other slots keep decoding" during a swap is UNACHIEVABLE: all
+  slots decode through the same shared ctx. All active slots pause
+  briefly (sub-second) during the regrow.
 
-Design (draft):
-1. Trigger: KV exhaustion at the wall for slot s (or a big prompt at
-   task start) with slot.n_ctx below the grown target. If the
-   per-card budget solve yields target <= slot.n_ctx (no headroom),
-   fall through to the current end-slot behavior (F31 unchanged).
-2. Quiesce: stop decoding for slot s (it is at the wall anyway);
-   synchronize the context.
-3. Save: llama_state_seq_get_data_ext(ctx, buf, size, s.id) into a
-   host buffer - KV + GDN state for the slot's seq, and the draft
-   state if ctx_dft (prompt_save already sizes both).
-4. Recreate: free the old ctx (releases its VRAM BEFORE the new one
-   allocates, so peak device memory = new ctx, not old+new), create
-   the new ctx at the grown n_ctx on the same model, then
-   llama_state_seq_set_data_ext(new_ctx, buf, size, s.id).
-5. Resume: point slot.ctx_tgt/ctx_dft at the new contexts, update
-   slot.n_ctx, continue decoding at the same position. The client
-   sees a pause (save + create + restore), no error, no restart.
-6. Rollback: if the new ctx creation fails, recreate the old ctx at
-   the old n_ctx and restore the saved state into it; if THAT
-   fails, end the slot (F31 behavior). The host buffer is the
-   source of truth until the restore succeeds.
-7. Budget: the per-card solve must subtract the host-buffer cost
-   from the HOST budget (not the cards) - the state buffer can be
-   large (KV ~24 KiB/token q5_1 + GDN ~150 MiB/seq at 27B scale);
-   the card budget must cover the new ctx while the model + other
-   slots' ctx stay resident.
-8. GDN note: the recurrent state is restored from the buffer, but
-   ONLY the tokens of the slot's own seq are covered - if the slot
-   ever shared a cell with another seq (cell.src copy-on-write,
-   llama-memory-recurrent.cpp:780), the shared state belongs to the
-   other owner; verify no cross-slot cell sharing exists in the
-   server (each slot is a separate context, so this should hold).
+The recreate design (save host state, free ctx, re-create,
+restore) is SUPERSEDED by the design below.
 
-Open questions (verify before implementing):
-1. state_read into a larger ring when the old ring wrapped (cache
-   shift) or an SWA mask dropped cells at save
-   (llama-kv-cache.cpp:2204-2208): the position-keyed restore should
-   cope, but the wrapped case needs a dedicated check.
-2. Draft/MTP slots: ctx_dft must be recreated and restored in the
-   same quiesced window (prompt_save's main+drft pattern).
-3. n_ctx_max_user equivalent: an opt-in cap flag (grow only up to N,
-   0 = off) mirroring -fitm, so growth is not surprising.
-4. Growth is PER-SLOT; in the unified-KV layout the ring is shared
-   (F32 finding 1), so the budget must account for the shared ring
-   growing and shrinking other slots' available cells.
-5. Interaction with the prompt cache (server_prompt_cache): a
-   grown slot's saved prompt (from before the growth) is stale and
-   must be invalidated.
+FINAL DESIGN (user agreed 10-25): in-place tail extension of the
+shared ctx ring, via per-layer data-tensor regrow. No shift, no
+re-pointing, no host save, no ctx recreation. The ring just gets
+more cells at the tail; everything else keeps the same object
+identity.
 
-Exit: user confirms or drops; if confirmed, recon notes (the open
-questions above) to private/ then staged implementation. NOT to be
-implemented without explicit confirmation.
+Why in-place is safe (all verified in tree):
+- Bookkeeping: llama_kv_cells.used is a std::set of cell indices
+  (llama-kv-cells.h:462); find_slot (llama-kv-cache.cpp:899-1096)
+  scans for empty cells, so holes are tolerated; cell indices stay
+  stable under all normal ops (shifts are pos-based; K-shift
+  re-encodes in place). Appending empty cells at the tail is a
+  valid extension; no existing data moves.
+- Data side: K/V tensors are per-buft today (one ggml ctx + one
+  buffer per device, llama-kv-cache.cpp:111-134, 278-296).
+  Regrowing per-device would need 2x per-device peak (~21 GiB on
+  ~10.7 GiB of per-device KV at 27B scale) - does not fit. Fix:
+  restructure the ctor to per-(layer, buft) ggml ctx + buffer, so
+  resize() can free each layer's old buffer right after its D2D
+  copy. Peak = old total + one layer's K+V (27B: 16 attn layers,
+  ~21.4 GiB KV total at ~910k tokens -> ~0.7-1.4 GiB extra per
+  card), which fits the 1.6-2.7 GiB free/card headroom.
+- GDN recurrent memory is NOT n_ctx-dependent: rs_size =
+  max(1, n_seq_max) (llama-model.cpp:2944); ring size = cell count
+  = n_seq_max (llama-memory-recurrent.h:70). No GDN grow needed.
+- MTP/draft ctx (mtp_on_hybrid_qwen, llama-model.cpp:2870-2873)
+  is a standalone plain llama_kv_cache (filter il >= n_layer,
+  mem_other = nullptr: own cells, own tensors) - the server
+  driver grows it too, same size; rollback = resize back.
+- No re-pointing after grow: common_memory (common.h:988-998)
+  holds only the ctx pointers; the prompt cache holds HOST buffers
+  (prompt_save :259-283, LLAMA_STATE_SEQ_FLAGS_NONE) keyed by
+  position - entries stay valid after a tail extension, no
+  invalidation needed.
+- The per-seq state export/import (llama_state_seq_get/set_data_
+  ext) is still the right tool for the draft rollback path and for
+  debugging, but the happy path needs no host save at all.
+
+Design (final, agreed 10-25):
+1. Core (stage 1):
+   - llama_memory_i: virtual bool resize(uint32_t new_size)
+     { return false; } (precedent: get_cell_usage, llama-memory.
+     h:107).
+   - llama_kv_cells: keep-existing resize (append empty cells; the
+     existing resize() at :63-70 resets state and is NOT used).
+   - llama_kv_cache: ctor restructure to per-(layer, buft) ggml
+     ctx + buffer; resize(new_size) = per layer: allocate new K/V
+     tensors -> ggml_backend_buffer_copy_tensor rows [0, min(S,
+     S')) (ggml-backend-impl.h:79) -> free the old buffer -> swap
+     the k/v pointers, rebuild the k_stream/v_stream views, re-
+     point shared-layer entries (map_layer_ids); then the
+     keep-existing cell resize; clamp v_heads; handle the no_alloc
+     (dummy) path; returns false when other != nullptr (shared-
+     cell consumers - the GEMMA4_ASSISTANT share path - are not
+     supported in stage 1).
+   - llama_memory_hybrid::resize: delegates to mem_attn only
+     (mem_recr is n_ctx-independent, see above).
+   - ctx-level public API (llama_context_resize or similar,
+     include/llama.h + llama-context.cpp): compute the new
+     n_ctx_seq mirroring the :376-392 derivation (unified:
+     n_ctx_seq = n_ctx; else n_ctx / n_seq_max padded to 256,
+     n_ctx adjusted back), call memory->resize, and on success
+     update cparams.n_ctx/n_ctx_seq (non-const member,
+     llama-context.h:300; n_ctx()/n_ctx_seq() read cparams,
+     llama-context.cpp:867-873).
+2. Server (stage 2):
+   - OPT-IN cap flag mirroring -fitm (name TBD, e.g. --grow-ctx-
+     max; 0 = off) in common_params + arg.cpp + common.cpp print
+     (pattern: -fitm at arg.cpp:2910-2916, common.h:472,
+     common.cpp:1323).
+   - Trigger (a) task start (:3097 non-splittable / :3108
+     splittable): if the request > slot.n_ctx and the cap allows,
+     grow before rejecting.
+   - Trigger (b) decode wall (:3632-3674): after
+     try_clear_idle_slots() fails (:3637), grow, then
+     DECODE_RETRY.
+   - Both sites are between decodes (no graph in flight): (a) is
+     pre-launch, (b) is after llama_decode returned ret == 1.
+   - Growth target: round up to a multiple of n_pad (1 for
+     hybrid), step-based (e.g. max(4096, current/4)), capped at
+     the flag.
+   - Grow ctx_dft too when present; rollback both via
+     resize(old) if the draft regrow fails.
+   - On success: update n_ctx_slot + every slot.n_ctx (they all
+     read the same shared ring).
+3. Verify (stage 3): build (bat recipe, ninja quirk, SYCL=ON); on
+   27B PTQ1_0: grow at the wall (small -c + cap), confirm
+   continuation without slot reset, output consistency, failure
+   path (cap too low -> normal EXCEED_CONTEXT_SIZE), MTP case if
+   feasible.
+
+Parked (future optimization, BACKLOG B16): the VA-page version -
+reserve the full max ring's virtual address space up front, then
+page-map physical memory as tokens arrive (ideal zero-copy
+growth, no regrow at all). Not reachable on the SYCL stack: it is
+a driver/memory-API surface question, no device kernels involved,
+but the needed mapping API is not exposed there. Revisit only if
+the per-layer regrow cost proves too high in practice.
+
+Status: design CONFIRMED by the user 10-25; implementing in stages
+(1: core resize API, 2: server flag + triggers, 3: build + verify
+on 27B PTQ1_0). B14 remains PARKED behind this path.
 
 ## For consideration (not approved, no code written)
 
@@ -1223,11 +1258,10 @@ landing and the fit-time auto-size; these are what is left on the table:
    router that aggregates /v1/models and routes by session. Draft
    pending user confirmation (registry config shape, budget via the
    fit.cpp projection, idle-offload + pin/lock).
-4. KV ring design options (if per-slot growth is ever needed):
-   in-place ring growth is REJECTED (KV pool fixed at context
-   creation); alternatives are fit-time auto-size (shipped, F31
-   stage 2), a larger per-slot reservation at startup, or per-slot
-   ring rebalance on evict - none approved. NEW 10-25: the
-   per-slot runtime growth design (recreate one slot's context
-   larger, restore via the seq-state export) is drafted in F33,
-   design only, pending user confirmation.
+4. KV ring design options: fit-time auto-size (shipped, F31 stage
+   2) handles the startup sizing. NEW 10-25: in-place runtime
+   growth is now the CONFIRMED path (F33, user agreed 10-25) - the
+   old "REJECTED (KV pool fixed at context creation)" note is
+   SUPERSEDED: the per-(layer, buft) restructure makes the regrow
+   affordable (peak = old total + one layer). The VA-page version
+   is parked as BACKLOG B16 (future optimization).

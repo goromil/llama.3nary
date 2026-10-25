@@ -1,23 +1,25 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-25 (evening). Tensor-mode ctx fit SHIPPED
-(1011b639d, F32): common_params_fit_tensor_impl measures the per-card
-footprint with a real model load + two real context creations, solves
-per-card fixed + bytes/token rates, fits n_ctx to the min per-card
-budget (floor-aligned 16384, trained cap exact when limiting); 5-case
-verify matrix on 27B PTQ1_0 all as expected. Growth design DRAFTED,
-design only (F33, B15): per-slot runtime context growth - recreate
-one slot's ctx larger on the same loaded model, restore via the
-seq-state export (KV + GDN R/S both seq-scoped, verified), pending
-user. B14 (twin-server + router) PARKED behind the growth path.
-Carried: KV wall two stages (F31, 6a30f9157 + db5cf4d80); SYCL build
-fixed (F30, recipe permanently SYCL=ON); B12 DONE (7cb134632); F28
-OPEN (live service runs from the CLONE tree); qwen35.cpp 9B MTP fix
-GONE from the tree (reported to user 10-25).
-NEXT: present the tensor-fit verification report + the F33 growth
-design draft to the user (user decision: implement / drop / B14).
+Last refresh: 2026-10-26 (morning). B15 runtime context growth
+design CONFIRMED by the user 10-25, now IMPLEMENTING (F33 revised,
+B15, B16 new). Final design: in-place tail extension of the shared
+ctx ring via per-layer data-tensor regrow (no shift, no re-
+pointing, no host save, no ctx recreation); per-(layer, buft)
+buffer restructure so the peak is old total + one layer K+V;
+opt-in cap flag mirroring -fitm (0 = off). PIVOT recorded: the old
+per-slot premise was WRONG - ONE shared ctx per server (slots are
+seq_ids), all slots pause briefly during a regrow. VA-page version
+parked as B16. B14 (twin-server + router) PARKED behind the growth
+path. Carried: tensor-fit SHIPPED (1011b639d, F32); KV wall two
+stages (F31, 6a30f9157 + db5cf4d80); SYCL build fixed (F30, recipe
+permanently SYCL=ON); B12 DONE (7cb134632); F28 OPEN (live service
+runs from the CLONE tree); qwen35.cpp 9B MTP fix GONE from the tree
+(reported to user 10-25).
+NEXT: B15 staged implementation (stage 1 core resize API, stage 2
+server flag + triggers, stage 3 build + verify on 27B PTQ1_0).
 Await the user's extraArgs bisection outcome + a free card for the
-Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13 recon.
+Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13
+recon.
 
 ## Environment
 
@@ -76,13 +78,29 @@ Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13 recon.
   Verified: 5-case matrix on 27B PTQ1_0 (A/A2/B/C/D, all as expected,
   F32). Findings: KV does not scale with n_seq_max (shared ring),
   hadamard-v2 gate blocks 10/20 exports, flash_attn auto-enabled.
-- B15 (NEW 10-25, DESIGN ONLY - F33): per-slot runtime context
-  growth. Recreate one slot's ctx_tgt/ctx_dft larger on the same
-  loaded model; restore via the seq-state export (KV + GDN R/S both
-  seq-scoped in this fork - verified, the earlier "KV only" guess is
-  wrong); trigger at the F31 wall site between idle-clear and
-  end-slot; rollback + opt-in cap. PENDING USER CONFIRMATION, no
-  code. See BACKLOG B15 + FINDINGS F33.
+- B15 (10-25 DESIGN CONFIRMED, 10-26 IMPLEMENTING - F33 revised):
+  runtime context growth = in-place tail extension of the shared
+  ctx ring via per-layer regrow (the old per-slot recreate
+  design was based on a WRONG premise: there is ONE shared ctx per
+  server, slots are seq_ids, all slots pause briefly during a
+  regrow). Stage 1 (core): llama_memory_i::resize virtual (default
+  false); llama_kv_cells keep-existing resize; llama_kv_cache ctor
+  restructure to per-(layer, buft) ggml ctx + buffer + resize()
+  (per-layer alloc -> D2D copy rows [0, min(S, S')) -> free old ->
+  swap k/v + rebuild stream views + re-point shared-layer entries;
+  false if other != nullptr); llama_memory_hybrid::resize (mem_attn
+  only); ctx-level public API (compute new n_ctx_seq mirroring the
+  :376-392 derivation, memory->resize, update cparams). GDN is
+  n_ctx-independent (rs_size = n_seq_max) - no grow; MTP draft ctx
+  grown too (standalone plain KV, same size); prompt cache stays
+  valid (host buffers, position-keyed) - no invalidation. Stage 2
+  (server): opt-in cap flag mirroring -fitm (0 = off); triggers at
+  task start (:3097/:3108 grow-before-reject) + decode wall
+  (:3637 grow-then-DECODE_RETRY); step-based target capped at the
+  flag; grow ctx_dft too, rollback both on draft failure; update
+  n_ctx_slot + all slot.n_ctx. Stage 3: build + verify matrix on
+  27B PTQ1_0. No B15 code written yet at refresh time. See
+  BACKLOG B15 + FINDINGS F33.
 - KV wall (10-25, DONE - both stages committed+pushed, F31):
   - Stage 1 no-crash (6a30f9157): only n_batch == 1 && ret == 1 (the
     KV wall) is special-cased in decode() (bool -> int, file-local
@@ -228,7 +246,7 @@ srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
 
-## Next (10-25 evening)
+## Next (10-26 morning)
 
 1. [DONE] KV wall stage 1 (no-crash at the wall): committed+pushed
    6a30f9157.
@@ -238,20 +256,21 @@ block; grep by port 8080/58452.
    build-3nary.bat permanently SYCL=ON.
 4. [DONE] Tensor-mode ctx fit: committed+pushed 1011b639d (F32);
    5-case verify matrix on 27B PTQ1_0 all as expected.
-5. [NEXT] Present to the user: (a) the tensor-fit verification report
-   (5-case table + findings: hadamard-v2 gate, flash_attn
-   auto-enable, shared KV ring, co-residency, ninja quirk); (b) the
-   F33 per-slot growth design draft - user decision: implement /
-   drop / B14 instead.
+5. [DONE 10-25] Present to the user: (a) the tensor-fit verification
+   report (delivered); (b) the F33 growth design - user AGREED the
+   final design 10-25 (in-place regrow, not the per-slot recreate
+   draft); implementation authorized.
 6. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
    -c 262144; prediction table in F31) - fold into FINDINGS when
    reported.
 7. [B] Await a free card (re-derive VRAM first; service PID 11848 +
    20004) -> run the Q5_K_S tensor bench (N17; GDN correctness check
    first).
-8. B15 (if the user confirms F33): verify the F33 open questions
-   (wrapped-ring restore, draft ctx, unified-KV budget, prompt-cache
-   invalidation), then staged implementation.
+8. B15 (design CONFIRMED 10-25, IMPLEMENTING): staged implementation
+   per the final design (F33 revised). Stage 1 core resize API,
+   stage 2 server flag + triggers, stage 3 build + verify on 27B
+   PTQ1_0. Recon COMPLETE (see F33 grounding). No code written yet
+   at refresh. B14 remains PARKED behind this.
 9. B7a (this fork, next code item): startup loud-fail on unfittable
    ctx/KV + closed -sm/-dev gate. NOTE: the old target
    (fit.cpp:182-183 tensor warn-then-continue) is GONE - the tensor

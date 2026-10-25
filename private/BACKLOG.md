@@ -30,8 +30,10 @@ Each item: what / why / how / exit criteria / status.
 > B14 (twin-server + router) drafted, pending user.
 > 10-25 (later): tensor-mode ctx fit SHIPPED (1011b639d, F32, 5-case
 > verify matrix on 27B PTQ1_0); B14 PARKED behind the growth path;
-> B15 (per-slot runtime growth) drafted DESIGN ONLY (F33), pending
-> user.
+> B15 designed. 10-26: B15 design CONFIRMED by user (in-place ring
+> tail extension via per-layer regrow, NOT the earlier per-slot
+> recreate draft); IMPLEMENTING in stages. B16 added (VA-page KV
+> ring, PARKED future optimization).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -276,23 +278,64 @@ Each item: what / why / how / exit criteria / status.
   CAPACITY vehicle if per-slot growth (B15) is insufficient or dropped;
   re-present the B14 draft before any B14 work.
 
-## B15. Per-slot runtime context growth (DESIGN ONLY - F33)
-- what: grow ONE slot's context at runtime when it hits the KV wall
-  and the cards have headroom: recreate that slot's ctx_tgt/ctx_dft
-  at a larger n_ctx on the same loaded model, restore the slot's
-  state via the seq-state export (KV + GDN R/S, both seq-scoped -
-  verified F33), keep the other slots decoding. Design is in F33;
-  NOTHING implemented.
+## B15. Runtime context growth - in-place ring tail extension
+  (design CONFIRMED 10-25, IMPLEMENTING - F33)
+- what: grow the server's shared context at runtime when a slot hits
+  the KV wall and the cards have headroom: in-place tail extension
+  of the shared ctx ring via per-layer data-tensor regrow. No shift,
+  no re-pointing, no host save, no ctx recreation. All active slots
+  pause briefly (sub-second) during the swap - the earlier "per-slot
+  recreate" draft was based on a WRONG premise (there is ONE shared
+  ctx per server; slots are seq_ids). Design in F33 (revised 10-26).
 - why: F31 stage 1 ends the wall-hitting slot (clean but lost work);
-  -fitm (stage 2) only sizes at fit time. Runtime per-slot growth
-  recovers the wall hit without a restart. Per-slot contexts
-  (server-context.cpp:203-204) make this a one-context operation.
-- how: see F33 (trigger at the F31 wall site + task-start check;
-  quiesce -> save state to host buffer -> free old ctx -> create new
-  ctx -> restore state -> resume; rollback on failure; per-card
-  budget from the F32 math; opt-in cap flag mirroring -fitm).
-  Open questions in F33 must be verified first (wrapped-ring
-  restore, draft ctx, unified-KV budget, prompt-cache invalidation).
-- exit: user confirms or drops; if confirmed, verify the F33 open
-  questions (recon notes to private/), then staged implementation.
-- status: DRAFT, DESIGN ONLY, PENDING USER CONFIRMATION (10-25).
+  -fitm (stage 2) only sizes at fit time. Runtime in-place growth
+  recovers the wall hit without a restart and without resetting any
+  slot's generated output.
+- how (staged):
+  - Stage 1 (core): llama_memory_i::resize virtual (default false;
+    precedent get_cell_usage, llama-memory.h:107); llama_kv_cells
+    keep-existing resize (append empty cells); llama_kv_cache ctor
+    restructure to per-(layer, buft) ggml ctx + buffer (so the old
+    buffer is freed right after each layer's D2D copy; peak = old
+    total + one layer K+V, ~0.7-1.4 GiB/card at 27B scale) +
+    resize(new_size) (per-layer alloc ->
+    ggml_backend_buffer_copy_tensor rows [0, min(S, S')) -> free old
+    -> swap k/v + rebuild k_stream/v_stream views + re-point shared-
+    layer entries; keep-existing cell resize; clamp v_heads;
+    no_alloc path; false if other != nullptr); llama_memory_hybrid::
+    resize (mem_attn only - mem_recr is n_ctx-independent); ctx-level
+    public API (compute new n_ctx_seq mirroring the
+    llama-context.cpp:376-392 derivation, memory->resize, update
+    cparams.n_ctx/n_ctx_seq).
+  - Stage 2 (server): OPT-IN cap flag mirroring -fitm (name TBD,
+    e.g. --grow-ctx-max; 0 = off); triggers at task start
+    (:3097/:3108 grow-before-reject) + decode wall (:3637 grow-then-
+    DECODE_RETRY); step-based target (e.g. max(4096, current/4),
+    n_pad-aligned) capped at the flag; grow ctx_dft too, rollback
+    both via resize(old) on draft failure; update n_ctx_slot + all
+    slot.n_ctx on success. Both trigger sites are between decodes
+    (no graph in flight).
+  - Stage 3: build (bat recipe, SYCL=ON) + verify on 27B PTQ1_0:
+    grow at the wall (small -c + cap), continuation without slot
+    reset, output consistency, failure path (cap too low -> normal
+    EXCEED_CONTEXT_SIZE), MTP case if feasible.
+- exit: staged commits pushed; verify matrix green on 27B PTQ1_0;
+  private/ refreshed with the new findings.
+- status: CONFIRMED by user 10-25; recon COMPLETE; implementing
+  10-26. B14 remains PARKED behind this path.
+
+## B16. VA-page KV ring (future optimization, PARKED)
+- what: the zero-copy alternative to B15's per-layer regrow: reserve
+  the full max ring's virtual address space at context creation,
+  then page-map physical memory as tokens arrive, so growth is a
+  mapping op, not a copy.
+- why: ideal steady-state behavior (no regrow cost, no peak
+  duplication), IF the stack exposes the needed VA-reserve +
+  page-map API.
+- how: parked - not reachable on the SYCL stack (driver/memory-API
+  surface; no device kernels involved, but the mapping API is not
+  exposed there). Revisit only if the per-layer regrow cost (B15)
+  proves too high in practice, or if a backend exposing the API
+  (CUDA VMM / Vulkan) becomes the target.
+- exit: n/a until un-parked; recon notes when revisited.
+- status: PARKED (10-26) as the future-optimization path for B15.
