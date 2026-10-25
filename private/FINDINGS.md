@@ -885,3 +885,144 @@ Design:
 8. Port note (B13): the clone's SYCL ternary kernels diverge from the
    3nary fork's (B11 byte-parallel rework is fork-only, F25). H-C would
    be designed per-tree, not ported.
+
+## F30. "SYCL=OFF OOM bypass" = CPU-only runtime, no visible error
+   (root cause of the 10-25 "no usable GPU"; FIXED)
+
+The 10-21/10-23 build state ran with -DGGML_SYCL=OFF as a bypass for
+commit-headroom OOMs during the heavy SYCL TU compile. Consequence found
+10-25 while verifying the fit grow work: the runtime had NO SYCL device
+at all (fit reported nd == 0), with no error anywhere in any log.
+
+[certain] Chain (all verified in source 10-25):
+1. Entry points call ggml_backend_load_all() unconditionally (common/
+   arg.cpp:253/:1125/:1142/:1168, src/llama.cpp:103).
+2. The loader tries to dlopen [lib]ggml-sycl-.dll next to the exe
+   (ggml/src/ggml-backend-reg.cpp:480-560, load_best; base-name
+   fallback :543-557).
+3. The dlopen contract needs ggml_backend_score (optional, :229-235)
+   and ggml_backend_init (REQUIRED, :237-243). Those exports are only
+   emitted with GGML_BACKEND_DL=ON (ggml/CMakeLists.txt:86, default
+   OFF - and this fork's proven build config keeps it OFF).
+4. Both the 10-23 build tree's ggml-sycl.dll and the 10-21 install
+   tree's (C:\Users\admin\.local\3nary-sycl\) export only
+   ggml_backend_sycl_reg + the SYCL API (verified 10-25: dumpbin
+   export lists + P/Invoke probes). So a SYCL=OFF build can NEVER
+   dlopen SYCL in this fork.
+5. Every load failure is swallowed under NDEBUG: silent = true
+   (ggml-backend-reg.cpp:567-571). Release builds log nothing.
+
+Net effect: SYCL=OFF build = CPU-only runtime; -ngl 99 silently does
+nothing; fit sees nd == 0. SYCL works ONLY via static registration in a
+SYCL=ON build: the ggml target links ggml-sycl PUBLIC and the registry
+ctor does #ifdef GGML_USE_SYCL register_backend(ggml_backend_sycl_reg())
+(ggml-backend-reg.cpp:126-128).
+
+Fix (DONE 10-25): one-time reconfigure -DGGML_SYCL=ON (GGML_BACKEND_DL
+stays OFF = the proven 10-23 config), build ONLY the ggml-sycl target
+with -j 1 (105/105 steps; needs ~24 GB commit headroom), then the
+downstream rebuild (297/297). build-3nary.bat (N3) is permanently
+switched to SYCL=ON with a comment; future builds are incremental (the
+SYCL TU is already compiled, so only invalidation of it reruns the
+heavy compile). build-sycl-tu.bat / build-downstream.bat in
+$env:TEMP\opencode\ hold the one-time recipe.
+[constraint] Any future redeploy from this tree must come from a
+SYCL=ON build state. If commit headroom is ever short again, SYCL=OFF
+may be used to finish the non-SYCL parts, but the deployable binary
+must then be completed with the SYCL=ON recipe before it is used.
+
+## F31. KV-exhaustion wall: no-crash at the wall + fit-time auto-size
+   (BOTH COMMITTED 10-25)
+
+Problem: a decode that could not allocate a KV slot after the half-batch
+retries used to fail EVERY active slot and abort the whole server
+context - one client hitting the -c 262144 wall took down the others.
+Also: fit could only SHRINK to fit, never grow a pinned -c into the
+free memory that is demonstrably available.
+
+Stage 1 - no-crash (commit 6a30f9157, "server : end only the failing
+slot when the KV cache is exhausted"):
+- decode() signature bool -> int; file-local enum decode_result
+  { DECODE_OK = 1, DECODE_RETRY = 0, DECODE_SKIP = -1 } in
+  server-context.cpp; single caller = the batch loop (~:2770).
+- Handles ONLY n_batch == 1 && ret == 1 (the KV wall). On n_batch == 1
+  the failing token belongs to a single slot:
+  1. try_clear_idle_slots(); if a slot is freed -> DECODE_RETRY (the
+     same token, next iteration).
+  2. else identify the failing slot by slot.id ==
+     batch_view.seq_id[0][0] (llama_batch.seq_id is llama_seq_id **,
+     one pointer per token; in the server seq id == slot.id), send_error
+     EXCEED_CONTEXT_SIZE to that client, release() + prompt_clear() the
+     slot, DECODE_SKIP.
+- Result: that client gets a clean error; the other slots keep
+  generating; the server keeps running. NO preemption of active clients
+  in v1.
+
+Stage 2 - fit-time auto-size (commit db5cf4d80, "fit : grow the context
+into free memory up to an opt-in cap (-fitm)"):
+- OPT-IN -fitm / --fit-ctx-max N (env LLAMA_ARG_FIT_CTX_MAX), field
+  common_params.fit_params_max_ctx (0 = off), units = total ctx like -c.
+  The grow block is a no-op when the flag is absent: the default fit
+  behavior is unchanged.
+- Grow block in common_params_fit_impl (common/fit.cpp :310-360):
+  gate on n_ctx_max_user > 0 && nd > 0 && cparams->n_ctx > 0; cap =
+  min(fitm, n_ctx_max); measure dmds_cap ONCE at the cap (save/restore
+  n_ctx around common_get_device_memory_data_impl); ctx_rate[id] =
+  (cap_ctx - cur_ctx) / (cap - cur), skip if <= 0; budget = free -
+  mb.total() - margin; budget < 0 -> limit = 0, break (already over
+  budget, no grow); else limit = min(limit, cur + budget / rate);
+  grown = floor(min(limit, cap) to lcm(16384, n_streams)) - the 16K
+  grow step; if grown > cur: set n_ctx and adjust
+  dmds_full[id].mb.context += ctx_rate * (grown - cur) in place so the
+  step-1 margin check applies to the grown context; sync
+  extra->cparams->n_ctx afterwards (add_extra_memory had left it at the
+  cap). fit.h contract doc extended.
+- In-place KV ring growth is REJECTED (the KV pool is fixed at context
+  creation) - auto-size happens at FIT time, before the context exists.
+
+Verification (3 scenarios, 10-25, live service holding the cards; fit
+loads with no_alloc + LLAMA_LOAD_MODE_NONE, safe alongside the service):
+- (a) host-only, nd == 0: grow skipped, fit OK (fitm-test2.log).
+- (b) GPU over budget, -c 131072 -ngl 99 -fitm 262144: budget < 0 ->
+  no grow; fit aborts correctly (projected 29501 MiB > free 29008 MiB;
+  pinned -c/-ngl reported; exit 1) (fitm-test3.log).
+- (c) GPU GROW, -c 32768 -ngl 40 -fitm 65536: grew 32768 -> 65536,
+  margin check passed on BOTH devices (S0 free 7132 / S1 free 6040 vs
+  target 1024 MiB), printed -c 65536 -ngl 40, exit 0 (fitm-grow.log +
+  fitm-grow.bat). Grow path proven on-device.
+- Fit math reference (10-25, service holding the cards): at -ngl 40 /
+  -c 32768 / -np 2: S0 free 13759, self 6751 (model 4742 + ctx 1629 +
+  compute 379); S1 free 15749, self 8582. At -ngl 99 / -c 131072 /
+  -np 2: S0 ctx 7766, S1 ctx 9814, projected 29501 vs free 29008.
+- Relation to the user's extraArgs bisection (pending user report):
+  preset tail -ngl 99 -np 2 -c 262144; predicted KV per the 10-25
+  table: full tail 2 x 131072 = 6144 MiB; minus -c: 2 x 81920 =
+  3840 MiB; all removed: 1 x 163840 = 3840 MiB. Fold the outcome into
+  this finding when the user reports it.
+
+## For consideration (not approved, no code written)
+
+Deferred design options for the KV/memory wall, in the order discussed
+10-24/10-25. The two already-shipped pieces (F31) are the no-crash
+landing and the fit-time auto-size; these are what is left on the table:
+
+1. Degradation signature (observed, unexplained): 50588 went from ~18
+   t/s to ~1.1-1.5 t/s on BOTH slots with zero child-log events; 60117
+   went 18 -> 0.09 t/s. Time/load-correlated => system-level, not
+   per-request. Candidate causes to check when next reproducible:
+   driver/VRAM fragmentation after long ctx, commit charge pressure,
+   SYCL runtime stalls. No fix proposed.
+2. LCP router thrash: the macube router (59148) LCP lines showed the
+   router re-baselining sessions; combined with (1) this is the likely
+   source of the "sudden slow" episodes. Needs a macube-side look
+   (user-owned; read-only at most).
+3. Twin-server + router (data parallel, deferred - see BACKLOG B14):
+   two llama-server children pinned -dev SYCL0 / -dev SYCL1 behind a
+   router that aggregates /v1/models and routes by session. Draft
+   pending user confirmation (registry config shape, budget via the
+   fit.cpp projection, idle-offload + pin/lock).
+4. KV ring design options (if per-slot growth is ever needed):
+   in-place ring growth is REJECTED (KV pool fixed at context creation);
+   alternatives are fit-time auto-size (shipped, F31 stage 2), a larger
+   per-slot reservation at startup, or per-slot ring rebalance on
+   evict - none approved.

@@ -24,6 +24,10 @@ Each item: what / why / how / exit criteria / status.
 > THIS fork first (B12, H-A design APPROVED by user 10-22, implement in
 > 3nary then port), then port the ternary work to the upstream clone at
 > C:\Users\admin\source\ai\llama.cpp (B13, target confirmed 10-22).
+> 10-25: B12 DONE (7cb134632); KV wall shipped in two stages (no-crash
+> 6a30f9157, fit-time auto-size -fitm db5cf4d80, F31); SYCL build
+> finding F30 (SYCL=OFF = CPU-only runtime, build recipe now SYCL=ON);
+> B14 (twin-server + router) drafted, pending user.
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -128,7 +132,10 @@ Each item: what / why / how / exit criteria / status.
   loud error paths. Read the existing code first; keep it minimal.
 - exit: a bad ctx/KV and a bad --dev each produce a clear startup error
   (no silent degrade); committed+pushed.
-- status: OPEN, APPROVED 10-22 (implement after B12 lands, same fork).
+- status: OPEN, APPROVED 10-22 (B12 has landed; next candidate in this
+  fork). NOTE 10-25: the runtime KV work shipped (F31, 6a30f9157 +
+  db5cf4d80) is additive and is NOT B7a - B7a remains the startup-side
+  loud-fail + closed --dev gate.
 
 ## B8. PQ2_0 ctx sweep (fit auto)
 - what: standalone PQ2_0 load WITHOUT -c (fit auto): read computed ctx +
@@ -203,10 +210,14 @@ Each item: what / why / how / exit criteria / status.
 - exit: PQ2_0 AND PTQ1_0 27B run `-sm tensor` on SYCL0,SYCL1 with no
   assert and sane output (expect ~sqrt(2)x quant error from the extra
   requant pass); committed+pushed; private/ updated.
-- status: APPROVED 10-22, IMPLEMENTING (user confirmed H-A, 3nary first).
-  Implementation order: (a) loader hook, (b) model transform, (c) graph
-  `folded` flag; then rebuild (N3) + verify (N14) + test PQ2_0 then
-  PTQ1_0.
+- status: DONE 10-23, committed 7cb134632 (pushed; 7 src files + the
+  tests/test-hadamard-fold.cpp unit test). H-A as designed: load-time
+  fold of the 128 axis-split weights (48 ssm_out + 64 ffn_down + 16
+  attn_output); the ssm_out gather bug was found + fixed on the way
+  (F27). PQ2_0 AND PTQ1_0 27B verified in tensor mode, no assert, sane
+  output; formula pinned by the unit test. H-C (kernel fusion) remains
+  the documented fallback (F29) - adopt only if the fold's requant
+  noise shows up in real workloads.
 
 ## B13. Port ternary work to the upstream clone (C:\Users\admin\source\ai\llama.cpp)
 - what: port the tensor-compatible ternary kernels + tensor-mode support
@@ -228,5 +239,32 @@ Each item: what / why / how / exit criteria / status.
   4. only then stage the port commit-by-commit.
 - exit: recon notes written to private/ (F25 expansion); user confirms
   port scope; port staged.
-- status: OPEN, BLOCKED on (a) B12 landing in this fork (port the FIXED
-  ternary, not the asserting one) and (b) the recon in `how` above.
+- status: OPEN. (a) UNBLOCKED 10-23: B12 landed in this fork
+  (7cb134632) - the port source is the FIXED ternary, not the asserting
+  one. (b) recon NOT started (read-only: the clone hosts the live
+  service).
+
+## B14. Twin-server + router (data parallel, DEFERRED - draft pending user)
+- what: two llama-server children, one pinned -dev SYCL0 and one
+  -dev SYCL1 (one physical card each, -fit off + explicit -ngl, no
+  cross-card split), fronted by a router that aggregates /v1/models and
+  routes by session (LCP-style stickiness). Registry config shape: one
+  entry per child (binary, device pin, -ngl, port, model); per-child
+  budget via the fit.cpp projection (F31 math); idle-offload +
+  pin/lock semantics so a cold child can be parked and a hot one kept.
+- why: the single-server -np 2 layout pays the KV wall at one shared
+  pool (F31): the second slot's growth is capped by the first slot's
+  footprint. Two pinned single-card children isolate a wall hit to one
+  child and double effective KV under the same total VRAM. The original
+  twin-server data-parallel plan was dropped 10-22 (B7) as the
+  PREEMPTION vehicle; it is revived 10-24 as the CAPACITY vehicle,
+  additive to F31 (no-crash + auto-size), not a replacement.
+- how: DRAFT ONLY - nothing approved, no code written. Grounding still
+  owed before the draft is presented: (1) the per-backend free-memory
+  surface fit.cpp can see under a device pin; (2) build placement
+  (tools/CMakeLists.txt; unified-binary subcommand vs a new tool);
+  (3) router location (new tool in this tree vs macube-side). Present
+  to the user; implement only on explicit confirmation.
+- exit: user confirms or drops; if confirmed, recon notes to private/
+  then staged implementation.
+- status: DRAFT, PENDING USER CONFIRMATION (10-25).

@@ -1,19 +1,23 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-23 (evening). B12 DONE + COMMITTED (7cb134632):
-H-A load-time fold implemented in this fork (gather bug found + fixed,
-F27), extended to ffn_down + attn_output (128 folds total), both
-PQ2_0 and PTQ1_0 verified in tensor mode, formula pinned by
-tests/test-hadamard-fold.cpp. USER 10-23: temp 1.0 is the production
-sampling and never loops (the temp-0.8 loop seen in verify runs is a
-sampling artifact, not a fold error); greedy-isolation test DROPPED;
-unit test coverage APPROVED (done). F26 resolved: exactly 3
-weight families (ssm_out/ffn_down/attn_output) get axis-split
-activations; padding rejected (hidden-dim / attention-geometry
-rewrite; does not fix ssm_out perm); fold = only viable option.
-F28 OPEN: live service now runs from the CLONE tree and hit a
-state-save bad allocation at 88K tok. NEXT: B7a (startup loud-fail),
-then B13 port to the clone.
+Last refresh: 2026-10-25. KV wall shipped in TWO stages, both
+committed+pushed (F31): (1) no-crash at the wall (6a30f9157) - a
+KV-exhausted decode with n_batch == 1 ends ONLY the failing slot (clean
+EXCEED_CONTEXT_SIZE to that client), the others keep generating;
+(2) fit-time auto-size (db5cf4d80) - opt-in -fitm / --fit-ctx-max
+grows a pinned -c into free device memory in 16K-token steps up to the
+cap, before the margin check; verified on-device (32768 -> 65536 grow,
+margin pass on both cards). SYCL build mystery root-caused + fixed
+(F30): the 10-21/10-23 "SYCL=OFF OOM bypass" produced CPU-only
+runtimes with no visible error; build-3nary.bat is now permanently
+SYCL=ON (one-time ggml-sycl TU rebuild at -j 1 + downstream, all
+green). Carried from 10-23: B12 DONE (7cb134632, H-A fold, PQ2_0 +
+PTQ1_0 tensor-verified); F28 OPEN (live service runs from the CLONE
+tree). NEW: B14 (twin-server + router) drafted, pending user.
+NEXT: present the B14 draft + the 10-25 report (qwen35.cpp 9B MTP fix
+gone from the tree; SYCL finding; grow verification). Await the
+user's extraArgs bisection outcome + a free card for the Q5_K_S tensor
+bench. Then B7a (startup loud-fail) and B13 recon.
 
 ## Environment
 
@@ -25,9 +29,12 @@ then B13 port to the clone.
 - Build tree: `build/` (Ninja, Release, shared libs, tests ON). Build
   recipe: NOTES.md N3 (oneAPI + vcvars64 Professional + oneAPI lib
   prepended to LIB).
-- Install tree (macube services run from here):
-  `C:\Users\admin\.local\3nary-sycl\` (state unknown after the 10-22
-  service restart; re-check before advising a redeploy).
+- Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-21 install).
+  10-25 (F30): its ggml-sycl.dll lacks ggml_backend_init like the
+  build tree's - the dlopen path is dead in this fork; SYCL works only
+  via the static link in a SYCL=ON build. Re-check the whole tree
+  before any redeploy advice; the live service runs from the CLONE
+  tree since 10-23 (F28), not from here.
 - Workspace: working dir `C:\Users\admin\source\ai\llama.3nary`,
   workspace root `C:\Users\gorom\source\ai\llama.3nary` (SAME tree, one
   build, shared build\bin).
@@ -36,51 +43,93 @@ then B13 port to the clone.
 
 ## Services (macube)
 
-- LIVE (10-23, do not disturb, user-owned): REDEPLOYED FROM THE CLONE
-  TREE `C:\Users\admin\source\ai\llama.cpp` (F28 - compile-time paths
-  in its logs point there). Old 10-22 PIDs 24252/26876 STALE.
-  Observed 10-23: 62743 (child, died slot 3 / 88212 tok, F28), 50630
-  (child, recovered, serving Q5_K_S tensor), 59148 (router, LCP
-  lines). Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080,
-  58452 -State Listen`.
-- History: 24252/26876 (10-22 service, Q5_K_S + MTP, replaced), 52416
+- LIVE (10-25, do not disturb, user-owned): RESTARTED AGAIN 10-25
+  (after the extraArgs-bisection restart), still from the CLONE tree
+  `C:\Users\admin\source\ai\llama.cpp` (F28). Re-derived 10-25:
+  llama-server PID 212452 on 8080; 58452 NOT listening; commit free
+  ~56.4 GB / phys free ~48.9 GB (looser than the 03:00 state -
+  consistent with the bisection removing -c/-ngl/-np from the preset
+  tail; VRAM state unknown, re-check before benching). The user is
+  bisecting the extraArgs tail (-ngl 99, -np 2, -c 262144); outcome
+  pending (prediction table in F31). Re-derive PIDs:
+  `Get-NetTCPConnection -LocalPort 8080,58452 -State Listen`.
+- History: 50630 (10-23 child) + 59148 (10-23 router) + 62743 (dead
+  10-23, F28, replaced by the 10-25 restart), 24252/26876 (10-22
+  service, Q5_K_S + MTP, replaced), 52416
   (tg 13.2+ at 73.6K, healthy, then restarted), 54447 (dead, F16),
   65463 (dead, F15), 61850/52510 (stopped 10-19), 58458 / 58186
   (tracked dead, F6/F7).
 
 ## Active work
 
-- B12: make ternary PTQ1_0/PQ2_0 `-sm tensor` compatible in this
-  fork. DONE 10-23, committed 7cb134632 (7 src files + unit test).
-  Implementation: `fold_hadamard_weight` (llama-model.cpp) - load-time
-  dequant -> in-place block FWHT -> signs -> ssm_out-only scatter
-  (grouped->tiled) -> requant, 128 weights (48 ssm_out + 64 ffn_down +
-  16 attn_output). Gather bug found + fixed (F27, proven exact by
-  numeric mini-model). Verified: PQ2_0 + PTQ1_0 tensor runs, 128 fold
-  lines, no :537 assert, SPLIT_STATE ssm_out {1024x3,1024x3} /
-  ffn_down {8704x1,8704x1}, sane tokens. Unit test
-  tests/test-hadamard-fold.cpp pins the formula (all checks pass).
-  Kernel-level fusion fallback (H-C, zero requant noise) documented in
-  F29 - adopt only if the fold's requant noise shows up in real
-  workloads.
+- KV wall (10-25, DONE - both stages committed+pushed, F31):
+  - Stage 1 no-crash (6a30f9157): only n_batch == 1 && ret == 1 (the
+    KV wall) is special-cased in decode() (bool -> int, file-local
+    enum decode_result; single caller = the batch loop ~:2770):
+    try_clear_idle_slots() -> DECODE_RETRY; else the failing slot is
+    slot.id == batch_view.seq_id[0][0], gets send_error
+    EXCEED_CONTEXT_SIZE + release() + prompt_clear() -> DECODE_SKIP.
+    No preemption of active clients in v1.
+  - Stage 2 auto-size (db5cf4d80): OPT-IN -fitm / --fit-ctx-max (env
+    LLAMA_ARG_FIT_CTX_MAX, common_params.fit_params_max_ctx, 0 = off,
+    units = total ctx like -c). Grow block in common_params_fit_impl
+    (common/fit.cpp :310-360): measure the footprint ONCE at the cap,
+    ctx_rate per device, budget = free - mb.total() - margin, grown =
+    floor(min(limit, cap) to lcm(16384, n_streams)) - the 16K step;
+    in-place dmds adjustment so the margin check applies to the grown
+    ctx. No-op when the flag is absent; in-place KV ring growth
+    REJECTED (pool fixed at context creation).
+  - Verified on-device 10-25 (service holding the cards): host-only
+    skips the grow; over-budget (-c 131072 -ngl 99 -fitm 262144)
+    aborts correctly (projected 29501 > free 29008 MiB); GROW
+    (-c 32768 -ngl 40 -fitm 65536) went 32768 -> 65536 with the margin
+    check passing on both cards (S0 free 7132 / S1 6040 vs target
+    1024 MiB).
+- SYCL build (10-25, FIXED, F30): "no usable GPU" root-caused: the
+  SYCL=OFF OOM-bypass builds were CPU-only runtimes (dlopen can never
+  load SYCL with GGML_BACKEND_DL=OFF; the Release registry swallows
+  the failure). One-time -DGGML_SYCL=ON reconfigure + ggml-sycl TU
+  rebuild at -j 1 (105 steps, ~24 GB commit headroom) + downstream
+  (297 steps), all green. build-3nary.bat permanently SYCL=ON with a
+  comment; future builds incremental. Deploy only from SYCL=ON build
+  states.
+- B12: DONE 10-23 (7cb134632, 7 src files + unit test). H-A load-time
+  fold of the 128 axis-split weights (48 ssm_out + 64 ffn_down + 16
+  attn_output); ssm_out gather bug found + fixed (F27); PQ2_0 +
+  PTQ1_0 tensor-verified; tests/test-hadamard-fold.cpp pins the
+  formula. H-C (kernel fusion, zero requant noise) documented in F29
+  as the fallback only.
+- B14 (NEW 10-25): twin-server + router - two pinned children
+  (-dev SYCL0 / -dev SYCL1, -fit off + explicit -ngl) behind a router
+  that aggregates /v1/models and routes by session. DRAFT pending user
+  confirmation; grounding owed: per-backend free-memory surface under
+  a pin, build placement (tools/CMakeLists.txt, unified-binary
+  subcommand vs new tool), router location. See BACKLOG B14.
 - B7a: startup-side loud-fail (unfittable ctx/KV) + closed --dev gate.
-  Status: APPROVED 10-22, OPEN - NEXT in this fork. Target site:
+  Status: APPROVED 10-22, OPEN - next code candidate in this fork.
+  The 10-25 runtime KV work is additive, NOT B7a. Target site:
   common/fit.cpp:182-183 (SPLIT_MODE_TENSOR fit throw, currently
   warn-then-continue per log).
 - B13: port the (fixed) ternary work to the upstream clone
-  `C:\Users\admin\source\ai\llama.cpp` (F25). Status: recon NOT started.
-  De-risked 10-23: the clone NOW HOSTS THE LIVE SERVICE in TENSOR mode
-  (Q5_K_S), so it already has the tensor enum + meta backend.
-  Clone is a LIVE deploy tree: recon is READ-ONLY. Open question:
-  does the 3nary fork have the clone's seq_rm fix (server-context.cpp
-  ~:3444) - relevant to F28. 3 uncommitted user mods (chat.cpp,
-  ui-assets.cmake, server-context.cpp) to PRESERVE.
+  `C:\Users\admin\source\ai\llama.cpp` (F25). Status: UNBLOCKED (B12
+  landed 10-23), recon NOT started. De-risked 10-23: the clone NOW
+  HOSTS THE LIVE SERVICE in TENSOR mode (Q5_K_S), so it already has
+  the tensor enum + meta backend. Clone is a LIVE deploy tree: recon
+  is READ-ONLY. Open question: does the 3nary fork have the clone's
+  seq_rm fix (server-context.cpp ~:3444) - relevant to F28. 3
+  uncommitted user mods (chat.cpp, ui-assets.cmake, server-context.cpp)
+  to PRESERVE.
 - B7 (runtime preemption C0/C1): CLOSED 10-22 (user dropped).
+- qwen35.cpp 9B MTP fix: GONE from the tree (working file matches
+  HEAD; the local src/ commits since 48e9082ca do not touch it). Must
+  be reported to the user.
 
 ## Git
 
-- branch `main`, pushed HEAD: `7cb134632` (llama : fold
-  activation-side hadamard into ternary weights for tensor mode).
+- branch `main`, pushed HEAD: `db5cf4d80` (fit : grow the context into
+  free memory up to an opt-in cap (-fitm)). Before it: `6a30f9157`
+  (server : end only the failing slot when the KV cache is exhausted),
+  `f66f6cd62` (docs : F29), `bcd84baff` (docs), `7cb134632` (B12).
   Full list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
@@ -89,8 +138,13 @@ then B13 port to the clone.
 
 ## Binaries
 
-- `build\bin`: current as of the 10-23 B12 build (H-A fold, 10:58)
-  + test-hadamard-fold (15:03). Supersedes the 10-20 B11 build.
+- `build\bin`: 10-25 SYCL=ON rebuild (F30): ggml-sycl.dll 62.8 MB
+  (~03:05), ggml.dll (~03:11), exes (~03:12) - the one-time ggml-sycl
+  TU compile + 297 downstream steps. Supersedes the 10-23 B12 build.
+  NOTE: the 10-21 install tree's ggml-sycl.dll lacks ggml_backend_init
+  (same as the old build tree's) - verify the install tree's link
+  state before any redeploy advice; dlopen is dead in this fork
+  either way (F30).
 
 ## Models (verified on disk 10-22)
 
@@ -118,6 +172,11 @@ GDN recurrent state 598.50 MiB (no per-token growth).
 | pq2_meta_debug.txt | 4379-line GGML_META_DEBUG tensor-mode trace of the PQ2_0 crash; assert at :4378. |
 | run_pq2_debug.ps1 | setvars + N14 repro runner. |
 | fitprobeA/B/C.txt | 10-20 fit probes (12 MB each, grep only). |
+| fitm-test2.log | 10-25 host-only fit (nd == 0, grow skipped, fit OK). |
+| fitm-test3.log | 10-25 GPU over-budget fit (-c 131072 -ngl 99 -fitm 262144): no grow, correct abort, exit 1. |
+| fitm-grow.log / fitm-grow.bat | 10-25 GROW evidence: 32768 -> 65536, margin pass both cards, printed -c 65536 -ngl 40, exit 0. |
+| build-3nary.bat | N3 recipe, now permanently SYCL=ON (F30). |
+| build-sycl-tu.bat / build-downstream.bat | one-time SYCL=ON ggml-sycl TU (-j 1, needs commit headroom) + downstream no-configure recipe (F30). |
 | mtp-server-*.log, ternary-d-err.log, ptq10-* | historical (F1/F8/F10/F14). |
 
 Macube logs: `C:\Users\gorom\source\macube\logs\llama.log` (per-child
@@ -125,19 +184,32 @@ srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
 
-## Next (10-23)
+## Next (10-25)
 
-1. [DONE] B12 implemented + verified + committed (7cb134632) +
-   unit test. Pushed to origin.
-2. [NEXT] B7a (this fork): startup loud-fail on unfittable ctx/KV +
-   closed --dev gate. Target: common/fit.cpp:182-183 SPLIT_MODE_TENSOR
-   fit throw + arg.cpp:2804 -sm parse area.
-3. B13 recon (read-only, clone hosts live service): diff fork vs
+1. [DONE] KV wall stage 1 (no-crash at the wall): committed+pushed
+   6a30f9157.
+2. [DONE] KV wall stage 2 (fit-time auto-size -fitm): committed+pushed
+   db5cf4d80; grow verified on-device (3 scenarios, F31).
+3. [DONE] SYCL=OFF = CPU-only runtime: root-caused + fixed (F30);
+   build-3nary.bat permanently SYCL=ON.
+4. [NEXT] Present to the user: (a) the B14 twin-server + router
+   draft; (b) the 10-25 report: qwen35.cpp 9B MTP fix gone from the
+   tree, the SYCL finding + fix, stage-2 grow verification (SHAs
+   6a30f9157, db5cf4d80).
+5. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
+   -c 262144; prediction table in F31) - fold into FINDINGS when
+   reported.
+6. [B] Await a free card (re-derive VRAM first; service PID 212452)
+   -> run the Q5_K_S tensor bench (GDN correctness check first).
+7. B7a (this fork, next code item): startup loud-fail on unfittable
+   ctx/KV + closed --dev gate. Target: common/fit.cpp:182-183
+   SPLIT_MODE_TENSOR fit throw + the -sm/-dev parse area.
+8. B13 recon (read-only, clone hosts live service): diff fork vs
    clone meta backend (upstream PRs #26490/#27574), ternary enum
    mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/divergent
    work map (F25), whether 3nary lacks the clone's seq_rm fix
    (server-context.cpp ~:3444, relevant to F28). THEN port
    commit-by-commit on user-confirmed scope.
-4. F28 (open, read-only): live-service state-save bad allocation at
+9. F28 (open, read-only): live-service state-save bad allocation at
    88K tok (clone build); does 3nary have the equivalent fix?
-5. Refresh private/ + commit+push at each milestone.
+10. Refresh private/ + commit+push at each milestone.
