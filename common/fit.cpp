@@ -176,12 +176,270 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// SPLIT_MODE_TENSOR fit:
+//   - the model runs on a single meta device spanning the selected devices, the split of the weights is fixed by the model
+//   - nothing on the weights side can be adjusted, only the context size is fitted
+//   - the per-device footprint is measured with a real model load and context creations,
+//     because the tensor split is only known at allocation time
+
+static int64_t get_dev_free_mem(const ggml_backend_dev_t dev) {
+    size_t free_mem;
+    size_t total_mem;
+    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+    return (int64_t) free_mem;
+}
+
+// create and free a context at the given n_ctx, return the per-device drop in free memory
+static bool tensor_measure_ctx(
+        llama_model * model, const llama_context_params & cparams, uint32_t n_ctx,
+        const std::vector<ggml_backend_dev_t> & devs, const std::vector<int64_t> & free_before,
+        std::vector<int64_t> & used_mem) {
+    llama_context_params cparams_copy = cparams;
+    cparams_copy.n_ctx = n_ctx;
+
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    used_mem.resize(devs.size());
+    for (size_t i = 0; i < devs.size(); i++) {
+        used_mem[i] = free_before[i] - get_dev_free_mem(devs[i]);
+    }
+
+    llama_free(ctx);
+    return true;
+}
+
+static void common_params_fit_tensor_impl(
+        const char * path_model, llama_model_params * mparams, llama_context_params * cparams,
+        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user,
+        const common_fit_extra_model * extra, ggml_log_level log_level) {
+    if (extra != nullptr) {
+        throw common_params_fit_exception("an extra (draft/MTP) model is not supported with SPLIT_MODE_TENSOR, abort");
+    }
+    constexpr int64_t MiB = 1024*1024;
+
+    struct logger_guard_t {
+        struct user_data_t {
+            ggml_log_callback callback;
+            void * user_data;
+            ggml_log_level min_level;
+        } ud;
+
+        explicit logger_guard_t(ggml_log_level min_level) {
+            llama_log_get(&ud.callback, &ud.user_data);
+            ud.min_level = min_level;
+            llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+                const user_data_t * ud = (const user_data_t *) user_data;
+                const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+                ud->callback(level_eff, text, ud->user_data);
+            }, &ud);
+        }
+        ~logger_guard_t() {
+            llama_log_set(ud.callback, ud.user_data);
+        }
+    } logger_guard(log_level);
+
+    // with non-unified kv, the context memory scales with n_streams
+    const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
+    const bool     n_ctx_auto = cparams->n_ctx == 0;
+
+    // the devices of the meta device: the explicit list, or the same default selection the model load uses
+    std::vector<ggml_backend_dev_t> candidate_devs;
+    if (mparams->devices) {
+        for (const ggml_backend_dev_t * dev = mparams->devices; *dev; ++dev) {
+            candidate_devs.push_back(*dev);
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                continue;
+            }
+            candidate_devs.push_back(dev);
+        }
+    }
+    if (candidate_devs.empty()) {
+        throw std::runtime_error("no non-CPU devices found for SPLIT_MODE_TENSOR");
+    }
+
+    std::vector<int64_t> free_load_before(candidate_devs.size());
+    for (size_t i = 0; i < candidate_devs.size(); i++) {
+        free_load_before[i] = get_dev_free_mem(candidate_devs[i]);
+    }
+
+    llama_model * model = llama_model_load_from_file(path_model, *mparams);
+    if (model == nullptr) {
+        throw std::runtime_error("failed to load model");
+    }
+
+    if (llama_model_n_devices(model) != 1) {
+        throw std::runtime_error("SPLIT_MODE_TENSOR is expected to use a single meta device");
+    }
+    const ggml_backend_dev_t meta_dev = llama_model_get_device(model, 0);
+    if (!ggml_backend_dev_is_meta(meta_dev)) {
+        throw std::runtime_error("the model device of SPLIT_MODE_TENSOR is not a meta device");
+    }
+    const size_t nd = ggml_backend_meta_dev_n_devs(meta_dev);
+
+    // keep only the devices of the meta device, this order defines the order of the margins
+    std::vector<ggml_backend_dev_t> devs;
+    std::vector<int64_t> free0; // free memory per device before the model load
+    for (size_t i = 0; i < nd; i++) {
+        const ggml_backend_dev_t dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
+        for (size_t j = 0; j < candidate_devs.size(); j++) {
+            if (candidate_devs[j] != dev) {
+                continue;
+            }
+            devs.push_back(dev);
+            free0.push_back(free_load_before[j]);
+            break;
+        }
+    }
+    if (devs.size() != nd) {
+        throw std::runtime_error("could not match all devices of the meta device");
+    }
+
+    const uint32_t n_ctx_train = llama_model_n_ctx_train(model);
+
+    std::vector<int64_t> free1; // free memory per device after the model load
+    free1.resize(nd);
+    for (size_t i = 0; i < nd; i++) {
+        free1[i] = get_dev_free_mem(devs[i]);
+    }
+
+    LOG_TRC("%s: memory of the real model load [MiB]:\n", __func__);
+    for (size_t i = 0; i < nd; i++) {
+        LOG_TRC("%s:   - %s: %6" PRId64 " model, %6" PRId64 " free before, %6" PRId64 " free after\n",
+            __func__, ggml_backend_dev_name(devs[i]), (free0[i] - free1[i])/MiB, free0[i]/MiB, free1[i]/MiB);
+    }
+
+    // two measurement points of the per-device context memory, both at or below the trained context size
+    const uint32_t n_ctx_pt_lo = std::min<uint32_t>(2048, std::max<uint32_t>(1, n_ctx_train));
+    const uint32_t n_ctx_pt_hi = std::min<uint32_t>(32768, std::max<uint32_t>(2*n_ctx_pt_lo, n_ctx_train));
+
+    std::vector<int64_t> used_lo;
+    if (!tensor_measure_ctx(model, *cparams, n_ctx_pt_lo, devs, free1, used_lo)) {
+        throw common_params_fit_exception("the model and a minimal context do not fit into the device memory, abort");
+    }
+    for (size_t i = 0; i < nd; i++) {
+        LOG_TRC("%s:   - %s: %6" PRId64 " context at %" PRIu32 "\n",
+            __func__, ggml_backend_dev_name(devs[i]), used_lo[i]/MiB, n_ctx_pt_lo);
+    }
+
+    // the maximum context size that fits on all devices
+    uint32_t n_ctx_fits = 0;
+    {
+        std::vector<int64_t> used_hi;
+        uint32_t n_ctx_hi = n_ctx_pt_hi;
+        bool have_hi = tensor_measure_ctx(model, *cparams, n_ctx_hi, devs, free1, used_hi);
+        while (!have_hi && n_ctx_hi > 2*n_ctx_pt_lo) {
+            n_ctx_hi /= 2;
+            have_hi = tensor_measure_ctx(model, *cparams, n_ctx_hi, devs, free1, used_hi);
+        }
+
+        if (have_hi) {
+            // the per-device context memory is linear in n_ctx between the two points
+            n_ctx_fits = UINT32_MAX;
+            for (size_t i = 0; i < nd; i++) {
+                const int64_t rate = (used_hi[i] - used_lo[i]) / (int64_t) (n_ctx_hi - n_ctx_pt_lo);
+                const int64_t fixed = used_lo[i] - rate * n_ctx_pt_lo;
+                const int64_t used_model = free0[i] - free1[i];
+                const int64_t budget = free0[i] - used_model - fixed - (int64_t) margins_s[i];
+                if (budget <= 0) {
+                    n_ctx_fits = 0;
+                    break; // this device is already over budget at the minimum context
+                }
+                if (rate > 0) {
+                    n_ctx_fits = std::min<uint32_t>(n_ctx_fits, (uint32_t) (budget / rate));
+                }
+            }
+        } else {
+            // fits at the low point but not at twice that, binary search the maximum
+            uint32_t lo = n_ctx_pt_lo;
+            uint32_t hi = 2*n_ctx_pt_lo;
+            while (hi - lo > 1) {
+                const uint32_t mid = lo + (hi - lo)/2;
+                std::vector<int64_t> used_mid;
+                if (tensor_measure_ctx(model, *cparams, mid, devs, free1, used_mid)) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            n_ctx_fits = lo;
+        }
+    }
+
+    llama_model_free(model);
+
+    const uint64_t n_ctx_max = std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
+    // n_ctx_min == UINT32_MAX means the user requested the full context (-c 0), no reduction is allowed:
+    const uint64_t n_ctx_min_total = n_ctx_min == UINT32_MAX
+        ? n_ctx_max
+        : std::min<uint64_t>(std::min<uint64_t>((uint64_t) n_ctx_min * n_streams, UINT32_MAX), n_ctx_max);
+
+    if (n_ctx_fits < n_ctx_min_total) {
+        LOG_TRC("%s: only %" PRIu32 " context fits, the minimum of %" PRIu64 " does not fit\n",
+            __func__, n_ctx_fits, n_ctx_min_total);
+        throw common_params_fit_exception(
+            "the context size of " + std::to_string((uint32_t) n_ctx_min_total) +
+            " does not fit into the device memory, abort");
+    }
+
+    // when the trained context is the limiting cap use it as is, otherwise round down to the alignment
+    auto n_ctx_from_cap = [n_ctx_max, n_streams](uint64_t cap) -> uint64_t {
+        if (cap == n_ctx_max) {
+            return cap;
+        }
+        const uint32_t align = (uint32_t) std::lcm<uint32_t>(16384, n_streams);
+        return (cap / align) * align;
+    };
+
+    if (n_ctx_auto) {
+        const uint64_t n_ctx_new = n_ctx_from_cap(std::min<uint64_t>(n_ctx_fits, n_ctx_max));
+        if (n_ctx_new < n_ctx_min_total) {
+            LOG_TRC("%s: only %" PRIu64 " aligned context fits, the minimum of %" PRIu64 " does not fit\n",
+                __func__, n_ctx_new, n_ctx_min_total);
+            throw common_params_fit_exception(
+                "the context size of " + std::to_string((uint32_t) n_ctx_min_total) +
+                " does not fit into the device memory, abort");
+        }
+        cparams->n_ctx = (uint32_t) n_ctx_new;
+        LOG_TRC("%s: setting the context size to %" PRIu32 " (max fitting %" PRIu32 ", trained %" PRIu32 ")\n",
+            __func__, cparams->n_ctx, n_ctx_fits, n_ctx_train);
+        return;
+    }
+
+    if ((uint64_t) cparams->n_ctx > n_ctx_fits) {
+        LOG_TRC("%s: the user context size of %" PRIu32 " does not fit, max fitting is %" PRIu32 "\n",
+            __func__, cparams->n_ctx, n_ctx_fits);
+        throw common_params_fit_exception(
+            "the user context size of " + std::to_string(cparams->n_ctx) +
+            " does not fit into the device memory, abort");
+    }
+
+    if (n_ctx_max_user == 0) {
+        LOG_TRC("%s: the user context size of %" PRIu32 " fits, no changes needed\n", __func__, cparams->n_ctx);
+        return;
+    }
+
+    const uint32_t n_ctx_orig = cparams->n_ctx;
+    const uint64_t n_ctx_new  = n_ctx_from_cap(std::min<uint64_t>(std::min<uint64_t>(n_ctx_fits, n_ctx_max_user), n_ctx_max));
+    if (n_ctx_new > n_ctx_orig) {
+        cparams->n_ctx = (uint32_t) n_ctx_new;
+        LOG_TRC("%s: growing the context size from %" PRIu32 " to %" PRIu32 "\n", __func__, n_ctx_orig, cparams->n_ctx);
+    }
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+        common_params_fit_tensor_impl(path_model, mparams, cparams, margins_s, n_ctx_min, n_ctx_max_user, extra, log_level);
+        return;
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
