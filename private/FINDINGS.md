@@ -1000,6 +1000,208 @@ loads with no_alloc + LLAMA_LOAD_MODE_NONE, safe alongside the service):
   3840 MiB; all removed: 1 x 163840 = 3840 MiB. Fold the outcome into
   this finding when the user reports it.
 
+## F32. Tensor-mode ctx fit: real-load measurement (SHIPPED 10-25)
+
+Problem: common_params_fit_impl could not fit SPLIT_MODE_TENSOR.
+The ngl loop is meaningless there (the weight split is fixed by the
+model, decided at allocation time) and the projection helpers assume
+per-device layer placement. Tensor mode fell through to
+warn-then-continue (the old B7a target site, fit.cpp:182-183), so a
+tensor-mode run with a pinned -c that does not fit failed late and
+opaquely.
+
+Design (approved 10-25; user constraint: NO alloc probes - real
+context creations only, no graph build):
+- common_params_fit_tensor_impl (fit.cpp :214-434), dispatched from
+  common_params_fit_impl (:440-443) when split_mode ==
+  SPLIT_MODE_TENSOR; a literal sibling of common_params_fit_impl
+  (the -fit family naming precedent).
+- Real model load with mparams as given (the tensor split is only
+  known at allocation time); per-card free memory before/after the
+  load = used_model.
+- Two real context creations, create+free, at n_ctx 2048 and 32768
+  (tensor_measure_ctx, :192-212); per-card free-memory deltas
+  (used_lo, used_hi). If the high point does not fit, halve it; if
+  even the low point fails, the model+min ctx do not fit (throw);
+  if only the low point fits, binary-search the max instead of the
+  linear solve.
+- Per-card linear solve: rate = (used_hi - used_lo)/(hi - lo)
+  bytes/token, fixed = used_lo - rate*lo; budget = free0 -
+  used_model - fixed - margin; n_ctx_fits = min over cards of
+  budget/rate (0 when a card is over budget at the minimum context).
+- n_ctx is TOTAL ctx (per-seq = n_ctx / n_seq_max); n_ctx_max =
+  n_ctx_train * n_streams (total cap, n_streams = 1 for unified KV,
+  else max(1, n_seq_max)).
+- Alignment: floor to lcm(16384, n_streams), EXCEPT when the cap is
+  the limiting bound (cap == n_ctx_max keeps the trained cap EXACT,
+  n_ctx_from_cap :392-398).
+- -c 0 sentinel: n_ctx_min == UINT32_MAX means full context
+  requested; effective min = n_ctx_max (no reduction allowed).
+- Explicit -c above n_ctx_fits: fit_exception with the max fitting
+  printed (the client sees "does not fit, max fitting is N").
+- -fitm (n_ctx_max_user): grow a pinned -c to
+  min(n_ctx_fits, n_ctx_max_user, n_ctx_max) with the same
+  alignment, only when it grows (n_ctx_orig saved).
+- Extra (draft/MTP) model in tensor mode: throw (unsupported).
+- Margins: margins_s are ordered by the meta device's card order
+  (explicit -dev list, or the default non-CPU selection), matched
+  via the three new meta accessors.
+
+Dependency (same commit): ggml_backend_dev_is_meta /
+ggml_backend_meta_dev_n_devs / ggml_backend_meta_dev_simple_dev
+were file-static in ggml-backend-meta.cpp; de-static + declared in
+ggml-backend.h (:407-409) so fit.cpp can map the meta device back
+to its cards. The model's single meta device comes from
+llama_model_n_devices/llama_model_get_device (llama-ext.h:88-90,
+llama-model.cpp:3514-3523 - in-tree, NOT in include/llama.h).
+
+Verification (27B ternary PTQ1_0 5.54 GB, q5_1 KV, -sm tensor
+-ngl 99, 2x Arc Pro B70 32 GB, co-resident with the live service;
+runner + logs in $env:TEMP\opencode, fit-verify-*.log):
+
+  A-auto (no -c):        exit 0, -c 262144 -ngl 99
+                         (max fitting 910054, trained cap exact)
+  A2-auto -np 2:         exit 0, -c 524288 -ngl 99
+                         (max fitting 903787; 2 x 262144 per-seq;
+                         cap == n_ctx_max so exact, no alignment)
+  B-explicit -c 1000000: exit 1, "the user context size of 1000000
+                         does not fit, max fitting is 909759"
+  C-full-ctx -c 0:       exit 0, -c 262144 -ngl 99
+                         (sentinel path; max fitting 909508)
+  D-grow -c 8192 -fitm
+  65536:                 exit 0, "growing the context size from
+                         8192 to 65536", -c 65536 -ngl 99
+
+Per-card trace (A): model 2707 MiB/card; free before/after 14577/
+11870 (SYCL0), 16234/13527 (SYCL1); ctx@2048 = 164 MiB/card;
+fit wall time ~97 s (one model load + two context creations).
+
+Findings:
+1. The KV cache does NOT scale with n_seq_max in this fork: 1 seq
+   32768 = 768 MiB (32768 cells, 16 layers q5_1, 1/1 seqs) vs 2 seqs
+   32768 = 768 MiB (16384 cells, 2/2 seqs) - the same shared n_ctx
+   ring (the pool F31's no-crash work addresses). Only the GDN
+   recurrent state grows per seq (149.62 -> 299.25 MiB, R+S f32).
+   This is why max fitting moved only 910054 -> 903787 between A
+   and A2.
+2. hadamard-v2 loader gate: 10/20 ternary re-exports (2B/4B/9B +
+   MTP) carry prism.hadamard.version = 2 and are rejected by this
+   tree (llama-model.cpp:1198-1201 accepts v1 only); only the 9/20
+   27B files (PTQ1_0, PQ2_0) load. The 27B was therefore the
+   verification vehicle; 4B/9B tensor work is blocked on this gate.
+3. Tensor mode force-enables flash_attn ("enabling flash_attn since
+   it is required for SPLIT_MODE_TENSOR") - no --flash-attn needed.
+4. Max fitting varies per run (903787-913441 observed) with the
+   service's memory footprint at fit time - expected (per-card free
+   at load), not a bug.
+5. Co-residency: post-restart the 27B tensor fit ran fine alongside
+   the live service (per-card free after model load ~11.6/13.5 GiB);
+   pre-restart the same fit hit the 0xC0000409 host-malloc assert
+   (F1/B4 family) under the older service footprint. Re-runs can
+   fail if the service footprint grows; re-derive VRAM first.
+6. Build quirk (local, documented, not chased): VS-bundled ninja
+   1.12.1 exits 0 after the "Provisioning UI assets" custom target
+   while ninja -n shows 6 pending edges, so the exes were not
+   relinked after the helper rename. Not blocking: the 16:59 exes +
+   18:28 llama-common.dll are ABI-compatible (the rename is a
+   file-static function; fit.cpp lives in llama-common, not the
+   -impl dlls). See STATE.md Binaries.
+
+Commit: 1011b639d (fit.cpp +260, ggml-backend.h +4,
+ggml-backend-meta.cpp 8 +/-), pushed 10-25.
+
+## F33. Per-slot runtime context growth (DESIGN ONLY, no code)
+
+Goal: when a slot hits the KV wall (F31 stage 1 ends it) and the
+cards demonstrably have headroom, grow THAT slot's context instead
+of ending it. Runtime counterpart of -fitm (F31 stage 2, fit-time):
+the model stays loaded, the other slots keep decoding, only one
+slot's context is recreated larger. PENDING USER CONFIRMATION -
+nothing implemented.
+
+Grounding (verified in tree 10-25):
+- Slots have PER-SLOT contexts: server_slot.ctx_tgt/ctx_dft
+  (server-context.cpp:203-204), slot.n_ctx is per-slot. Growth =
+  one new llama_context on the same loaded model, not a server
+  restart.
+- Wall path today (F31 stage 1): decode() n_batch == 1 && ret == 1
+  -> try_clear_idle_slots() (:1586) -> else end ONLY the failing
+  slot with EXCEED_CONTEXT_SIZE (:3632-3664). Growth slots in
+  between the idle-clear and the end. Second site: the task-start
+  check n_tokens > slot.n_ctx (:3085-3116) - a big prompt that does
+  not fit the pinned n_ctx could be grown at assignment time
+  instead of erroring.
+- The restore primitive exists and is in production use: the per-seq
+  state export/import (llama_state_seq_get/set_data_ext,
+  llama-context.cpp:4411-4420, impl :3267/:3286). The server
+  already saves/restores slot state this way (prompt_save
+  :259-283, handle_slots_restore :5253).
+- COVERAGE VERIFIED: both memory types are seq-scoped in this fork
+  (the earlier guess that the export covered full-attn KV only is
+  WRONG):
+  - full-attn KV: llama-kv-cache.cpp:2176 state_write; per-cell
+    positions are stored (state_write_meta :2295) -> position-keyed
+    restore into the larger ring;
+  - GDN recurrent R/S: llama-memory-recurrent.cpp:743 state_write;
+    cells carry seq_id, R/S buffers are fixed size per cell (no
+    n_ctx dependence) -> size-invariant restore.
+- Sizing: reuse the tensor-fit per-card math (F32: fixed + rate,
+  budget = free - used - margin) against the CURRENT per-card free
+  memory; floor to 16384, capped at n_ctx_train.
+
+Design (draft):
+1. Trigger: KV exhaustion at the wall for slot s (or a big prompt at
+   task start) with slot.n_ctx below the grown target. If the
+   per-card budget solve yields target <= slot.n_ctx (no headroom),
+   fall through to the current end-slot behavior (F31 unchanged).
+2. Quiesce: stop decoding for slot s (it is at the wall anyway);
+   synchronize the context.
+3. Save: llama_state_seq_get_data_ext(ctx, buf, size, s.id) into a
+   host buffer - KV + GDN state for the slot's seq, and the draft
+   state if ctx_dft (prompt_save already sizes both).
+4. Recreate: free the old ctx (releases its VRAM BEFORE the new one
+   allocates, so peak device memory = new ctx, not old+new), create
+   the new ctx at the grown n_ctx on the same model, then
+   llama_state_seq_set_data_ext(new_ctx, buf, size, s.id).
+5. Resume: point slot.ctx_tgt/ctx_dft at the new contexts, update
+   slot.n_ctx, continue decoding at the same position. The client
+   sees a pause (save + create + restore), no error, no restart.
+6. Rollback: if the new ctx creation fails, recreate the old ctx at
+   the old n_ctx and restore the saved state into it; if THAT
+   fails, end the slot (F31 behavior). The host buffer is the
+   source of truth until the restore succeeds.
+7. Budget: the per-card solve must subtract the host-buffer cost
+   from the HOST budget (not the cards) - the state buffer can be
+   large (KV ~24 KiB/token q5_1 + GDN ~150 MiB/seq at 27B scale);
+   the card budget must cover the new ctx while the model + other
+   slots' ctx stay resident.
+8. GDN note: the recurrent state is restored from the buffer, but
+   ONLY the tokens of the slot's own seq are covered - if the slot
+   ever shared a cell with another seq (cell.src copy-on-write,
+   llama-memory-recurrent.cpp:780), the shared state belongs to the
+   other owner; verify no cross-slot cell sharing exists in the
+   server (each slot is a separate context, so this should hold).
+
+Open questions (verify before implementing):
+1. state_read into a larger ring when the old ring wrapped (cache
+   shift) or an SWA mask dropped cells at save
+   (llama-kv-cache.cpp:2204-2208): the position-keyed restore should
+   cope, but the wrapped case needs a dedicated check.
+2. Draft/MTP slots: ctx_dft must be recreated and restored in the
+   same quiesced window (prompt_save's main+drft pattern).
+3. n_ctx_max_user equivalent: an opt-in cap flag (grow only up to N,
+   0 = off) mirroring -fitm, so growth is not surprising.
+4. Growth is PER-SLOT; in the unified-KV layout the ring is shared
+   (F32 finding 1), so the budget must account for the shared ring
+   growing and shrinking other slots' available cells.
+5. Interaction with the prompt cache (server_prompt_cache): a
+   grown slot's saved prompt (from before the growth) is stale and
+   must be invalidated.
+
+Exit: user confirms or drops; if confirmed, recon notes (the open
+questions above) to private/ then staged implementation. NOT to be
+implemented without explicit confirmation.
+
 ## For consideration (not approved, no code written)
 
 Deferred design options for the KV/memory wall, in the order discussed
@@ -1022,7 +1224,10 @@ landing and the fit-time auto-size; these are what is left on the table:
    pending user confirmation (registry config shape, budget via the
    fit.cpp projection, idle-offload + pin/lock).
 4. KV ring design options (if per-slot growth is ever needed):
-   in-place ring growth is REJECTED (KV pool fixed at context creation);
-   alternatives are fit-time auto-size (shipped, F31 stage 2), a larger
-   per-slot reservation at startup, or per-slot ring rebalance on
-   evict - none approved.
+   in-place ring growth is REJECTED (KV pool fixed at context
+   creation); alternatives are fit-time auto-size (shipped, F31
+   stage 2), a larger per-slot reservation at startup, or per-slot
+   ring rebalance on evict - none approved. NEW 10-25: the
+   per-slot runtime growth design (recreate one slot's context
+   larger, restore via the seq-state export) is drafted in F33,
+   design only, pending user confirmation.

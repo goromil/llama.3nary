@@ -28,6 +28,10 @@ Each item: what / why / how / exit criteria / status.
 > 6a30f9157, fit-time auto-size -fitm db5cf4d80, F31); SYCL build
 > finding F30 (SYCL=OFF = CPU-only runtime, build recipe now SYCL=ON);
 > B14 (twin-server + router) drafted, pending user.
+> 10-25 (later): tensor-mode ctx fit SHIPPED (1011b639d, F32, 5-case
+> verify matrix on 27B PTQ1_0); B14 PARKED behind the growth path;
+> B15 (per-slot runtime growth) drafted DESIGN ONLY (F33), pending
+> user.
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -267,4 +271,28 @@ Each item: what / why / how / exit criteria / status.
   to the user; implement only on explicit confirmation.
 - exit: user confirms or drops; if confirmed, recon notes to private/
   then staged implementation.
-- status: DRAFT, PENDING USER CONFIRMATION (10-25).
+- status: PARKED (10-25) - the user chose the tensor-fit + growth path
+  first (F32 shipped, F33 drafted). B14 remains the alternative
+  CAPACITY vehicle if per-slot growth (B15) is insufficient or dropped;
+  re-present the B14 draft before any B14 work.
+
+## B15. Per-slot runtime context growth (DESIGN ONLY - F33)
+- what: grow ONE slot's context at runtime when it hits the KV wall
+  and the cards have headroom: recreate that slot's ctx_tgt/ctx_dft
+  at a larger n_ctx on the same loaded model, restore the slot's
+  state via the seq-state export (KV + GDN R/S, both seq-scoped -
+  verified F33), keep the other slots decoding. Design is in F33;
+  NOTHING implemented.
+- why: F31 stage 1 ends the wall-hitting slot (clean but lost work);
+  -fitm (stage 2) only sizes at fit time. Runtime per-slot growth
+  recovers the wall hit without a restart. Per-slot contexts
+  (server-context.cpp:203-204) make this a one-context operation.
+- how: see F33 (trigger at the F31 wall site + task-start check;
+  quiesce -> save state to host buffer -> free old ctx -> create new
+  ctx -> restore state -> resume; rollback on failure; per-card
+  budget from the F32 math; opt-in cap flag mirroring -fitm).
+  Open questions in F33 must be verified first (wrapped-ring
+  restore, draft ctx, unified-KV budget, prompt-cache invalidation).
+- exit: user confirms or drops; if confirmed, verify the F33 open
+  questions (recon notes to private/), then staged implementation.
+- status: DRAFT, DESIGN ONLY, PENDING USER CONFIRMATION (10-25).

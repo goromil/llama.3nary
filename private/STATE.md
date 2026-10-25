@@ -1,23 +1,23 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-25. KV wall shipped in TWO stages, both
-committed+pushed (F31): (1) no-crash at the wall (6a30f9157) - a
-KV-exhausted decode with n_batch == 1 ends ONLY the failing slot (clean
-EXCEED_CONTEXT_SIZE to that client), the others keep generating;
-(2) fit-time auto-size (db5cf4d80) - opt-in -fitm / --fit-ctx-max
-grows a pinned -c into free device memory in 16K-token steps up to the
-cap, before the margin check; verified on-device (32768 -> 65536 grow,
-margin pass on both cards). SYCL build mystery root-caused + fixed
-(F30): the 10-21/10-23 "SYCL=OFF OOM bypass" produced CPU-only
-runtimes with no visible error; build-3nary.bat is now permanently
-SYCL=ON (one-time ggml-sycl TU rebuild at -j 1 + downstream, all
-green). Carried from 10-23: B12 DONE (7cb134632, H-A fold, PQ2_0 +
-PTQ1_0 tensor-verified); F28 OPEN (live service runs from the CLONE
-tree). NEW: B14 (twin-server + router) drafted, pending user.
-NEXT: present the B14 draft + the 10-25 report (qwen35.cpp 9B MTP fix
-gone from the tree; SYCL finding; grow verification). Await the
-user's extraArgs bisection outcome + a free card for the Q5_K_S tensor
-bench. Then B7a (startup loud-fail) and B13 recon.
+Last refresh: 2026-10-25 (evening). Tensor-mode ctx fit SHIPPED
+(1011b639d, F32): common_params_fit_tensor_impl measures the per-card
+footprint with a real model load + two real context creations, solves
+per-card fixed + bytes/token rates, fits n_ctx to the min per-card
+budget (floor-aligned 16384, trained cap exact when limiting); 5-case
+verify matrix on 27B PTQ1_0 all as expected. Growth design DRAFTED,
+design only (F33, B15): per-slot runtime context growth - recreate
+one slot's ctx larger on the same loaded model, restore via the
+seq-state export (KV + GDN R/S both seq-scoped, verified), pending
+user. B14 (twin-server + router) PARKED behind the growth path.
+Carried: KV wall two stages (F31, 6a30f9157 + db5cf4d80); SYCL build
+fixed (F30, recipe permanently SYCL=ON); B12 DONE (7cb134632); F28
+OPEN (live service runs from the CLONE tree); qwen35.cpp 9B MTP fix
+GONE from the tree (reported to user 10-25).
+NEXT: present the tensor-fit verification report + the F33 growth
+design draft to the user (user decision: implement / drop / B14).
+Await the user's extraArgs bisection outcome + a free card for the
+Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13 recon.
 
 ## Environment
 
@@ -45,14 +45,16 @@ bench. Then B7a (startup loud-fail) and B13 recon.
 
 - LIVE (10-25, do not disturb, user-owned): RESTARTED AGAIN 10-25
   (after the extraArgs-bisection restart), still from the CLONE tree
-  `C:\Users\admin\source\ai\llama.cpp` (F28). Re-derived 10-25:
-  llama-server PID 212452 on 8080; 58452 NOT listening; commit free
-  ~56.4 GB / phys free ~48.9 GB (looser than the 03:00 state -
-  consistent with the bisection removing -c/-ngl/-np from the preset
-  tail; VRAM state unknown, re-check before benching). The user is
-  bisecting the extraArgs tail (-ngl 99, -np 2, -c 262144); outcome
-  pending (prediction table in F31). Re-derive PIDs:
-  `Get-NetTCPConnection -LocalPort 8080,58452 -State Listen`.
+  `C:\Users\admin\source\ai\llama.cpp` (F28). Re-derived 10-25
+  (evening, post the fit-verify runs): llama-server PID 11848 on
+  0.0.0.0:8080 + PID 20004 on 127.0.0.1:60283 (loopback, likely a
+  macube child); 58452 NOT listening. Commit free ~49 GB / phys free
+  ~48 GB. The user is bisecting the extraArgs tail (-ngl 99, -np 2,
+  -c 262144); outcome pending (prediction table in F31). The tensor
+  fit coexisted with this service post-restart (F32 finding 5).
+  Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080,58452,60283
+  -State Listen` (process details access-denied for non-service
+  ports).
 - History: 50630 (10-23 child) + 59148 (10-23 router) + 62743 (dead
   10-23, F28, replaced by the 10-25 restart), 24252/26876 (10-22
   service, Q5_K_S + MTP, replaced), 52416
@@ -62,6 +64,25 @@ bench. Then B7a (startup loud-fail) and B13 recon.
 
 ## Active work
 
+- Tensor-mode ctx fit (10-25, SHIPPED 1011b639d, F32):
+  common_params_fit_tensor_impl (fit.cpp :179-434) - real model load
+  + two real context creations (n_ctx 2048/32768), per-card free-mem
+  deltas, linear solve for fixed + bytes/token per card, n_ctx to the
+  min per-card budget floor-aligned to lcm(16384, n_streams) (trained
+  cap kept exact when it is the limiting bound); -c 0 sentinel,
+  explicit -c verified (fail prints the max fitting), -fitm grow
+  branch; extra (draft/MTP) model throws. Same commit: the three meta
+  accessors de-static (ggml-backend-meta.cpp + ggml-backend.h:407-409).
+  Verified: 5-case matrix on 27B PTQ1_0 (A/A2/B/C/D, all as expected,
+  F32). Findings: KV does not scale with n_seq_max (shared ring),
+  hadamard-v2 gate blocks 10/20 exports, flash_attn auto-enabled.
+- B15 (NEW 10-25, DESIGN ONLY - F33): per-slot runtime context
+  growth. Recreate one slot's ctx_tgt/ctx_dft larger on the same
+  loaded model; restore via the seq-state export (KV + GDN R/S both
+  seq-scoped in this fork - verified, the earlier "KV only" guess is
+  wrong); trigger at the F31 wall site between idle-clear and
+  end-slot; rollback + opt-in cap. PENDING USER CONFIRMATION, no
+  code. See BACKLOG B15 + FINDINGS F33.
 - KV wall (10-25, DONE - both stages committed+pushed, F31):
   - Stage 1 no-crash (6a30f9157): only n_batch == 1 && ret == 1 (the
     KV wall) is special-cased in decode() (bool -> int, file-local
@@ -99,17 +120,20 @@ bench. Then B7a (startup loud-fail) and B13 recon.
   PTQ1_0 tensor-verified; tests/test-hadamard-fold.cpp pins the
   formula. H-C (kernel fusion, zero requant noise) documented in F29
   as the fallback only.
-- B14 (NEW 10-25): twin-server + router - two pinned children
+- B14 (10-25, PARKED): twin-server + router - two pinned children
   (-dev SYCL0 / -dev SYCL1, -fit off + explicit -ngl) behind a router
-  that aggregates /v1/models and routes by session. DRAFT pending user
-  confirmation; grounding owed: per-backend free-memory surface under
-  a pin, build placement (tools/CMakeLists.txt, unified-binary
-  subcommand vs new tool), router location. See BACKLOG B14.
+  that aggregates /v1/models and routes by session. PARKED 10-25: the
+  user chose the tensor-fit + growth path first (F32 shipped, F33
+  drafted); B14 remains the alternative CAPACITY vehicle. See
+  BACKLOG B14.
 - B7a: startup-side loud-fail (unfittable ctx/KV) + closed --dev gate.
   Status: APPROVED 10-22, OPEN - next code candidate in this fork.
-  The 10-25 runtime KV work is additive, NOT B7a. Target site:
-  common/fit.cpp:182-183 (SPLIT_MODE_TENSOR fit throw, currently
-  warn-then-continue per log).
+  The 10-25 runtime KV work is additive, NOT B7a. NOTE 10-25 (evening):
+  the old target site (fit.cpp:182-183 warn-then-continue on
+  SPLIT_MODE_TENSOR) is GONE - the tensor fit branch now exists
+  (fit.cpp :179-434, F32) and throws a proper fit_exception. B7a's
+  remaining target: the startup ctx/KV loud-fail for the non-tensor
+  paths + the closed -sm/-dev parse gate (common-params parse area).
 - B13: port the (fixed) ternary work to the upstream clone
   `C:\Users\admin\source\ai\llama.cpp` (F25). Status: UNBLOCKED (B12
   landed 10-23), recon NOT started. De-risked 10-23: the clone NOW
@@ -126,11 +150,12 @@ bench. Then B7a (startup loud-fail) and B13 recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `db5cf4d80` (fit : grow the context into
-  free memory up to an opt-in cap (-fitm)). Before it: `6a30f9157`
-  (server : end only the failing slot when the KV cache is exhausted),
-  `f66f6cd62` (docs : F29), `bcd84baff` (docs), `7cb134632` (B12).
-  Full list: NOTES.md N12.
+- branch `main`, pushed HEAD: `1011b639d` (fit : tensor-mode context
+  fitting via real context-creation measurement). Before it:
+  `16a21e2ce` (docs : N17), `715ffcbb0` (docs : private library
+  refresh), `db5cf4d80` (fit : -fitm), `6a30f9157` (server : KV wall
+  no-crash), `f66f6cd62` (docs : F29), `bcd84baff` (docs),
+  `7cb134632` (B12). Full list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
@@ -141,7 +166,22 @@ bench. Then B7a (startup loud-fail) and B13 recon.
 - `build\bin`: 10-25 SYCL=ON rebuild (F30): ggml-sycl.dll 62.8 MB
   (~03:05), ggml.dll (~03:11), exes (~03:12) - the one-time ggml-sycl
   TU compile + 297 downstream steps. Supersedes the 10-23 B12 build.
-  NOTE: the 10-21 install tree's ggml-sycl.dll lacks ggml_backend_init
+  10-25 (evening, F32 build): llama-common.dll relinked 18:28 with
+  the renamed tensor-fit helper; the exes + -impl dlls stay at 16:59
+  (the build did not reach the exe relink - see the ninja quirk
+  below). ABI-compatible in practice: the rename is a file-static
+  function inside llama-common (fit.cpp), not in the -impl dlls, and
+  the 5-case verify matrix ran green against exactly this binary set.
+- NOTE 10-25 (evening): VS-bundled ninja 1.12.1
+  (`C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\
+  IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe`) exits 0
+  after the [1/6] "Provisioning UI assets" custom target while
+  `ninja -n` lists 6 pending edges (ui.cpp.obj, server-http.cpp.obj,
+  llama-ui.lib, llama-server-impl.dll, llama-server.exe);
+  llama-fit-params.exe never enters the plan. Root cause unresolved;
+  not chased (F32 finding 6). Incremental compiles of common/ fit.cpp
+  DO complete (obj + llama-common.dll relink).
+- NOTE: the 10-21 install tree's ggml-sycl.dll lacks ggml_backend_init
   (same as the old build tree's) - verify the install tree's link
   state before any redeploy advice; dlopen is dead in this fork
   either way (F30).
@@ -153,7 +193,7 @@ bench. Then B7a (startup loud-fail) and B13 recon.
 | Ternary PQ2_0 27B (crashing model) | `C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_0\` | PQ2_0 gguf 6.71 GB + mmproj-BF16 888 MB. 64 blocks (48 GDN + 16 full-attn at 3,7,...,63), NO MTP nextn, ternary type 142, qwen35 arch. ssm_out [K=6144, N=5120] PQ2_0. |
 | Ternary PTQ1_0 27B (PREFERRED test model) | `E:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PTQ1_0\` | PTQ1_0 gguf 5.54 GB + mmproj. B11 kernel applies. |
 | Qwen3.8-27B-UD-Q5_K_S (target, live service) | `E:\DataVolume\Models\Qwen3.8-27B-UD-Q5_K_S\` | 17.38 GB + mtp-Q4_0 draft 1306 MiB + mmproj-BF16. 65 blocks, 16 full-attn + 48 GDN, embd 5120. Tensor mode proven at 160K ctx (31.9 t/s, N10). |
-| Ternary family (small) | `E:\DataVolume\TernaryModels\` | 2B PTQ1_0, 4B PQ2_0 + 4B/9B MTP Q8_0 variants (co-residency candidates, F17). |
+| Ternary family (small) | `E:\DataVolume\TernaryModels\` | 2B PTQ1_0, 4B PQ2_0 + 4B/9B MTP Q8_0 variants (co-residency candidates, F17). 10-25: the 10/20 small re-exports carry prism.hadamard.version=2 and are REJECTED by this tree (v1 gate, llama-model.cpp:1198-1201) - only the 9/20 27B files load (F32 finding 2). |
 
 KV math (F17): KV q5_1 @131072 = 3072 MiB, draft KV q4_0 = 144 MiB,
 GDN recurrent state 598.50 MiB (no per-token growth).
@@ -175,6 +215,10 @@ GDN recurrent state 598.50 MiB (no per-token growth).
 | fitm-test2.log | 10-25 host-only fit (nd == 0, grow skipped, fit OK). |
 | fitm-test3.log | 10-25 GPU over-budget fit (-c 131072 -ngl 99 -fitm 262144): no grow, correct abort, exit 1. |
 | fitm-grow.log / fitm-grow.bat | 10-25 GROW evidence: 32768 -> 65536, margin pass both cards, printed -c 65536 -ngl 40, exit 0. |
+| run-fit-verify.ps1 | 10-25 tensor-fit matrix runner (27B PTQ1_0; cases A-auto, A2-auto-np2, B-explicit-big, C-full-ctx, D-grow). |
+| fit-verify-{A-auto,A2-auto-np2,B-explicit-big,C-full-ctx,D-grow}.log | 10-25 tensor-fit verify matrix (F32): fitted -c lines at ~:2685, fit traces at ~:2681, per-card traces at ~:2310-2312. |
+| fit-verify-probe-ptq10.log | 10-25 first successful 27B tensor fit (post service-restart; max fitting 913441). |
+| build-3nary-fit.bat / build-3nary-fit{,2}.log | 10-25 fit build recipe + the ninja-1.12.1 early-exit evidence (F32 finding 6). |
 | build-3nary.bat | N3 recipe, now permanently SYCL=ON (F30). |
 | build-sycl-tu.bat / build-downstream.bat | one-time SYCL=ON ggml-sycl TU (-j 1, needs commit headroom) + downstream no-configure recipe (F30). |
 | mtp-server-*.log, ternary-d-err.log, ptq10-* | historical (F1/F8/F10/F14). |
@@ -184,7 +228,7 @@ srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
 
-## Next (10-25)
+## Next (10-25 evening)
 
 1. [DONE] KV wall stage 1 (no-crash at the wall): committed+pushed
    6a30f9157.
@@ -192,24 +236,33 @@ block; grep by port 8080/58452.
    db5cf4d80; grow verified on-device (3 scenarios, F31).
 3. [DONE] SYCL=OFF = CPU-only runtime: root-caused + fixed (F30);
    build-3nary.bat permanently SYCL=ON.
-4. [NEXT] Present to the user: (a) the B14 twin-server + router
-   draft; (b) the 10-25 report: qwen35.cpp 9B MTP fix gone from the
-   tree, the SYCL finding + fix, stage-2 grow verification (SHAs
-   6a30f9157, db5cf4d80).
-5. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
+4. [DONE] Tensor-mode ctx fit: committed+pushed 1011b639d (F32);
+   5-case verify matrix on 27B PTQ1_0 all as expected.
+5. [NEXT] Present to the user: (a) the tensor-fit verification report
+   (5-case table + findings: hadamard-v2 gate, flash_attn
+   auto-enable, shared KV ring, co-residency, ninja quirk); (b) the
+   F33 per-slot growth design draft - user decision: implement /
+   drop / B14 instead.
+6. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
    -c 262144; prediction table in F31) - fold into FINDINGS when
    reported.
-6. [B] Await a free card (re-derive VRAM first; service PID 212452)
-   -> run the Q5_K_S tensor bench (N17; GDN correctness check first).
-7. B7a (this fork, next code item): startup loud-fail on unfittable
-   ctx/KV + closed --dev gate. Target: common/fit.cpp:182-183
-   SPLIT_MODE_TENSOR fit throw + the -sm/-dev parse area.
-8. B13 recon (read-only, clone hosts live service): diff fork vs
-   clone meta backend (upstream PRs #26490/#27574), ternary enum
-   mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/divergent
-   work map (F25), whether 3nary lacks the clone's seq_rm fix
-   (server-context.cpp ~:3444, relevant to F28). THEN port
-   commit-by-commit on user-confirmed scope.
-9. F28 (open, read-only): live-service state-save bad allocation at
-   88K tok (clone build); does 3nary have the equivalent fix?
-10. Refresh private/ + commit+push at each milestone.
+7. [B] Await a free card (re-derive VRAM first; service PID 11848 +
+   20004) -> run the Q5_K_S tensor bench (N17; GDN correctness check
+   first).
+8. B15 (if the user confirms F33): verify the F33 open questions
+   (wrapped-ring restore, draft ctx, unified-KV budget, prompt-cache
+   invalidation), then staged implementation.
+9. B7a (this fork, next code item): startup loud-fail on unfittable
+   ctx/KV + closed -sm/-dev gate. NOTE: the old target
+   (fit.cpp:182-183 tensor warn-then-continue) is GONE - the tensor
+   fit branch exists now (F32); remaining target is the non-tensor
+   startup ctx/KV loud-fail + the parse gate.
+10. B13 recon (read-only, clone hosts live service): diff fork vs
+    clone meta backend (upstream PRs #26490/#27574), ternary enum
+    mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
+    divergent work map (F25), whether 3nary lacks the clone's seq_rm
+    fix (server-context.cpp ~:3444, relevant to F28). THEN port
+    commit-by-commit on user-confirmed scope.
+11. F28 (open, read-only): live-service state-save bad allocation at
+    88K tok (clone build); does 3nary have the equivalent fix?
+12. Refresh private/ + commit+push at each milestone.
