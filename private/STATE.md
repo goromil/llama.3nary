@@ -200,7 +200,7 @@ block; grep by port 8080/58452.
    -c 262144; prediction table in F31) - fold into FINDINGS when
    reported.
 6. [B] Await a free card (re-derive VRAM first; service PID 212452)
-   -> run the Q5_K_S tensor bench (GDN correctness check first).
+   -> run the Q5_K_S tensor bench (N17; GDN correctness check first).
 7. B7a (this fork, next code item): startup loud-fail on unfittable
    ctx/KV + closed --dev gate. Target: common/fit.cpp:182-183
    SPLIT_MODE_TENSOR fit throw + the -sm/-dev parse area.

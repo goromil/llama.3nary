@@ -389,3 +389,21 @@ build\bin\llama-cli.exe -m C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_
 - Live-service log lines: 5th column = level (D/I/W/E). LCP slot
   selection lines (`selected slot by LCP similarity, f_sim_best = ...`)
   are INFO, not warnings - they report warm-slot KV reuse.
+
+## N17. Q5_K_S tensor bench (user runs it, needs a free card, 10-25)
+
+Exact bench line for Qwen3.8-27B-UD-Q5_K_S in tensor mode (the BLOCKED
+item; GDN correctness check FIRST, then speed):
+
+    cmd /c "C:\Users\gorom\source\ai\llama.3nary\build\bin\llama-server.exe -m E:\DataVolume\Models\Qwen3.8-27B-UD-Q5_K_S\Qwen3.8-27B-UD-Q5_K_S.gguf --model-draft E:\DataVolume\Models\Qwen3.8-27B-UD-Q5_K_S\mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp --cache-type-k q5_1 --cache-type-v q5_1 --cache-type-k-draft q4_0 --cache-type-v-draft q4_0 --ctx-size 131072 --batch-size 6144 --ubatch-size 6144 --threads 56 --threads-batch 28 --flash-attn on -fit off -ngl 99 -sm tensor -port 8123 -lv 5 > C:\Users\admin\AppData\Local\Temp\opencode\q5ks-tensor-bench.log 2>&1"
+
+- Use build\bin (the 10-25 SYCL=ON build, F30); do not bench with the
+  10-21 install tree's exe until its link state is re-verified. The
+  original line used C:\Users\admin\.local\3nary-sycl\llama-server.exe
+  with the same args.
+- -ngl 99 + -sm tensor without -dev uses BOTH cards (tensor
+  intentionally spans SYCL0+SYCL1, F19) - it needs the VRAM the live
+  service holds (PID 212452 as of 10-25), so it runs only after the
+  user frees a card / stops the service.
+- GDN correctness first: short generation, sane output (no garbage /
+  loops) before trusting the t/s.

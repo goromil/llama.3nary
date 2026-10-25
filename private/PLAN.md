@@ -39,7 +39,7 @@ SYCL build mystery was root-caused + fixed in between (F30). B14
 7. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
    -c 262144; prediction table in F31) - fold into FINDINGS.
 8. [B] Await a free card (re-derive service VRAM first, PID 212452)
-   -> run the Q5_K_S tensor bench (GDN correctness check first).
+   -> run the Q5_K_S tensor bench (N17; GDN correctness check first).
 9. [ ] B7a (next code item in this fork): startup loud-fail on
    unfittable ctx/KV + closed --dev gate. Target:
    common/fit.cpp:182-183 SPLIT_MODE_TENSOR fit throw + the -sm/-dev
