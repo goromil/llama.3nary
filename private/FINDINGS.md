@@ -1613,6 +1613,136 @@ Retained-KV shrink policy fork (OPEN, presented to user):
   262144->16284 (~4 GiB at production scale) once traffic has
   cycled through the retaining slots.
 
+## F36. B70/SYCL single-GPU reference data (4 URLs, fetched 10-27) vs the live dual-B70
+
+[certain] Card specs (web-verified, consistent across all 4 sources):
+Intel Arc Pro B70, BMG-G31: 32 GB GDDR6, 256-bit bus, 608 GB/s, 32 Xe
+cores / 256 XMX engines, TBP 160-290 W.
+
+Single-GPU reference numbers (dense Q4-class, llama.cpp SYCL):
+- jeffgrover/b70-setup (USB4 eGPU, Q4_K_S, 256K ctx): pp8K ~1068 t/s,
+  decode 12.4-25.9 t/s.
+- sergiiob.dev full recipe (dense 27B Q4, one card): pp4096 936 t/s,
+  decode 21.3 t/s. Their env recipe:
+  SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0,
+  SYCL_CACHE_PERSISTENT=0, SYCL_DEVICE_FILTER=level_zero,
+  ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE, ONEAPI_DEVICE_SELECTOR=level_zero:0,
+  ZE_AFFINITY_MASK=0.
+- snailium/llama.cpp-sycl-intel-b70 (AOT
+  -DGGML_SYCL_DEVICE_ARCH=bmg-g31): pp 470-490 t/s, decode 41-46 t/s.
+  Mandatory env: ONEAPI_DEVICE_SELECTOR=level_zero:0,
+  SYCL_CACHE_PERSISTENT=0, ZES_ENABLE_SYSMAN=1. The pp spread across
+  sources (470-1068) reflects prompt size + AOT-vs-JIT + eGPU-vs-discrete.
+- indiekings: prefill is compute-bound (XMX), decode is bandwidth-bound
+  (608 GB/s ceiling); strip debug symbols.
+
+Framing vs the live setup: ALL refs are single-GPU. The live child =
+dual B70 (layer split) + Qwen3.8-27B-UD-Q6_K 20.47 GiB + q5_1 KV +
+ctx 163840 + MTP draft + flash-attn + yarn. The 41-46 t/s single-card
+decode (snailium, same 27B class) is the useful floor: the live
+dual-card single-chat decode should be AT or ABOVE it; a live single-
+chat TG below that points at driver/env or split-mode P2P overhead
+(F38), not the hardware. The 12.4-25.9 t/s (jeffgrover) is USB4 eGPU
++ 256K ctx (long-ctx decode penalty), not comparable to our
+163840-base, discrete, dual-card setup.
+
+[open] No dual-B70 llama.cpp SYCL reference in these sources; the
+split-mode overhead on the live child is the F38 mechanism.
+
+## F37. Tensor-mode "bad allocation" decode failures (live service,
+10-27 evening)
+
+[certain] Symptom (user report + macube logs):
+`update_slots: decode() failed: bad allocation` (e.g. [57315]
+194.19.001.745, task 96704) happens ONLY under `--split-mode tensor`,
+is random, and may need a server restart; the user reverted to
+`-sm layer`. ALL 5 bad_alloc children are TENSOR mode (59129, 55422,
+57315, 65508, 54879; 54879 = MTP variant, ctx 262144); the only known
+layer child (52439, current live) is clean. Pattern: long decode
+(26379 / 96802 tokens) fails once, retries of the same conversation
+fail for minutes, then recover or hard-crash.
+
+[certain] "bad allocation" = std::bad_alloc's DEFAULT what() (MSVC STL
+under icx) = a HOST-side allocation failure. The SYCL backend prints
+device OOM with its own text; a raw host throw is what surfaces.
+
+[certain] Fatal variant (child death + router respawn): raw
+`bad allocation` + abort in ggml_sycl_op_mul_mat
+(ggml-sycl.cpp:3332) via CHECK_TRY_ERROR
+(ggml-sycl/common.hpp:77-88, prints e.what()) -> ggml_sycl_error ->
+GGML_ABORT (common.hpp:145). The same throw caught around
+llama_decode = the non-fatal server-level `decode() failed` line.
+
+[certain] PROVEN host bad_alloc site = the prompt cache:
+server_prompt_cache::alloc (server-task.cpp:1711) does a host
+std::vector::resize of the full KV state. Caught in the logs:
+[65508] "failed to allocate memory for prompt cache state: bad
+allocation" -> self-throttle to 1961.495 MiB; [54879] "prompt state
+size 10828.796 MiB exceeds cache size limit 8192.000 MiB, skipping".
+Default cache_ram_mib = 8192 (common/common.h:632); the live spawn
+line has NO --cache-ram. At the live KV size (~27.5 KB/token q5_1), a
+full 163840-ctx state is ~7-10 GiB of HOST memory per cache entry -
+the 10.8 GiB skip above matches.
+
+[high] Machine state at check (10-27 evening): 64 GB RAM (39.4 GB
+free), pagefile 60.9 GB, commit limit 123 GB, ~23 GB free commit
+(~100 GB committed). Per-process commit charge not readable
+(Get-Process CommitVirtual = access denied; WS only).
+
+[open] The tensor-decode-specific host allocation site is NOT pinned:
+the split mul_mat staging (ggml-sycl.cpp:3100-3388) uses per-op
+buffers from ctx.pool(i) = DEVICE memory (src0_dd/src1_ddf/src1_ddq/
+dst_dd); dst stays on device 0 via dpct::async_dpct_memcpy dev->dev.
+ggml_sycl_host_malloc (common.cpp:26, pinned sycl::malloc_host) has no
+call sites in ggml/. Working hypothesis: host COMMIT exhaustion
+surfacing at an arbitrary `new` during decode, aggravated in tensor
+mode because fit is a no-op there (llama_params_fit is not
+implemented for SPLIT_MODE_TENSOR - warning at load) so the server
+always runs the full 163840 ctx and exports GiB-scale prompt-cache
+states, while layer mode + fit keeps the ctx (and the cache states)
+smaller.
+
+Mitigations (ranked, for the handover):
+1. `--cache-ram 0` (or a small value) in the macube spawn line -
+   user-owned, one flag, kills the proven host OOM class without
+   touching model behavior.
+2. Stay on `-sm layer` short-term (the clean child).
+3. B14 twin-servers + router as the STRUCTURAL fix: each child is
+   single-card (no split-mode P2P waits, F38; tensor mode not needed
+   to use both cards), so both reported issues (balance + tensor
+   bad_alloc) disappear by construction.
+
+## F38. Layer/row-split two-chat balance: per-layer blocking P2P waits,
+no slot pipelining (10-27)
+
+[high] User report: with `-sm layer` (maybe row too), two concurrent
+chats are not balanced - the devices wait for each other per token and
+TG halves. User expectation: phased load (device 2 does chat#1 token i
+while device 1 does chat#2 token i).
+
+[certain] Code evidence for the per-token wait (ggml-sycl.cpp split
+mul_mat :3100-3388): the split path issues per-layer q8_1 weight
+copies dev->dev with BLOCKING .wait()s (:3288-3292), dev2dev_memcpy
+(:3298), and event barriers (:3361-3366, :3371-3387); dst accumulates
+on device 0 (dpct::async_dpct_memcpy dev->dev, :3335-3358). Every
+layer therefore serializes both cards: a token cannot progress until
+the P2P copies + barriers of that layer complete on BOTH devices.
+
+[certain] No slot pipelining exists in one llama-server: slots are
+evaluated SEQUENTIALLY through one shared pipeline (update_slots,
+server-context.cpp:2844+). Two chats sharing one server alternate
+through the same serialized per-layer split path; there is no
+mechanism to run chat#2 on card 1 while chat#1 is on card 2. The
+halved TG under two concurrent chats is the expected consequence, not
+a misconfiguration.
+
+The user's "phasing" = DATA PARALLELISM, which is exactly B14
+(twin-servers + router, one child per card). B14 sidesteps BOTH
+reported issues: no split-mode P2P waits (each child is single-card)
+and no tensor mode (so the F37 tensor-only bad_alloc class does not
+apply). Status: B14 remains PARKED (draft pending user); this finding
+raises its priority.
+
 ## For consideration (not approved, no code written)
 
 Deferred design options for the KV/memory wall, in the order discussed

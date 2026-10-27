@@ -36,6 +36,13 @@ Each item: what / why / how / exit criteria / status.
 > ring, PARKED future optimization). 10-26 (later): B15 stages 1+2
 > done (F34): core resize + server flag/triggers built green, unit
 > tests 100% + mutation-verified; stage 3 (27B verify) after install.
+> 10-27 (evening): B15 COMPLETE (9c8772ed8 + 5b8aa1fad + 2822ce088
+> pushed; E2E on the final binaries: first successful in-place
+> shrink 16384->8192 in 68 ms, grow content-verified, wide rebuild
+> 2822ce088 green); B14 priority RAISED (F37 tensor-only bad
+> allocation + F38 structural two-chat TG halving both point at
+> B14); B17 added (install-dir swap + spawn-line handover, incl.
+> the proposed --cache-ram 0, user call).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -278,7 +285,13 @@ Each item: what / why / how / exit criteria / status.
 - status: PARKED (10-25) - the user chose the tensor-fit + growth path
   first (F32 shipped, F33 drafted). B14 remains the alternative
   CAPACITY vehicle if per-slot growth (B15) is insufficient or dropped;
-  re-present the B14 draft before any B14 work.
+  re-present the B14 draft before any B14 work. NOTE 10-27 (evening):
+  priority RAISED - F38 (two-chat TG halving is structural: per-layer
+  blocking P2P waits + no slot pipelining) and F37 (bad allocation is
+  tensor-mode-only) both point at B14 as the fix for BOTH reported
+  issues; it sidesteps split-mode P2P and tensor mode by construction.
+  Re-present the draft (registry config shape, per-child budget,
+  idle-offload) before any work.
 
 ## B15. Runtime context growth - in-place ring tail extension
   (design CONFIRMED 10-25, IMPLEMENTED 10-26/27 - F33/F34, stage 3
@@ -337,15 +350,32 @@ Each item: what / why / how / exit criteria / status.
   retain-free-shrink cycle (--parallel 1) 26 ms; over-cap clean
   EXCEED_CONTEXT_SIZE at the 16384 cap, server survives; all far
   under the 2 s gate. E2E found + fixed 3 OUR-side bugs (idle tick
-  gap, iswa resize gap, 1/s retry spam) - all in the uncommitted
-  set. 27B-scale timings (262144->16284, ~6.3 GiB, est. 0.5-1 s)
-  still need a service-stop window. Open: retained-KV shrink policy
-  fork A/B/C (F35; C = shipped interim). DONE 10-27 (late): single
-  commit 9c8772ed8 pushed to the private origin. Next: install-dir
-  swap + live spawn-line handover (--fit-ctx/--fit-ctx-max ->
-  --adaptive-ctx full / --adaptive-ctx-max 262144 /
-  --adaptive-ctx-idle 30) -> B70 reference comparison -> bad-
-  allocation analysis. B14 remains PARKED behind this path.
+  gap, iswa resize gap, 1/s retry spam). 27B-scale timings
+  (262144->16284, ~6.3 GiB, est. 0.5-1 s) still need a
+  service-stop window. Retained-KV shrink policy (F35 fork A/B/C):
+  C shipped - refined 10-27 (evening) by the shrink pre-check below,
+  so a blocked shrink now NEVER reaches the cell resize (silent
+  skip, one attempt per idle period). DONE 10-27: 9c8772ed8 (B15
+  core) pushed. DONE 10-27 (evening): two follow-up commits pushed to
+  the private origin - 5b8aa1fad (llama : regrow KV-row copy on
+  device via ggml_backend_tensor_copy between row-limited views;
+  replaces the host-buffer round trip that could reach ~6 GiB at
+  27B scale) + 2822ce088 (server : try_shrink_ctx_idle pre-check -
+  count retained slot KV (slot.prompt.n_tokens(); per slot, or the
+  sum for unified) and skip while it does not fit the base floor;
+  before the fix ANY retained conversation > base made every idle
+  shrink fail with `E resize: cannot shrink the cells ... still
+  used`). E2E on the final binaries (gemma-4-E4B, port 18200): GROW
+  verified with content assertion (ZQX-7741 survived 8192->32768 on a
+  15054-token prompt; a 24054-token prompt processed post-grow
+  without corruption); FIRST EVER SUCCESSFUL IN-PLACE SHRINK
+  16384->8192 in 68 ms; retained KV intact across the shrink
+  (passcode BLT-2489); over-cap clean 400 EXCEED_CONTEXT_SIZE;
+  server still serving. Wide rebuild 2822ce088 via build-sycl.ps1
+  green (247 steps, ~3 min; build\bin in sync with the tree). Next:
+  B17 handover (install-dir swap + spawn line, incl. the proposed
+  --cache-ram 0 from F37). B14 remains PARKED (priority raised,
+  F37/F38).
 
 ## B16. VA-page KV ring (future optimization, PARKED)
 - what: the zero-copy alternative to B15's per-layer regrow: reserve
@@ -362,3 +392,29 @@ Each item: what / why / how / exit criteria / status.
   (CUDA VMM / Vulkan) becomes the target.
 - exit: n/a until un-parked; recon notes when revisited.
 - status: PARKED (10-26) as the future-optimization path for B15.
+
+## B17. Install-dir swap + live spawn-line handover (10-27)
+- what: in a user service-stop window, copy build\bin (HEAD 2822ce088)
+  over C:\Users\admin\.local\3nary-sycl\ (running exe/DLLs are locked,
+  so the service must be stopped), then swap the macube spawn line
+  (user-owned config, hands-off): delete `--fit-ctx 16284` /
+  `--fit-ctx-max 262144` (HARD DELETED from the new binary - the
+  server will not start on the old line); add `--adaptive-ctx full
+  --adaptive-ctx-min 16284 --adaptive-ctx-max 262144
+  --adaptive-ctx-idle 30`; PROPOSED addition: `--cache-ram 0` (F37 -
+  the 8 GiB default prompt cache is a proven host-OOM class at 27B
+  scale; user decision).
+- why: until the swap the live service runs PRE-ACTX binaries and the
+  tensor-mode bad-alloc class (F37) plus the per-token split P2P
+  waits (F38) stay live. The swap activates B15 (adaptive ctx,
+  on-device regrow copy, shrink pre-check).
+- how: user stops the macube service -> copy build\bin *.exe+*.dll
+  over the install dir -> swap the spawn line in the macube config ->
+  start. In the same window: measure the 27B-scale on-device copy
+  timing (262144->16284 load-shrink, ~6.3 GiB, est. 0.5-1 s).
+- exit: service up on the new line; child log shows the adaptive-ctx
+  load-shrink to 16284 and on-demand grow/shrink; no bad-alloc
+  recurrence; 27B-scale regrow timing recorded in FINDINGS.
+- status: OPEN (10-27 evening) - binaries READY (build\bin @
+  2822ce088, wide rebuild green 10-27 evening); awaits the user stop
+  window + the user's call on --cache-ram 0.

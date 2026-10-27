@@ -1,41 +1,39 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-27 (B15 stage 3 timed E2E DONE). B15 stages
-1+2 + the user-designed 4-flag adaptive-ctx family DONE (F34,
-F35): core resize + server grow/shrink triggers; ctest 100%; unit
-tests green. Stage 3 timed E2E on gemma-4-E4B COMPLETE 10-27
-(F35): load-shrink 32768->8192 in 19-22 ms, grow 8192->12288 in
-19-25 ms, over-cap clean EXCEED_CONTEXT_SIZE at a 16384 cap with
-the server surviving, and the full cycle (grow -> retained-KV
-blocked shrink -> new task frees KV -> shrink succeeds in 26 ms)
-verified with --parallel 1. All far under the 2 s gate; the 27B-
-scale shrink (262144->16284, ~6.3 GiB) est. 0.5-1 s and still
-needs a service-stop window. E2E found + fixed 3 OUR-side bugs,
-all in the uncommitted set: (1) the idle hook never fired on a
-purely idle server (server-queue.cpp tick gap), (2) the iswa KV
-wrapper lacked a resize override (silent base false on every SWA
-model), (3) 1/s retry spam after a blocked idle shrink (now one
-attempt per idle period, retry after a new task). Retained-KV
-shrink policy fork A/B/C is OPEN (F35); C (never discard retained
-KV) is the shipped interim. The old --fit-ctx/-fitc,
---fit-ctx-max/-fitm, --grow-ctx-max flags are HARD DELETED: the
-live spawn line must be swapped at the next install or the server
-will not start. Carried: tensor-fit SHIPPED (1011b639d, F32); KV
-wall two stages (F31, 6a30f9157 + db5cf4d80); SYCL build fixed
-(F30); B12 DONE (7cb134632); F28 CLOSED 10-27 (live service runs
-from the INSTALL dir, not the CLONE tree); B14 PARKED; B16 PARKED.
-NEXT: install-dir binary swap + live spawn-line handover
-(--fit-ctx/--fit-ctx-max -> --adaptive-ctx full /
---adaptive-ctx-max 262144 / --adaptive-ctx-idle 30; the old flags
-are gone, the server will not start on the old line) -> B70/SYCL
-reference comparison (the 4 user URLs) -> live bad-allocation
-analysis (deferred by user).
-DONE 10-27 (late): single commit 9c8772ed8 pushed to the private
-origin (stages 1-3 + actx + the 3 bug fixes + test + llama.h note +
-READMEs + private/; the user's index.svelte.ts left uncommitted).
-Await the user's extraArgs bisection outcome + a free card for the
-Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13
-recon.
+Last refresh: 2026-10-27 (evening) - B15 COMPLETE, 3 commits
+pushed: 9c8772ed8 (adaptive-ctx core + 3 E2E-found bug fixes),
+5b8aa1fad (llama : regrow KV-row copy on device via
+ggml_backend_tensor_copy between row-limited views, replaces the
+host-buffer round trip up to ~6 GiB), 2822ce088 (server : skip the
+idle KV shrink while retained slot KV does not fit the base floor). E2E on the FINAL binaries (gemma-4-E4B, port 18200): GROW content-
+verified (ZQX-7741 survived 8192->32768 at 15054 tokens; 24054-
+token prompt clean post-grow), FIRST EVER SUCCESSFUL IN-PLACE
+SHRINK 16384->8192 in 68 ms, retained KV intact across the shrink
+(BLT-2489), over-cap clean 400 EXCEED_CONTEXT_SIZE, server still
+serving. Wide rebuild via build-sycl.ps1 green (247 steps, ~3
+min, build\bin @ 2822ce088, reconfigure auto-picked the new HEAD).
+Retained-KV shrink policy: C (never discard retained KV) shipped,
+refined by the pre-check so a blocked shrink never reaches the
+cell resize (F35). The 27B-scale shrink (262144->16284, ~6.3 GiB)
+est. 0.5-1 s - its timing needs the B17 service-stop window. The
+old --fit-ctx/-fitc, --fit-ctx-max/-fitm, --grow-ctx-max flags are
+HARD DELETED: the live spawn line must be swapped at the next
+install or the server will not start. NEW 10-27 (evening): F36
+(B70 single-GPU references vs the live dual-card setup - the
+41-46 t/s single-card decode floor), F37 (tensor-mode "bad
+allocation" = host-side std::bad_alloc; proven host site = the 8
+GiB default prompt cache; user reverted to -sm layer; --cache-ram
+0 proposed), F38 (two-chat TG halving is structural: per-layer
+blocking P2P waits + no slot pipelining -> B14 priority RAISED).
+Carried: tensor-fit SHIPPED (1011b639d, F32); KV wall two stages
+(F31); SYCL build fixed (F30); B12 DONE (7cb134632); F28 CLOSED
+10-27; B14 PARKED (priority raised); B16 PARKED.
+NEXT: B17 handover (install-dir swap + spawn line, incl. the
+proposed --cache-ram 0 - user call) in a user stop window ->
+measure the 27B-scale on-device copy timing in that window ->
+B14 draft re-presentation -> B7a -> B13 recon. Await the user's
+extraArgs bisection outcome + a free card for the Q5_K_S tensor
+bench (N17).
 
 ## Environment
 
@@ -53,9 +51,10 @@ recon.
   oneAPI lib prepended to LIB).
 - Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-26 16:38
   install, PRE-ACTX - B15 binaries not in it). The LIVE CHILD RUNS
-  FROM HERE (10-27 spawn line, macube log :14435). Swap = copy
-  build\bin over this dir (service stop window: running exe/DLLs
-  are locked) + swap the macube spawn line (hands-off, see NEXT).
+  FROM HERE (spawn line re-derived 10-27 evening, see Services).
+  Swap = copy build\bin over this dir (service stop window:
+  running exe/DLLs are locked) + swap the macube spawn line
+  (hands-off) = B17.
   F30 note stands: the dlopen path is dead in this fork; SYCL works
   only via the static link in a SYCL=ON build.
 - Workspace: working dir `C:\Users\admin\source\ai\llama.3nary`,
@@ -67,28 +66,33 @@ recon.
 ## Services (macube)
 
 - LIVE (do not disturb, user-owned): model Qwen3.8-27B-UD-Q6_K,
-  child spawns the INSTALL-dir exe (C:\Users\admin\.local\3nary-
-  sycl\llama-server.exe) at 127.0.0.1:56762. Spawn line
-  re-derived from macube/logs/llama-error.log (:14435):
-  --ctx-size 163840 --fit on --fit-ctx 16284 --fit-ctx-max 262144
-  --cache-type-k q5_1 --cache-type-v q5_1 --flash-attn on
-  --split-mode tensor --batch-size 6144 --threads 56
-  --threads-batch 28 --ubatch-size 6144 --n-gpu-layers all +
-  mmproj BF16 (swap at install: see NEXT). Re-derived 10-27
-  (day): router PID 15516 on 0.0.0.0:8080, child PID 19760
-  (created 10-27 9:11 AM); the child restarted 5x in ~4 h
-  (54418 -> 14088, -> 23940, -> 17416, -> 17680, -> 19760) -
-  service UNSTABLE, relevant to the bad-allocation analysis
-  (child 54418 -> 14088: decode() failed: bad allocation, task
-  88753 slot 3, n_tokens 90102). F28's "CLONE tree" claim is
-  STALE: the compile-time path in the 10-23 error line did not
-  match the spawn exe. The user is still bisecting the extraArgs
-  tail (-ngl 99, -np 2, -c 262144); outcome pending (prediction
-  table in F31). Re-derive PIDs: `Get-NetTCPConnection
-  -LocalPort 8080 -State Listen` then the child via
-  ParentProcessId (process details access-denied for non-service
-  ports).
-- History: 15516/19760 (10-27 9:11 AM router/child, CURRENT),
+  child PID 22456 on 127.0.0.1:52439 (WS 13.36 GB), router PID
+  15516 on 0.0.0.0:8080. The child spawns the INSTALL-dir exe
+  (C:\Users\admin\.local\3nary-sycl\llama-server.exe). Spawn line
+  re-derived 10-27 (evening) from macube/logs/llama-error.log
+  (:14671): --ctx-size 163840 --fit on --fit-ctx 16284
+  --fit-ctx-max 262144 --cache-type-k q5_1 --cache-type-v q5_1
+  --flash-attn on --split-mode layer --batch-size 6144 --threads
+  56 --threads-batch 28 --ubatch-size 6144 --n-gpu-layers all
+  --numa distribute --jinja --rope-scaling yarn --load-mode none
+  --reasoning-budget 4000 --reasoning-preserve
+  --image-min/max-tokens 1024/4000 + api-key-file + mmproj BF16.
+  NOTE 10-27 (evening): the user REVERTED this child to
+  --split-mode layer after the tensor-mode bad-allocation episodes
+  (F37; the day's tensor child was 19760 @ 56762, which had
+  restarted 5x in ~4 h: 54418 -> 14088, -> 23940, -> 17416, ->
+  17680, -> 19760). The old --fit-ctx flags work here only because
+  the install dir is still PRE-ACTX; at the B17 swap the line must
+  move to --adaptive-ctx (the old flags are gone from the new
+  binary). F28's "CLONE tree" claim is STALE (install dir, not
+  clone). The user is still bisecting the extraArgs tail (-ngl 99,
+  -np 2, -c 262144); outcome pending (prediction table in F31).
+  Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080 -State
+  Listen` then the child via ParentProcessId (process details
+  access-denied for non-service ports).
+- History: 15516/22456 (10-27 evening router/child, CURRENT -
+  layer mode after the user's tensor revert), 15516/19760 (10-27
+  9:11 AM router/child, tensor, replaced by the user's revert),
   14096/17416 (10-27 3:37 AM, replaced), 17680 (10-27 child,
   replaced), 13988/23940 (10-27 00:05 child, replaced),
   54418->14088 (10-27
@@ -220,12 +224,13 @@ recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `1011b639d` (fit : tensor-mode context
-  fitting via real context-creation measurement). Before it:
-  `16a21e2ce` (docs : N17), `715ffcbb0` (docs : private library
-  refresh), `db5cf4d80` (fit : -fitm), `6a30f9157` (server : KV wall
-  no-crash), `f66f6cd62` (docs : F29), `bcd84baff` (docs),
-  `7cb134632` (B12). Full list: NOTES.md N12.
+- branch `main`, pushed HEAD: `2822ce088` (server : skip the idle
+  KV shrink while retained slot KV does not fit). Before it:
+  `5b8aa1fad` (llama : copy KV rows on device in the in-place
+  cache regrow), `e141ac25b` (docs : private sync after B15 ship),
+  `9c8772ed8` (llama : adaptive ctx, in-place runtime resize),
+  `1011b639d` (fit : tensor-mode context fitting). Full list:
+  NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
@@ -233,6 +238,13 @@ recon.
 
 ## Binaries
 
+- `build\bin`: 10-27 (evening) WIDE REBUILD via build-sycl.ps1 at
+  HEAD 2822ce088 - the reconfigure auto-picked the new HEAD (cmake/
+  build-info.cmake git rev-parse), 247 ninja steps, ~3 min, all
+  targets relinked incl. llama-server.exe; build\bin in sync with
+  the committed tree. This is the B17 swap source. The install dir
+  (C:\Users\admin\.local\3nary-sycl\) is still PRE-ACTX - the swap
+  is B17 (needs the user stop window).
 - `build\bin`: 10-25 SYCL=ON rebuild (F30): ggml-sycl.dll 62.8 MB
   (~03:05), ggml.dll (~03:11), exes (~03:12) - the one-time ggml-sycl
   TU compile + 297 downstream steps. Supersedes the 10-23 B12 build.
@@ -298,41 +310,33 @@ srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
 
-## Next (10-26 morning)
+## Next (10-27 evening)
 
-1. [DONE] KV wall stage 1 (no-crash at the wall): committed+pushed
-   6a30f9157.
-2. [DONE] KV wall stage 2 (fit-time auto-size -fitm): committed+pushed
-   db5cf4d80; grow verified on-device (3 scenarios, F31).
-3. [DONE] SYCL=OFF = CPU-only runtime: root-caused + fixed (F30);
-   build-3nary.bat permanently SYCL=ON.
-4. [DONE] Tensor-mode ctx fit: committed+pushed 1011b639d (F32);
-   5-case verify matrix on 27B PTQ1_0 all as expected.
-5. [DONE 10-25] Present to the user: (a) the tensor-fit verification
-   report (delivered); (b) the F33 growth design - user AGREED the
-   final design 10-25 (in-place regrow, not the per-slot recreate
-   draft); implementation authorized.
-6. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
+1. B17 handover (TOP, needs the user stop window): stop the
+   service -> copy build\bin over C:\Users\admin\.local\3nary-sycl\
+   -> swap the macube spawn line (delete --fit-ctx/--fit-ctx-max;
+   add --adaptive-ctx full --adaptive-ctx-min 16284
+   --adaptive-ctx-max 262144 --adaptive-ctx-idle 30; PROPOSED
+   --cache-ram 0, user call) -> start.
+2. In that window: measure the 27B-scale on-device copy timing
+   (262144->16284 load-shrink, ~6.3 GiB, est. 0.5-1 s) + verify
+   the adaptive-ctx lines in the child log.
+3. B14 draft re-presentation (priority RAISED by F37/F38 - the
+   structural fix for BOTH reported issues); implement only on
+   explicit user confirmation.
+4. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
    -c 262144; prediction table in F31) - fold into FINDINGS when
    reported.
-7. [B] Await a free card (re-derive VRAM first; service PID 13688 +
-   22072) -> run the Q5_K_S tensor bench (N17; GDN correctness
-   check first).
-8. B15 (stages 1+2 DONE 10-26, F34): stages 1-2 built green; unit
-   tests 100% + mutation-verified; thread safety verified in-
-   process. AWAIT USER INSTALL -> stage 3 verify matrix on 27B
-   PTQ1_0 -> commit + push. B14 remains PARKED behind this.
-9. B7a (this fork, next code item): startup loud-fail on unfittable
-   ctx/KV + closed -sm/-dev gate. NOTE: the old target
-   (fit.cpp:182-183 tensor warn-then-continue) is GONE - the tensor
-   fit branch exists now (F32); remaining target is the non-tensor
-   startup ctx/KV loud-fail + the parse gate.
-10. B13 recon (read-only, clone hosts live service): diff fork vs
-    clone meta backend (upstream PRs #26490/#27574), ternary enum
-    mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
-    divergent work map (F25), whether 3nary lacks the clone's seq_rm
-    fix (server-context.cpp ~:3444, relevant to F28). THEN port
-    commit-by-commit on user-confirmed scope.
-11. F28 (open, read-only): live-service state-save bad allocation at
-    88K tok (clone build); does 3nary have the equivalent fix?
-12. Refresh private/ + commit+push at each milestone.
+5. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
+   tensor bench (N17; GDN correctness check first).
+6. B7a (this fork, next code item): startup loud-fail on unfittable
+   ctx/KV + closed -sm/-dev gate (the old tensor warn-then-continue
+   target is GONE - F32; remaining: the non-tensor startup ctx/KV
+   loud-fail + the parse gate).
+7. B13 recon (read-only, clone hosts live service): diff fork vs
+   clone meta backend (upstream PRs #26490/#27574), ternary enum
+   mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
+   divergent work map (F25), the seq_rm fix question (server-
+   context.cpp ~:3444, relevant to F28). THEN port commit-by-
+   commit on user-confirmed scope.
+8. Refresh private/ + commit+push at each milestone.
