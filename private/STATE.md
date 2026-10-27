@@ -22,14 +22,17 @@ KV) is the shipped interim. The old --fit-ctx/-fitc,
 live spawn line must be swapped at the next install or the server
 will not start. Carried: tensor-fit SHIPPED (1011b639d, F32); KV
 wall two stages (F31, 6a30f9157 + db5cf4d80); SYCL build fixed
-(F30); B12 DONE (7cb134632); F28 OPEN (live service runs from the
-CLONE tree); B14 PARKED; B16 PARKED.
-NEXT: single commit + push (stages 1-3 + actx + the 3 bug fixes +
-test + llama.h note + READMEs; private/ via push-only-private/)
--> install-dir binary swap + live spawn-line handover (--fit-ctx/
---fit-ctx-max -> --adaptive-ctx full / --adaptive-ctx-max 262144 /
---adaptive-ctx-idle 30) -> B70/SYCL reference comparison (the 4
-user URLs) -> live bad-allocation analysis (deferred by user).
+(F30); B12 DONE (7cb134632); F28 CLOSED 10-27 (live service runs
+from the INSTALL dir, not the CLONE tree); B14 PARKED; B16 PARKED.
+NEXT: install-dir binary swap + live spawn-line handover
+(--fit-ctx/--fit-ctx-max -> --adaptive-ctx full /
+--adaptive-ctx-max 262144 / --adaptive-ctx-idle 30; the old flags
+are gone, the server will not start on the old line) -> B70/SYCL
+reference comparison (the 4 user URLs) -> live bad-allocation
+analysis (deferred by user).
+DONE 10-27 (late): single commit 9c8772ed8 pushed to the private
+origin (stages 1-3 + actx + the 3 bug fixes + test + llama.h note +
+READMEs + private/; the user's index.svelte.ts left uncommitted).
 Await the user's extraArgs bisection outcome + a free card for the
 Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13
 recon.
@@ -41,15 +44,20 @@ recon.
   64 GB RAM. GGML_SYCL_DEVICE is a NO-OP in this fork (F9). Pin:
   `-dev SYCL0` or `--split-mode none -mg 0`. Tensor mode INTENTIONALLY
   uses both (`-dev SYCL0,SYCL1`, F19/N14).
-- Build tree: `build/` (Ninja, Release, shared libs, tests ON). Build
-  recipe: NOTES.md N3 (oneAPI + vcvars64 Professional + oneAPI lib
-  prepended to LIB).
-- Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-21 install).
-  10-25 (F30): its ggml-sycl.dll lacks ggml_backend_init like the
-  build tree's - the dlopen path is dead in this fork; SYCL works only
-  via the static link in a SYCL=ON build. Re-check the whole tree
-  before any redeploy advice; the live service runs from the CLONE
-  tree since 10-23 (F28), not from here.
+- Build tree: `build/` (Ninja, Release, shared libs, tests OFF
+  since the 10-27 script run). Configure ONLY via build-sycl.ps1:
+  it pins C:\Program Files\CMake\bin\cmake.exe (4.4.4); mixing in
+  the VS-bundled CMake 3.31.6 regenerates the build rules and
+  forces a full rebuild (10-27 root cause of the repeated full
+  builds). Recipe: NOTES.md N3 (oneAPI + vcvars64 Professional +
+  oneAPI lib prepended to LIB).
+- Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-26 16:38
+  install, PRE-ACTX - B15 binaries not in it). The LIVE CHILD RUNS
+  FROM HERE (10-27 spawn line, macube log :14435). Swap = copy
+  build\bin over this dir (service stop window: running exe/DLLs
+  are locked) + swap the macube spawn line (hands-off, see NEXT).
+  F30 note stands: the dlopen path is dead in this fork; SYCL works
+  only via the static link in a SYCL=ON build.
 - Workspace: working dir `C:\Users\admin\source\ai\llama.3nary`,
   workspace root `C:\Users\gorom\source\ai\llama.3nary` (SAME tree, one
   build, shared build\bin).
@@ -58,27 +66,32 @@ recon.
 
 ## Services (macube)
 
-- LIVE (do not disturb, user-owned): still from the CLONE tree
-  `C:\Users\admin\source\ai\llama.cpp` (F28), model Qwen3.8-27B-
-  UD-Q6_K, child port 55996. Spawn line re-derived from
-  macube/logs/llama-error.log: --ctx-size 163840 --fit on
-  --fit-ctx 16284 --fit-ctx-max 262144 --cache-type-k q5_1
-  --cache-type-v q5_1 --flash-attn on --split-mode tensor
-  --batch-size 6144 --threads 56 --threads-batch 28 --ubatch-size
-  6144 --n-gpu-layers all + mmproj BF16 (swap at install: see NEXT).
-  Re-derived 10-27 (early morning): router PID 14096 on 0.0.0.0:
-  8080, child PID 17416 (created 10-27 3:37 AM); the child
-  restarted 3x in ~3.5 h (54418 -> 14088, -> 23940 at 00:05, ->
-  17416 at 3:37) - service UNSTABLE, relevant to the bad-
-  allocation analysis (child 54418 -> 14088: decode() failed: bad
-  allocation, task 88753 slot 3, n_tokens 90102). Health ok at
-  refresh. The user is still bisecting the extraArgs tail (-ngl
-  99, -np 2, -c 262144); outcome pending (prediction table in
-  F31). Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080
-  -State Listen` then the child via ParentProcessId (process
-  details access-denied for non-service ports).
-- History: 14096/17416 (10-27 3:37 AM router/child, CURRENT),
-  13988/23940 (10-27 00:05 child, replaced), 54418->14088 (10-27
+- LIVE (do not disturb, user-owned): model Qwen3.8-27B-UD-Q6_K,
+  child spawns the INSTALL-dir exe (C:\Users\admin\.local\3nary-
+  sycl\llama-server.exe) at 127.0.0.1:56762. Spawn line
+  re-derived from macube/logs/llama-error.log (:14435):
+  --ctx-size 163840 --fit on --fit-ctx 16284 --fit-ctx-max 262144
+  --cache-type-k q5_1 --cache-type-v q5_1 --flash-attn on
+  --split-mode tensor --batch-size 6144 --threads 56
+  --threads-batch 28 --ubatch-size 6144 --n-gpu-layers all +
+  mmproj BF16 (swap at install: see NEXT). Re-derived 10-27
+  (day): router PID 15516 on 0.0.0.0:8080, child PID 19760
+  (created 10-27 9:11 AM); the child restarted 5x in ~4 h
+  (54418 -> 14088, -> 23940, -> 17416, -> 17680, -> 19760) -
+  service UNSTABLE, relevant to the bad-allocation analysis
+  (child 54418 -> 14088: decode() failed: bad allocation, task
+  88753 slot 3, n_tokens 90102). F28's "CLONE tree" claim is
+  STALE: the compile-time path in the 10-23 error line did not
+  match the spawn exe. The user is still bisecting the extraArgs
+  tail (-ngl 99, -np 2, -c 262144); outcome pending (prediction
+  table in F31). Re-derive PIDs: `Get-NetTCPConnection
+  -LocalPort 8080 -State Listen` then the child via
+  ParentProcessId (process details access-denied for non-service
+  ports).
+- History: 15516/19760 (10-27 9:11 AM router/child, CURRENT),
+  14096/17416 (10-27 3:37 AM, replaced), 17680 (10-27 child,
+  replaced), 13988/23940 (10-27 00:05 child, replaced),
+  54418->14088 (10-27
   child pair, bad-allocation episode, replaced), 13688/22072 (10-26
   1:10 PM service, replaced), 50630 (10-23 child) + 59148 (10-23
   router) + 62743 (dead

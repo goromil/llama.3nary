@@ -340,9 +340,10 @@ Each item: what / why / how / exit criteria / status.
   gap, iswa resize gap, 1/s retry spam) - all in the uncommitted
   set. 27B-scale timings (262144->16284, ~6.3 GiB, est. 0.5-1 s)
   still need a service-stop window. Open: retained-KV shrink policy
-  fork A/B/C (F35; C = shipped interim). Next: single commit +
-  push -> install-dir swap + live spawn-line handover (--fit-ctx/
-  --fit-ctx-max -> --adaptive-ctx full / --adaptive-ctx-max 262144 /
+  fork A/B/C (F35; C = shipped interim). DONE 10-27 (late): single
+  commit 9c8772ed8 pushed to the private origin. Next: install-dir
+  swap + live spawn-line handover (--fit-ctx/--fit-ctx-max ->
+  --adaptive-ctx full / --adaptive-ctx-max 262144 /
   --adaptive-ctx-idle 30) -> B70 reference comparison -> bad-
   allocation analysis. B14 remains PARKED behind this path.
 

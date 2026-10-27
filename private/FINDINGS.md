@@ -756,6 +756,14 @@ greedy isolation dropped.
 
 ## F28. Live service (CLONE build) state restore failure, 88K tok (OPEN)
 
+[correction 10-27] The "CLONE build" part is STALE: the live
+child now spawns the INSTALL-dir exe (C:\Users\admin\.local\
+3nary-sycl\llama-server.exe, port 56762, spawn log :14435) - the
+compile-time path in the 10-23 error line did not match the spawn
+exe. Still open: whether the bad-allocation state-save failure
+mode exists in the 3nary build (fold into the deferred bad-
+allocation analysis).
+
 [observed] 10-23, user pasted live-service log: the macube service is now
 deployed from the CLONE tree `C:\Users\admin\source\ai\llama.cpp`
 (compile-time path in the error line; old child PID 62743, new child
