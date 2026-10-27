@@ -1717,6 +1717,24 @@ private:
             return false;
         }
 
+        // a released slot keeps its KV for prefix reuse; the resize below refuses to
+        // drop used cells, so skip the shrink while the retained cells do not fit
+        size_t n_used = 0;
+        for (const auto & slot : slots) {
+            n_used += (size_t) slot.prompt.n_tokens();
+
+            if (!unified && slot.prompt.n_tokens() > n_slot_floor) {
+                SRV_TRC("adaptive ctx: skipping the shrink, slot %d retains %d tokens (floor = %d)\n",
+                        slot.id, slot.prompt.n_tokens(), n_slot_floor);
+                return false;
+            }
+        }
+
+        if (unified && n_used > (size_t) n_slot_floor) {
+            SRV_TRC("adaptive ctx: skipping the shrink, retained cells = %zu (floor = %d)\n", n_used, n_slot_floor);
+            return false;
+        }
+
         const int n_ctx_cur = llama_n_ctx(ctx_tgt);
         const int n_ctx_tgt = unified ? n_slot_floor : n_slot_floor * n_seq_max;
 
