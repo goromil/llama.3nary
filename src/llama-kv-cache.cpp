@@ -520,32 +520,57 @@ bool llama_kv_cache::regrow_layer(size_t i, uint32_t new_size) {
 
     ggml_backend_buffer_clear(buf.get(), 0);
 
-    // copy the existing rows, stream by stream; the stream views are registered in the backend buffers
-    // so get/set on them resolves the data of the (possibly split) k/v tensors
+    // copy the existing rows, stream by stream, via the backend tensor copy;
+    // the smaller side is limited to n_copy rows via views
     if (!hparams.no_alloc && n_copy > 0) {
-        auto copy_streams = [&](const std::vector<ggml_tensor *> & src, std::vector<ggml_tensor *> & dst) -> bool {
-            for (uint32_t s = 0; s < n_stream; ++s) {
-                const size_t row_bytes = src[s]->nb[1];
-                const size_t n_bytes   = size_t(n_copy) * row_bytes;
+        const bool grow = new_size > old_size;
 
-                void * host = std::malloc(n_bytes);
-                if (!host) {
-                    LLAMA_LOG_ERROR("%s: failed to allocate %zu bytes for the KV row copy of layer %d\n",
-                            __func__, n_bytes, (int) layer.il);
-                    return false;
-                }
+        // no-alloc ctx for the copy views; the layer ctx above has no spare slots
+        ggml_context_ptr cctx;
+        {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*n_stream*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
 
-                ggml_backend_tensor_get(src[s], host, 0, n_bytes);
-                ggml_backend_tensor_set(dst[s], host, 0, n_bytes);
-
-                std::free(host);
+            cctx.reset(ggml_init(params));
+            if (!cctx) {
+                return false;
             }
+        }
 
+        // t is already the s-th stream view, so its first n_copy rows start at offset 0
+        auto make_view = [&](ggml_tensor * t) -> ggml_tensor * {
+            ggml_tensor * r = ggml_view_2d(cctx.get(), t, t->ne[0], n_copy, t->nb[1], 0);
+            if (ggml_backend_view_init(r) != GGML_STATUS_SUCCESS) {
+                return nullptr;
+            }
+            return r;
+        };
+
+        auto copy_stream = [&](ggml_tensor * old_t, ggml_tensor * new_t) -> bool {
+            ggml_tensor * src;
+            ggml_tensor * dst;
+            if (grow) {
+                src = old_t;
+                dst = make_view(new_t);
+            } else {
+                src = make_view(old_t);
+                dst = new_t;
+            }
+            if (!dst || !src) {
+                LLAMA_LOG_ERROR("%s: failed to init the copy views for layer %d\n", __func__, (int) layer.il);
+                return false;
+            }
+            ggml_backend_tensor_copy(src, dst);
             return true;
         };
 
-        if (!copy_streams(layer.k_stream, k_stream) || (has_v && !copy_streams(layer.v_stream, v_stream))) {
-            return false;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            if (!copy_stream(layer.k_stream[s], k_stream[s]) || (has_v && !copy_stream(layer.v_stream[s], v_stream[s]))) {
+                return false;
+            }
         }
     }
 
