@@ -438,6 +438,13 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// how the context adapts to free device memory and load
+enum common_adaptive_ctx_mode {
+    COMMON_ADAPTIVE_CTX_NONE = 0, // no adaptation, the context size is set by -c
+    COMMON_ADAPTIVE_CTX_HALF = 1, // at load: the fit settles the context size into the min/max bounds
+    COMMON_ADAPTIVE_CTX_FULL = 2, // at load: like half, at runtime: grow the KV cache in place on demand and shrink it in place on idle
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -468,8 +475,11 @@ struct common_params {
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
-    int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
-    int32_t fit_params_max_ctx =    0;  // grow the context up to this total size when fitting, 0 = do not grow
+    int32_t adaptive_ctx       = COMMON_ADAPTIVE_CTX_NONE; // how the context adapts to memory and load, see common_adaptive_ctx_mode
+    int32_t adaptive_ctx_idle  = 30;   // idle seconds before shrinking the KV cache in place (full mode), 0 = grow-only
+    int32_t fit_params_min_ctx =   -1;  // minimum total ctx size the fit may shrink to, set by --adaptive-ctx-min, -1 = auto
+    int32_t fit_params_max_ctx =    0;  // maximum total ctx size the fit may grow to, set by --adaptive-ctx-max, 0 = do not grow
+    uint32_t fit_ctx_base      = 0;    // total ctx size the fit settled before growing, 0 = the fit did not grow the context
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

@@ -790,6 +790,14 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+static const char * adaptive_ctx_mode_str(int32_t mode) {
+    switch (mode) {
+        case COMMON_ADAPTIVE_CTX_HALF: return "half";
+        case COMMON_ADAPTIVE_CTX_FULL: return "full";
+        default:                       return "none";
+    }
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -855,7 +863,12 @@ private:
 
     bool add_bos_token = true;
 
-    int32_t n_ctx; // total context for all clients / slots
+    int32_t n_ctx;      // total context for all clients / slots
+    int32_t n_ctx_base; // total ctx the fit settled before growing, the floor of the idle shrink
+    int32_t n_ctx_max;  // total ctx the adaptive grow may reach, 0 = disabled
+
+    int64_t t_idle_start_ms = 0;  // when all slots became idle, 0 = not idle
+    bool    actx_shrink_blocked = false; // last idle shrink attempt failed, retry only after a new task
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1072,6 +1085,18 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        // the floor of the idle shrink: an explicit min wins, otherwise the size the fit settled before growing
+        n_ctx_base = params_base.fit_params_min_ctx > 0 ? params_base.fit_params_min_ctx
+                : params_base.fit_ctx_base != 0       ? params_base.fit_ctx_base : n_ctx;
+        n_ctx_max  = params_base.adaptive_ctx == COMMON_ADAPTIVE_CTX_FULL
+                     ? (params_base.fit_params_max_ctx > 0 ? params_base.fit_params_max_ctx : n_ctx)
+                     : 0;
+
+        if (params_base.adaptive_ctx != COMMON_ADAPTIVE_CTX_NONE) {
+            SRV_INF("adaptive ctx: mode=%s base=%d max=%d idle=%ds\n",
+                    adaptive_ctx_mode_str(params_base.adaptive_ctx), n_ctx_base, n_ctx_max, params_base.adaptive_ctx_idle);
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1608,6 +1633,122 @@ private:
         }
 
         return res;
+    }
+
+    // grow the KV cache in place, keeping the existing data (see n_ctx_max, 0 = disabled)
+    // n_min is the minimum per-slot ctx the current request needs, 0 = grow one step
+    // return true if the context was grown
+    bool try_grow_ctx(int n_min) {
+        if (n_ctx_max <= 0) {
+            return false;
+        }
+
+        const bool unified = params_base.kv_unified;
+        const int   n_seq_max = llama_n_seq_max(ctx_tgt);
+
+        // the slot capacity is capped by the model training context, if known
+        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const int n_train     = n_ctx_train > 0 ? n_ctx_train : INT_MAX;
+
+        const int n_slot_cur = std::min((int) llama_n_ctx_seq(ctx_tgt), n_train);
+        const int n_slot_cap = std::min(n_ctx_max / (unified ? 1 : n_seq_max), n_train);
+        if (n_slot_cap <= n_slot_cur) {
+            return false;
+        }
+
+        // grow one step, or enough to fit the request, up to the cap
+        int n_slot_tgt = n_slot_cur + std::max(4096, n_slot_cur / 4);
+        n_slot_tgt = std::min(std::max(n_slot_tgt, n_min), n_slot_cap);
+        if (n_slot_tgt <= n_slot_cur) {
+            return false;
+        }
+
+        const int n_ctx_cur = llama_n_ctx(ctx_tgt);
+        const int n_ctx_tgt = unified ? n_slot_tgt : n_slot_tgt * n_seq_max;
+
+        SRV_INF("adaptive ctx: growing the KV cache in place from %d to %d tokens\n", n_ctx_cur, n_ctx_tgt);
+
+        const int64_t t_grow = ggml_time_ms();
+
+        if (!llama_context_resize(ctx_tgt, (uint32_t) n_ctx_tgt)) {
+            return false;
+        }
+
+        if (ctx_dft && !llama_context_resize(ctx_dft, (uint32_t) n_ctx_tgt)) {
+            // roll back the target context to keep the two in sync
+            llama_context_resize(ctx_tgt, (uint32_t) n_ctx_cur);
+            return false;
+        }
+
+        SRV_INF("adaptive ctx: KV cache grown in place in %lld ms\n", (long long) (ggml_time_ms() - t_grow));
+
+        // the slot capacity follows the context
+        n_ctx = llama_n_ctx(ctx_tgt);
+        const int n_ctx_slot = std::min((int) llama_n_ctx_seq(ctx_tgt), n_train);
+        for (auto & slot : slots) {
+            slot.n_ctx = n_ctx_slot;
+        }
+
+        if (prompt_cache) {
+            prompt_cache->limit_tokens = (size_t) n_ctx;
+        }
+
+        return true;
+    }
+
+    // shrink the KV cache in place after a sustained idle, down to the load-time base (see n_ctx_base)
+    // may only be called when all slots are idle, the resize itself still refuses to drop used cells
+    // return true if the context was shrunk
+    bool try_shrink_ctx_idle(int64_t idle_ms) {
+        if (n_ctx_base <= 0 || n_ctx_max <= 0) {
+            return false;
+        }
+
+        const bool unified = params_base.kv_unified;
+        const int   n_seq_max = llama_n_seq_max(ctx_tgt);
+
+        // the slot capacity is capped by the model training context, if known
+        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const int n_train     = n_ctx_train > 0 ? n_ctx_train : INT_MAX;
+
+        const int n_slot_cur   = std::min((int) llama_n_ctx_seq(ctx_tgt), n_train);
+        const int n_slot_floor = std::min(n_ctx_base / (unified ? 1 : n_seq_max), n_train);
+        if (n_slot_floor >= n_slot_cur) {
+            return false;
+        }
+
+        const int n_ctx_cur = llama_n_ctx(ctx_tgt);
+        const int n_ctx_tgt = unified ? n_slot_floor : n_slot_floor * n_seq_max;
+
+        SRV_INF("adaptive ctx: shrinking the KV cache in place from %d to %d tokens (idle for %llds)\n",
+                n_ctx_cur, n_ctx_tgt, (long long) (idle_ms / 1000));
+
+        const int64_t t_shrink = ggml_time_ms();
+
+        if (!llama_context_resize(ctx_tgt, (uint32_t) n_ctx_tgt)) {
+            return false;
+        }
+
+        if (ctx_dft && !llama_context_resize(ctx_dft, (uint32_t) n_ctx_tgt)) {
+            // roll back the target context to keep the two in sync
+            llama_context_resize(ctx_tgt, (uint32_t) n_ctx_cur);
+            return false;
+        }
+
+        SRV_INF("adaptive ctx: KV cache shrunk in place in %lld ms\n", (long long) (ggml_time_ms() - t_shrink));
+
+        // the slot capacity follows the context
+        n_ctx = llama_n_ctx(ctx_tgt);
+        const int n_ctx_slot = std::min((int) llama_n_ctx_seq(ctx_tgt), n_train);
+        for (auto & slot : slots) {
+            slot.n_ctx = n_ctx_slot;
+        }
+
+        if (prompt_cache) {
+            prompt_cache->limit_tokens = (size_t) n_ctx;
+        }
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2716,9 +2857,31 @@ private:
 
                 metrics_flush_idle();
 
+                // adaptive ctx: shrink the KV cache in place after a sustained idle
+                if (n_ctx_max > 0 && params_base.adaptive_ctx_idle > 0) {
+                    const int64_t t_now = ggml_time_ms();
+                    if (t_idle_start_ms == 0) {
+                        t_idle_start_ms = t_now;
+                    }
+                    if (t_now - t_idle_start_ms >= (int64_t) params_base.adaptive_ctx_idle * 1000
+                            && !actx_shrink_blocked) {
+                        // while the server stays idle the cell state cannot change
+                        // (retained slot KV is only freed by a new task), so a failed
+                        // shrink is not retried within the same idle period
+                        const int64_t t_idle = t_now - t_idle_start_ms;
+                        t_idle_start_ms = t_now;
+                        if (!try_shrink_ctx_idle(t_idle)) {
+                            actx_shrink_blocked = true;
+                        }
+                    }
+                }
+
                 return; // skip further processing
 
             } else {
+                t_idle_start_ms = 0;
+                actx_shrink_blocked = false;
+
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
@@ -3095,24 +3258,34 @@ private:
                             }
 
                             if (slot.task->n_tokens() > slot.n_ctx) {
-                                send_error(
-                                    slot,
-                                    string_format(
-                                        "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
-                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
+                                // grow the KV cache in place if enabled, then re-check
+                                try_grow_ctx(slot.task->n_tokens());
+
+                                if (slot.task->n_tokens() > slot.n_ctx) {
+                                    send_error(
+                                        slot,
+                                        string_format(
+                                            "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                                            slot.task->n_tokens(), slot.n_ctx),
+                                        ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                    slot.release();
+                                    return;
+                                }
                             }
                         } else {
                             if (slot.task->n_tokens() >= slot.n_ctx) {
-                                send_error(slot,
-                                           string_format("request (%d tokens) exceeds the available context size (%d "
-                                                         "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                                slot.release();
-                                return;
+                                // grow the KV cache in place if enabled, then re-check
+                                try_grow_ctx(slot.task->n_tokens() + 1);
+
+                                if (slot.task->n_tokens() >= slot.n_ctx) {
+                                    send_error(slot,
+                                               string_format("request (%d tokens) exceeds the available context size (%d "
+                                                             "tokens), try increasing it",
+                                                             slot.task->n_tokens(), slot.n_ctx),
+                                               ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                    slot.release();
+                                    return;
+                                }
                             }
 
                             if (slot.task->params.cache_prompt) {
@@ -3635,6 +3808,11 @@ private:
                 // the half-batch retries are exhausted, a single token still does not fit
                 // note: freeing an idle slot only helps with a unified KV cache, see try_clear_idle_slots()
                 if (try_clear_idle_slots()) {
+                    return DECODE_RETRY;
+                }
+
+                // grow the KV cache in place if enabled, then retry the same token
+                if (try_grow_ctx(0)) {
                     return DECODE_RETRY;
                 }
 

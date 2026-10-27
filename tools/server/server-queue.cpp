@@ -357,7 +357,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // no new tasks: tick the slot update so idle-only work (e.g. the adaptive
+                // ctx shrink) also runs while the queue stays empty
+                lock.unlock();
+                const int64_t t_tick = ggml_time_ms();
+                callback_update_slots();
+                lock.lock();
+                // as above, the tick time is not counted as idle
+                const int64_t now = ggml_time_ms();
+                time_last_task = std::min(now, time_last_task + (now - t_tick));
             }
         }
     }

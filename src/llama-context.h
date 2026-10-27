@@ -76,6 +76,11 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // resize the memory (KV cache) in place, keeping the existing data
+    // n_ctx is the new total context size, see the cparams derivation in the constructor
+    // return false if the memory type does not support resizing or the resize failed
+    bool memory_resize(uint32_t n_ctx);
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();

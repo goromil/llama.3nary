@@ -213,7 +213,7 @@ static bool tensor_measure_ctx(
 
 static void common_params_fit_tensor_impl(
         const char * path_model, llama_model_params * mparams, llama_context_params * cparams,
-        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user,
+        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, uint32_t * n_ctx_base,
         const common_fit_extra_model * extra, ggml_log_level log_level) {
     if (extra != nullptr) {
         throw common_params_fit_exception("an extra (draft/MTP) model is not supported with SPLIT_MODE_TENSOR, abort");
@@ -426,6 +426,9 @@ static void common_params_fit_tensor_impl(
     }
 
     const uint32_t n_ctx_orig = cparams->n_ctx;
+    if (n_ctx_base != nullptr) {
+        *n_ctx_base = n_ctx_orig;
+    }
     const uint64_t n_ctx_new  = n_ctx_from_cap(std::min<uint64_t>(std::min<uint64_t>(n_ctx_fits, n_ctx_max_user), n_ctx_max));
     if (n_ctx_new > n_ctx_orig) {
         cparams->n_ctx = (uint32_t) n_ctx_new;
@@ -436,9 +439,9 @@ static void common_params_fit_tensor_impl(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, uint32_t * n_ctx_base, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        common_params_fit_tensor_impl(path_model, mparams, cparams, margins_s, n_ctx_min, n_ctx_max_user, extra, log_level);
+        common_params_fit_tensor_impl(path_model, mparams, cparams, margins_s, n_ctx_min, n_ctx_max_user, n_ctx_base, extra, log_level);
         return;
     }
     constexpr int64_t MiB = 1024*1024;
@@ -569,6 +572,9 @@ static void common_params_fit_impl(
     // note: runs before the margin check below, so the grown context is what gets checked
     if (n_ctx_max_user > 0 && nd > 0 && cparams->n_ctx > 0) {
         const uint32_t cur = cparams->n_ctx;
+        if (n_ctx_base != nullptr) {
+            *n_ctx_base = cur;
+        }
         const uint32_t cap = std::min(n_ctx_max_user, n_ctx_max);
 
         if (cap > cur) {
@@ -1195,12 +1201,13 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         uint32_t n_ctx_max_user,
+        uint32_t * n_ctx_base,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, n_ctx_max_user, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, n_ctx_max_user, n_ctx_base, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

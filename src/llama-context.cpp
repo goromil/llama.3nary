@@ -952,6 +952,73 @@ bool llama_context::memory_update(bool optimize) {
     return true;
 }
 
+bool llama_context::memory_resize(uint32_t n_ctx) {
+    if (!memory) {
+        return false;
+    }
+
+    if (n_ctx < 256) {
+        LLAMA_LOG_ERROR("%s: n_ctx must be at least 256, got %u\n", __func__, n_ctx);
+        return false;
+    }
+
+    n_ctx = GGML_PAD(n_ctx, 256);
+
+    if (n_ctx == cparams.n_ctx) {
+        return true;
+    }
+
+    // derive n_ctx_seq the same way as the constructor does
+    uint32_t n_ctx_seq;
+    if (cparams.kv_unified) {
+        n_ctx_seq = n_ctx;
+    } else {
+        n_ctx_seq = n_ctx / cparams.n_seq_max;
+        n_ctx_seq = GGML_PAD(n_ctx_seq, 256);
+
+        if (n_ctx_seq == 0) {
+            LLAMA_LOG_ERROR("%s: n_ctx_seq == 0\n", __func__);
+            return false;
+        }
+    }
+
+    if (!memory->resize(n_ctx_seq)) {
+        LLAMA_LOG_ERROR("%s: failed to resize the memory to %u cells\n", __func__, n_ctx_seq);
+        return false;
+    }
+
+    if (!cparams.kv_unified) {
+        n_ctx = n_ctx_seq * cparams.n_seq_max;
+    }
+
+    cparams.n_ctx = n_ctx;
+    cparams.n_ctx_seq = n_ctx_seq;
+
+    // the k/v tensors have new addresses, so the cached graph cannot be reused
+    gf_res_prev->reset();
+
+    // the worst-case graph is sized by the full cache, so reserve it again
+    {
+        const auto mctx = memory->init_full();
+        if (!mctx) {
+            throw std::runtime_error("failed to initialize memory context");
+        }
+
+        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory resize\n", __func__);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: n_ctx = %u, n_ctx_seq = %u\n", __func__, cparams.n_ctx, cparams.n_ctx_seq);
+
+    return true;
+}
+
 enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
@@ -3956,6 +4023,10 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
 
 uint32_t llama_n_ctx_seq(const llama_context * ctx) {
     return ctx->n_ctx_seq();
+}
+
+bool llama_context_resize(struct llama_context * ctx, uint32_t n_ctx) {
+    return ctx->memory_resize(n_ctx);
 }
 
 uint32_t llama_n_batch(const llama_context * ctx) {

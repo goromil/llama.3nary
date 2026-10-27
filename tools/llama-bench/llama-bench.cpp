@@ -2296,6 +2296,7 @@ int llama_bench(int argc, char ** argv) {
                 inst.fit_min_ctx,
                 0, // do not grow the context
                 nullptr,
+                nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
        }
 

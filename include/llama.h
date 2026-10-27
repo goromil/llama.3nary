@@ -577,6 +577,12 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    // resize the KV cache of the context in place, keeping the existing data
+    // n_ctx is the new total context size; it is rounded up to a multiple of 256
+    // not thread-safe: serialize it with the other kv cache operations of the context
+    // return false if the memory type does not support resizing or the resize failed
+    LLAMA_API bool llama_context_resize(struct llama_context * ctx, uint32_t n_ctx);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

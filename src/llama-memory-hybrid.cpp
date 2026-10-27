@@ -144,6 +144,11 @@ void llama_memory_hybrid::clear(bool data) {
     mem_recr->clear(data);
 }
 
+bool llama_memory_hybrid::resize(uint32_t new_size) {
+    // the recurrent cache is sized by n_seq_max, not by n_ctx, so only the attention cache is resized
+    return mem_attn->resize(new_size);
+}
+
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.

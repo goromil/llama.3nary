@@ -1,22 +1,35 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-26 (morning). B15 runtime context growth
-design CONFIRMED by the user 10-25, now IMPLEMENTING (F33 revised,
-B15, B16 new). Final design: in-place tail extension of the shared
-ctx ring via per-layer data-tensor regrow (no shift, no re-
-pointing, no host save, no ctx recreation); per-(layer, buft)
-buffer restructure so the peak is old total + one layer K+V;
-opt-in cap flag mirroring -fitm (0 = off). PIVOT recorded: the old
-per-slot premise was WRONG - ONE shared ctx per server (slots are
-seq_ids), all slots pause briefly during a regrow. VA-page version
-parked as B16. B14 (twin-server + router) PARKED behind the growth
-path. Carried: tensor-fit SHIPPED (1011b639d, F32); KV wall two
-stages (F31, 6a30f9157 + db5cf4d80); SYCL build fixed (F30, recipe
-permanently SYCL=ON); B12 DONE (7cb134632); F28 OPEN (live service
-runs from the CLONE tree); qwen35.cpp 9B MTP fix GONE from the tree
-(reported to user 10-25).
-NEXT: B15 staged implementation (stage 1 core resize API, stage 2
-server flag + triggers, stage 3 build + verify on 27B PTQ1_0).
+Last refresh: 2026-10-27 (B15 stage 3 timed E2E DONE). B15 stages
+1+2 + the user-designed 4-flag adaptive-ctx family DONE (F34,
+F35): core resize + server grow/shrink triggers; ctest 100%; unit
+tests green. Stage 3 timed E2E on gemma-4-E4B COMPLETE 10-27
+(F35): load-shrink 32768->8192 in 19-22 ms, grow 8192->12288 in
+19-25 ms, over-cap clean EXCEED_CONTEXT_SIZE at a 16384 cap with
+the server surviving, and the full cycle (grow -> retained-KV
+blocked shrink -> new task frees KV -> shrink succeeds in 26 ms)
+verified with --parallel 1. All far under the 2 s gate; the 27B-
+scale shrink (262144->16284, ~6.3 GiB) est. 0.5-1 s and still
+needs a service-stop window. E2E found + fixed 3 OUR-side bugs,
+all in the uncommitted set: (1) the idle hook never fired on a
+purely idle server (server-queue.cpp tick gap), (2) the iswa KV
+wrapper lacked a resize override (silent base false on every SWA
+model), (3) 1/s retry spam after a blocked idle shrink (now one
+attempt per idle period, retry after a new task). Retained-KV
+shrink policy fork A/B/C is OPEN (F35); C (never discard retained
+KV) is the shipped interim. The old --fit-ctx/-fitc,
+--fit-ctx-max/-fitm, --grow-ctx-max flags are HARD DELETED: the
+live spawn line must be swapped at the next install or the server
+will not start. Carried: tensor-fit SHIPPED (1011b639d, F32); KV
+wall two stages (F31, 6a30f9157 + db5cf4d80); SYCL build fixed
+(F30); B12 DONE (7cb134632); F28 OPEN (live service runs from the
+CLONE tree); B14 PARKED; B16 PARKED.
+NEXT: single commit + push (stages 1-3 + actx + the 3 bug fixes +
+test + llama.h note + READMEs; private/ via push-only-private/)
+-> install-dir binary swap + live spawn-line handover (--fit-ctx/
+--fit-ctx-max -> --adaptive-ctx full / --adaptive-ctx-max 262144 /
+--adaptive-ctx-idle 30) -> B70/SYCL reference comparison (the 4
+user URLs) -> live bad-allocation analysis (deferred by user).
 Await the user's extraArgs bisection outcome + a free card for the
 Q5_K_S tensor bench (N17). Then B7a (startup loud-fail) and B13
 recon.
@@ -45,19 +58,30 @@ recon.
 
 ## Services (macube)
 
-- LIVE (10-25, do not disturb, user-owned): RESTARTED AGAIN 10-25
-  (after the extraArgs-bisection restart), still from the CLONE tree
-  `C:\Users\admin\source\ai\llama.cpp` (F28). Re-derived 10-25
-  (evening, post the fit-verify runs): llama-server PID 11848 on
-  0.0.0.0:8080 + PID 20004 on 127.0.0.1:60283 (loopback, likely a
-  macube child); 58452 NOT listening. Commit free ~49 GB / phys free
-  ~48 GB. The user is bisecting the extraArgs tail (-ngl 99, -np 2,
-  -c 262144); outcome pending (prediction table in F31). The tensor
-  fit coexisted with this service post-restart (F32 finding 5).
-  Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080,58452,60283
-  -State Listen` (process details access-denied for non-service
-  ports).
-- History: 50630 (10-23 child) + 59148 (10-23 router) + 62743 (dead
+- LIVE (do not disturb, user-owned): still from the CLONE tree
+  `C:\Users\admin\source\ai\llama.cpp` (F28), model Qwen3.8-27B-
+  UD-Q6_K, child port 55996. Spawn line re-derived from
+  macube/logs/llama-error.log: --ctx-size 163840 --fit on
+  --fit-ctx 16284 --fit-ctx-max 262144 --cache-type-k q5_1
+  --cache-type-v q5_1 --flash-attn on --split-mode tensor
+  --batch-size 6144 --threads 56 --threads-batch 28 --ubatch-size
+  6144 --n-gpu-layers all + mmproj BF16 (swap at install: see NEXT).
+  Re-derived 10-27 (early morning): router PID 14096 on 0.0.0.0:
+  8080, child PID 17416 (created 10-27 3:37 AM); the child
+  restarted 3x in ~3.5 h (54418 -> 14088, -> 23940 at 00:05, ->
+  17416 at 3:37) - service UNSTABLE, relevant to the bad-
+  allocation analysis (child 54418 -> 14088: decode() failed: bad
+  allocation, task 88753 slot 3, n_tokens 90102). Health ok at
+  refresh. The user is still bisecting the extraArgs tail (-ngl
+  99, -np 2, -c 262144); outcome pending (prediction table in
+  F31). Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080
+  -State Listen` then the child via ParentProcessId (process
+  details access-denied for non-service ports).
+- History: 14096/17416 (10-27 3:37 AM router/child, CURRENT),
+  13988/23940 (10-27 00:05 child, replaced), 54418->14088 (10-27
+  child pair, bad-allocation episode, replaced), 13688/22072 (10-26
+  1:10 PM service, replaced), 50630 (10-23 child) + 59148 (10-23
+  router) + 62743 (dead
   10-23, F28, replaced by the 10-25 restart), 24252/26876 (10-22
   service, Q5_K_S + MTP, replaced), 52416
   (tg 13.2+ at 73.6K, healthy, then restarted), 54447 (dead, F16),
@@ -78,7 +102,7 @@ recon.
   Verified: 5-case matrix on 27B PTQ1_0 (A/A2/B/C/D, all as expected,
   F32). Findings: KV does not scale with n_seq_max (shared ring),
   hadamard-v2 gate blocks 10/20 exports, flash_attn auto-enabled.
-- B15 (10-25 DESIGN CONFIRMED, 10-26 IMPLEMENTING - F33 revised):
+- B15 (10-25 DESIGN CONFIRMED, 10-26 stages 1+2 DONE - F33/F34):
   runtime context growth = in-place tail extension of the shared
   ctx ring via per-layer regrow (the old per-slot recreate
   design was based on a WRONG premise: there is ONE shared ctx per
@@ -94,13 +118,28 @@ recon.
   n_ctx-independent (rs_size = n_seq_max) - no grow; MTP draft ctx
   grown too (standalone plain KV, same size); prompt cache stays
   valid (host buffers, position-keyed) - no invalidation. Stage 2
-  (server): opt-in cap flag mirroring -fitm (0 = off); triggers at
-  task start (:3097/:3108 grow-before-reject) + decode wall
-  (:3637 grow-then-DECODE_RETRY); step-based target capped at the
-  flag; grow ctx_dft too, rollback both on draft failure; update
-  n_ctx_slot + all slot.n_ctx. Stage 3: build + verify matrix on
-  27B PTQ1_0. No B15 code written yet at refresh time. See
-  BACKLOG B15 + FINDINGS F33.
+  (server): the user-designed 4-flag adaptive-ctx family
+  (-actx/--adaptive-ctx none|half|full default none,
+  --adaptive-ctx-min default -1, --adaptive-ctx-max default -1,
+  --adaptive-ctx-idle default 30; env
+  LLAMA_ARG_ADAPTIVE_CTX[_MIN|_MAX|_IDLE]); triggers at
+  task start (grow-before-reject) + decode wall (grow-then-
+  DECODE_RETRY) + context-exceed sites; step-based target capped
+  at the max; grow ctx_dft too, rollback both on draft failure;
+  update n_ctx_slot + all slot.n_ctx; the idle hook shrinks to the
+  load-time base after a sustained idle (t_idle_start_ms gate;
+  idle 0 = grow-only; single jump to the floor); per-resize
+  duration log lines ("grown/shrunk in place in X ms"). Stages
+  1+2 BUILT GREEN 10-26/27 (F34):
+  cells-first ordering bug in resize() found + fixed (unit test
+  catches it, mutation-verified); unit tests
+  tests/test-context-resize.cpp 100% green + deterministic (ctest,
+  real stories15M GGUF, C API only - synthetic tests excluded on
+  WIN32+shared); thread safety of the growth path verified in-
+  process (single loop thread, lock-free like other KV mutations,
+  doc note in llama.h). Stage 3: verify matrix on 27B PTQ1_0
+  AFTER the user's install (user: "I will proceed with
+  installation"). See BACKLOG B15 + FINDINGS F33/F34.
 - KV wall (10-25, DONE - both stages committed+pushed, F31):
   - Stage 1 no-crash (6a30f9157): only n_batch == 1 && ret == 1 (the
     KV wall) is special-cased in decode() (bool -> int, file-local
@@ -263,14 +302,13 @@ block; grep by port 8080/58452.
 6. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
    -c 262144; prediction table in F31) - fold into FINDINGS when
    reported.
-7. [B] Await a free card (re-derive VRAM first; service PID 11848 +
-   20004) -> run the Q5_K_S tensor bench (N17; GDN correctness check
-   first).
-8. B15 (design CONFIRMED 10-25, IMPLEMENTING): staged implementation
-   per the final design (F33 revised). Stage 1 core resize API,
-   stage 2 server flag + triggers, stage 3 build + verify on 27B
-   PTQ1_0. Recon COMPLETE (see F33 grounding). No code written yet
-   at refresh. B14 remains PARKED behind this.
+7. [B] Await a free card (re-derive VRAM first; service PID 13688 +
+   22072) -> run the Q5_K_S tensor bench (N17; GDN correctness
+   check first).
+8. B15 (stages 1+2 DONE 10-26, F34): stages 1-2 built green; unit
+   tests 100% + mutation-verified; thread safety verified in-
+   process. AWAIT USER INSTALL -> stage 3 verify matrix on 27B
+   PTQ1_0 -> commit + push. B14 remains PARKED behind this.
 9. B7a (this fork, next code item): startup loud-fail on unfittable
    ctx/KV + closed -sm/-dev gate. NOTE: the old target
    (fit.cpp:182-183 tensor warn-then-continue) is GONE - the tensor

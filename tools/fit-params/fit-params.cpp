@@ -53,8 +53,18 @@ int llama_fit_params(int argc, char ** argv) {
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
 
+        // resolve the adaptive ctx bounds for the fit engine, same as common_init_from_params
+        uint32_t n_ctx_min_user = params.fit_params_min_ctx > 0 ? (uint32_t) params.fit_params_min_ctx : 4096;
+        uint32_t n_ctx_max_user = params.fit_params_max_ctx;
+        if (params.adaptive_ctx == COMMON_ADAPTIVE_CTX_NONE) {
+            n_ctx_max_user = 0; // no growth
+        } else if (params.adaptive_ctx == COMMON_ADAPTIVE_CTX_FULL && n_ctx_max_user == 0) {
+            n_ctx_max_user = UINT32_MAX; // grow into all free memory, capped by the training ctx
+        }
+
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-                params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx, params.fit_params_max_ctx,
+                params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), n_ctx_min_user, n_ctx_max_user,
+                &params.fit_ctx_base,
                 has_draft || spec_mtp ? &extra : nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {

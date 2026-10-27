@@ -2901,19 +2901,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(
-        { "-fitc", "--fit-ctx" }, "N",
-        string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
-        [](common_params & params, int value) {
-            params.fit_params_min_ctx = value;
+        { "-actx", "--adaptive-ctx" }, "[none|half|full]",
+        "how the context adapts to memory and load: none = fixed, half = settled by the fit at load, full = like half, plus the KV cache grows in place on demand and shrinks in place on idle (default: none)",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.adaptive_ctx = COMMON_ADAPTIVE_CTX_NONE;
+            } else if (value == "half") {
+                params.adaptive_ctx = COMMON_ADAPTIVE_CTX_HALF;
+            } else if (value == "full") {
+                params.adaptive_ctx = COMMON_ADAPTIVE_CTX_FULL;
+            } else {
+                throw std::invalid_argument(string_format("error: unknown value for --adaptive-ctx: '%s'\n", value.c_str()));
+            }
         }
-    ).set_env("LLAMA_ARG_FIT_CTX"));
+    ).set_env("LLAMA_ARG_ADAPTIVE_CTX"));
     add_opt(common_arg(
-        { "-fitm", "--fit-ctx-max" }, "N",
-        string_format("maximum total ctx size that --fit may grow -c to, 0 = do not grow, default: %" PRIu32, params.fit_params_max_ctx),
+        { "--adaptive-ctx-min" }, "N|-1",
+        "minimum total ctx size the fit may shrink to, full mode: floor of the idle shrink, -1 = auto, default: -1",
         [](common_params & params, int value) {
-            params.fit_params_max_ctx = value;
+            if (value > 0) {
+                params.fit_params_min_ctx = value;
+            }
         }
-    ).set_env("LLAMA_ARG_FIT_CTX_MAX"));
+    ).set_env("LLAMA_ARG_ADAPTIVE_CTX_MIN"));
+    add_opt(common_arg(
+        { "--adaptive-ctx-max" }, "N|-1",
+        "maximum total ctx size the fit may grow to, -1 = auto (full mode: as much as fits, capped by the training ctx), default: -1",
+        [](common_params & params, int value) {
+            if (value > 0) {
+                params.fit_params_max_ctx = value;
+            }
+        }
+    ).set_env("LLAMA_ARG_ADAPTIVE_CTX_MAX"));
+    add_opt(common_arg(
+        { "--adaptive-ctx-idle" }, "0|N",
+        "idle seconds before shrinking the KV cache in place (full mode), 0 = grow-only, default: 30",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: invalid value for --adaptive-ctx-idle\n");
+            }
+            params.adaptive_ctx_idle = value;
+        }
+    ).set_env("LLAMA_ARG_ADAPTIVE_CTX_IDLE"));
     add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),

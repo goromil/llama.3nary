@@ -33,7 +33,9 @@ Each item: what / why / how / exit criteria / status.
 > B15 designed. 10-26: B15 design CONFIRMED by user (in-place ring
 > tail extension via per-layer regrow, NOT the earlier per-slot
 > recreate draft); IMPLEMENTING in stages. B16 added (VA-page KV
-> ring, PARKED future optimization).
+> ring, PARKED future optimization). 10-26 (later): B15 stages 1+2
+> done (F34): core resize + server flag/triggers built green, unit
+> tests 100% + mutation-verified; stage 3 (27B verify) after install.
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -279,7 +281,9 @@ Each item: what / why / how / exit criteria / status.
   re-present the B14 draft before any B14 work.
 
 ## B15. Runtime context growth - in-place ring tail extension
-  (design CONFIRMED 10-25, IMPLEMENTING - F33)
+  (design CONFIRMED 10-25, IMPLEMENTED 10-26/27 - F33/F34, stage 3
+  timed E2E DONE on gemma-4-E4B 10-27 - F35; 27B-scale timings
+  await a service-stop window)
 - what: grow the server's shared context at runtime when a slot hits
   the KV wall and the cards have headroom: in-place tail extension
   of the shared ctx ring via per-layer data-tensor regrow. No shift,
@@ -308,7 +312,10 @@ Each item: what / why / how / exit criteria / status.
     llama-context.cpp:376-392 derivation, memory->resize, update
     cparams.n_ctx/n_ctx_seq).
   - Stage 2 (server): OPT-IN cap flag mirroring -fitm (name TBD,
-    e.g. --grow-ctx-max; 0 = off); triggers at task start
+    e.g. --grow-ctx-max; 0 = off) - SUPERSEDED 10-27: landed as the
+    4-flag adaptive-ctx family (-actx none|half|full,
+    --adaptive-ctx-min/-max/-idle; the old --fit-ctx/--fit-ctx-max/
+    --grow-ctx-max hard-deleted, F34); triggers at task start
     (:3097/:3108 grow-before-reject) + decode wall (:3637 grow-then-
     DECODE_RETRY); step-based target (e.g. max(4096, current/4),
     n_pad-aligned) capped at the flag; grow ctx_dft too, rollback
@@ -321,8 +328,23 @@ Each item: what / why / how / exit criteria / status.
     EXCEED_CONTEXT_SIZE), MTP case if feasible.
 - exit: staged commits pushed; verify matrix green on 27B PTQ1_0;
   private/ refreshed with the new findings.
-- status: CONFIRMED by user 10-25; recon COMPLETE; implementing
-  10-26. B14 remains PARKED behind this path.
+- status: CONFIRMED by user 10-25; recon COMPLETE; stages 1+2
+  implemented and BUILT GREEN 10-26/27 (F34) with the user-designed
+  4-flag adaptive-ctx family; ctest 100% (9.72 s); unit tests
+  (tests/test-context-resize.cpp) 100% green + mutation-verified.
+  Stage 3 timed E2E DONE on gemma-4-E4B 10-27 (F35): load-shrink
+  32768->8192 19-22 ms; grow 8192->12288 19-25 ms; full
+  retain-free-shrink cycle (--parallel 1) 26 ms; over-cap clean
+  EXCEED_CONTEXT_SIZE at the 16384 cap, server survives; all far
+  under the 2 s gate. E2E found + fixed 3 OUR-side bugs (idle tick
+  gap, iswa resize gap, 1/s retry spam) - all in the uncommitted
+  set. 27B-scale timings (262144->16284, ~6.3 GiB, est. 0.5-1 s)
+  still need a service-stop window. Open: retained-KV shrink policy
+  fork A/B/C (F35; C = shipped interim). Next: single commit +
+  push -> install-dir swap + live spawn-line handover (--fit-ctx/
+  --fit-ctx-max -> --adaptive-ctx full / --adaptive-ctx-max 262144 /
+  --adaptive-ctx-idle 30) -> B70 reference comparison -> bad-
+  allocation analysis. B14 remains PARKED behind this path.
 
 ## B16. VA-page KV ring (future optimization, PARKED)
 - what: the zero-copy alternative to B15's per-layer regrow: reserve

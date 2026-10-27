@@ -134,6 +134,8 @@ public:
 
     void clear(bool data) override;
 
+    bool resize(uint32_t new_size) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -282,8 +284,14 @@ private:
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    // the ggml contexts and backend buffers of the layers, indexed like `layers`;
+    // null for shared layers that reference the tensors of the source cache (see n_shared)
+    std::vector<ggml_context_ptr> layer_ctxs;
+    std::vector<ggml_backend_buffer_ptr> layer_bufs;
+
+    // the number of layers of other caches that share this cache's layer tensors
+    // (see the share callback in the constructor); this cache cannot be resized while they exist
+    uint32_t n_shared = 0;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -320,6 +328,10 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    // resize the data tensors of layer i to new_size, keeping the first old_size rows
+    // return false on failure, the layer is left unchanged in that case
+    bool regrow_layer(size_t i, uint32_t new_size);
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

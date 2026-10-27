@@ -47,7 +47,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) : unified(unified) {
+    const  layer_share_cb & share) :
+    swa_full(swa_full),
+    unified(unified),
+    n_swa_cap(hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -70,7 +73,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t size_swa = GGML_PAD(std::min(size_base, n_swa_cap), 256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -108,6 +111,34 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 void llama_kv_cache_iswa::clear(bool data) {
     kv_base->clear(data);
     kv_swa ->clear(data);
+}
+
+bool llama_kv_cache_iswa::resize(uint32_t new_size) {
+    const uint32_t old_size = kv_base->get_size();
+
+    if (new_size == old_size) {
+        return true;
+    }
+
+    // the SWA ring is capped by the window; only a full-size ring follows the base size
+    const uint32_t new_size_swa = swa_full ? new_size : GGML_PAD(std::min(new_size, n_swa_cap), 256);
+
+    const uint32_t old_size_swa = kv_swa->get_size();
+
+    // resize the ring first: a base failure would leave a ring smaller than the base,
+    // which still wraps safely, and the ring rollback is a cheap allocation
+    if (!kv_swa->resize(new_size_swa)) {
+        return false;
+    }
+
+    if (!kv_base->resize(new_size)) {
+        if (new_size_swa != old_size_swa && !kv_swa->resize(old_size_swa)) {
+            LLAMA_LOG_ERROR("%s: failed to roll back the SWA cache to %u cells\n", __func__, old_size_swa);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

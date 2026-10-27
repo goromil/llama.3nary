@@ -154,7 +154,10 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
 | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
 | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
 | `-fitt, --fit-target MiB0,MiB1,MiB2,...` | target margin per device for --fit, comma-separated list of values, single value is broadcast across all devices, default: 1024<br/>(env: LLAMA_ARG_FIT_TARGET) |
-| `-fitc, --fit-ctx N` | minimum ctx size that can be set by --fit option, default: 4096<br/>(env: LLAMA_ARG_FIT_CTX) |
+| `-actx, --adaptive-ctx [none\|half\|full]` | how the context adapts to memory and load: none = fixed, half = settled by the fit at load, full = like half, plus the KV cache grows in place on demand and shrinks in place on idle (default: none)<br/>(env: LLAMA_ARG_ADAPTIVE_CTX) |
+| `--adaptive-ctx-min N\|-1` | minimum total ctx size the fit may shrink to, full mode: floor of the idle shrink, -1 = auto, default: -1<br/>(env: LLAMA_ARG_ADAPTIVE_CTX_MIN) |
+| `--adaptive-ctx-max N\|-1` | maximum total ctx size the fit may grow to, -1 = auto (full mode: as much as fits, capped by the training ctx), default: -1<br/>(env: LLAMA_ARG_ADAPTIVE_CTX_MAX) |
+| `--adaptive-ctx-idle 0\|N` | idle seconds before shrinking the KV cache in place (full mode), 0 = grow-only, default: 30<br/>(env: LLAMA_ARG_ADAPTIVE_CTX_IDLE) |
 | `--check-tensors` | check model tensor data for invalid values (default: false) |
 | `--override-kv KEY=TYPE:VALUE,...` | advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.<br/>types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false |
 | `--op-offload, --no-op-offload` | whether to offload host tensor operations to device (default: true) |

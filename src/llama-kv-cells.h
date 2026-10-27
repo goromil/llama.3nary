@@ -69,6 +69,39 @@ public:
         reset();
     }
 
+    // resize while keeping the state of the surviving cells
+    // growth appends empty cells, shrinking fails if any dropped cell is not empty
+    // return true on success
+    bool resize_keep(uint32_t n) {
+        const uint32_t n_old = pos.size();
+
+        if (n == n_old) {
+            return true;
+        }
+
+        if (n < n_old) {
+            for (uint32_t i = n; i < n_old; ++i) {
+                if (pos[i] != -1) {
+                    return false;
+                }
+            }
+        }
+
+        pos.resize(n);
+        ext.resize(n);
+        shift.resize(n);
+        seq.resize(n);
+
+        for (uint32_t i = n_old; i < n; ++i) {
+            pos[i]   = -1; // std::vector::resize value-initializes to 0, empty cells use -1
+            ext[i].reset();
+            shift[i] =  0;
+            seq[i].reset();
+        }
+
+        return true;
+    }
+
     bool is_empty(uint32_t i) const {
         assert(i < pos.size());
         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);

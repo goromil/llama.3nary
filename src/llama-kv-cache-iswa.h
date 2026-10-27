@@ -67,6 +67,8 @@ public:
 
     void clear(bool data) override;
 
+    bool resize(uint32_t new_size) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -91,7 +93,11 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
+    const bool swa_full;
     const bool unified;
+
+    // the SWA ring size cap without padding, as used in the ctor to size kv_swa
+    const uint32_t n_swa_cap;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;

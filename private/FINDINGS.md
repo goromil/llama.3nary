@@ -1203,7 +1203,9 @@ Design (final, agreed 10-25):
    - OPT-IN cap flag mirroring -fitm (name TBD, e.g. --grow-ctx-
      max; 0 = off) in common_params + arg.cpp + common.cpp print
      (pattern: -fitm at arg.cpp:2910-2916, common.h:472,
-     common.cpp:1323).
+     common.cpp:1323). SUPERSEDED 10-27: the flag landed as the
+     4-flag adaptive-ctx family (F34); --grow-ctx-max was never
+     shipped.
    - Trigger (a) task start (:3097 non-splittable / :3108
      splittable): if the request > slot.n_ctx and the cap allows,
      grow before rejecting.
@@ -1233,9 +1235,375 @@ a driver/memory-API surface question, no device kernels involved,
 but the needed mapping API is not exposed there. Revisit only if
 the per-layer regrow cost proves too high in practice.
 
-Status: design CONFIRMED by the user 10-25; implementing in stages
-(1: core resize API, 2: server flag + triggers, 3: build + verify
-on 27B PTQ1_0). B14 remains PARKED behind this path.
+Status: Stages 1+2 implemented and BUILT GREEN 10-26; unit tests
+100% green (F34). Stage 3 (verify on 27B PTQ1_0) awaits the user's
+install. B14 remains PARKED behind this path.
+
+## F34. B15 implementation: core resize, server triggers, unit tests (10-26)
+
+Implementation of F33 stages 1+2 (uncommitted at refresh).
+
+Stage 1 (core), as designed:
+- llama_kv_cache ctor restructured to per-layer ggml ctx + buffer
+  (layer_ctxs/layer_bufs, llama-kv-cache.h:289-290); regrow_layer
+  (llama-kv-cache.cpp:450) = fresh no_alloc ggml ctx with the new
+  k/v + stream views -> allocate buffer on the layer's own buft ->
+  zero-clear -> copy rows [0, min(old,new)] stream by stream via a
+  host staging buffer (get/set resolve the possibly-split tensors)
+  -> atomic swap of k/v + views + ctx + buf (old released with it).
+  Atomic: the layer state is swapped only after full success.
+- llama_kv_cells::resize_keep (llama-kv-cells.h:75): grow appends
+  pos=-1 cells; shrink validates ALL dropped cells before mutating
+  (a failed check touches nothing).
+- llama_kv_cache::resize (llama-kv-cache.cpp:385): no-op if equal;
+  refuse other/n_shared (shared-layer consumers); GGML_ASSERT
+  new_size % n_pad; cells first, then per-layer regrow with
+  rollback (see bug below).
+- llama_memory_hybrid::resize (llama-memory-hybrid.cpp:147):
+  mem_attn only (GDN recurrent is n_ctx-independent).
+- Public API: llama_context_resize (llama-context.cpp:4028) ->
+  memory_resize (:955): reject n_ctx < 256, GGML_PAD(n_ctx, 256),
+  no-op if unchanged after padding, n_ctx_seq derivation mirroring
+  the ctor (kv_unified: n_ctx_seq = n_ctx; else n_ctx / n_seq_max
+  padded to 256), memory->resize, update cparams.n_ctx/n_ctx_seq,
+  gf_res_prev->reset() + graph re-reserve (the k/v tensors have new
+  addresses; the worst-case graph is sized by the full cache).
+
+ORDERING BUG FOUND + FIXED in resize() (unit test catches it):
+- The first draft regrew the data tensors BEFORE the cell-usage
+  check. A failed shrink destroys the tail rows (the row copy is
+  one-way: the new buffer only holds min(old,new) rows), then the
+  rollback regrow copies only min(new,old) rows back, so the used
+  tail cells are left marked in use with ZEROED data while
+  resize() returns false. Any continuation decode would attend over
+  the zeroed keys.
+- Fix: resize the cells FIRST (a failed shrink fails fast with
+  nothing touched), save v_heads (clamp to 0 if >= new_size), then
+  regrow the layers; on a layer failure roll back the layers AND
+  the cells (resize_keep(old_size) always succeeds - only empty
+  cells were dropped or added) and restore v_heads.
+- Mutation-verified: temporarily restoring the old ordering makes
+  test case (d) fail (max |logit diff| 0.918 vs the control); the
+  fixed code passes at 0 (byte-exact).
+
+Stage 2 (server), as designed; the flag surface was later
+redesigned by the user into the final 4-flag adaptive-ctx family
+(the initial grow-only flag below was hard-replaced, not kept):
+- FINAL FLAGS (locked 10-27): -actx/--adaptive-ctx [none|half|full]
+  (default none), --adaptive-ctx-min N (default -1),
+  --adaptive-ctx-max N (default -1), --adaptive-ctx-idle 0|N (default
+  30); env LLAMA_ARG_ADAPTIVE_CTX[_MIN|_MAX|_IDLE]. Old flags
+  --fit-ctx/-fitc, --fit-ctx-max/-fitm, --grow-ctx-max are HARD
+  DELETED: a live spawn line using them will not start the server
+  until it is swapped at the next install.
+  Semantics: auto min = the load-time base the fit settled before
+  growing (fit_ctx_base, common.h:482; explicit min wins and becomes
+  the shrink floor); max -1 with mode=full = grow-to-fit capped by
+  the training ctx (server-context.cpp:1088-1093); idle 0 = grow-only
+  (shrink disabled); the idle shrink is a single jump to the floor,
+  gated by t_idle_start_ms (server-context.cpp:870) set when the last
+  slot goes idle. Per-resize duration lines: "adaptive ctx: KV cache
+  grown/shrunk in place in %lld ms".
+  Without --fit the same flags work: base falls back to n_ctx and max
+  must be explicit (fit_ctx_base stays 0).
+- try_grow_ctx(n_min) (server-context.cpp:1640): cap check;
+  slot capacity capped at n_ctx_train; step target =
+  max(4096, cur/4) or enough to fit (n_min), capped at
+  min(cap/(unified ? 1 : n_seq_max), n_train); resize ctx_tgt,
+  then ctx_dft (roll back the target on draft failure); on success
+  n_ctx + n_ctx_slot + every slot.n_ctx + prompt_cache->limit_
+  tokens follow the context.
+- Triggers: task start (~:3100-3130, grow before rejecting an
+  over-cap request) and the decode wall (~:3640, exactly where the
+  shipped try_clear_idle_slots + DECODE_RETRY sits, F31). Both run
+  on the loop thread between decodes.
+
+Thread safety (in-process) - VERIFIED:
+- All context ops happen on the server's single loop thread:
+  server_queue::start_loop (server-queue.cpp:278) alternates
+  process_new_tasks -> callback_update_slots (decode at
+  server-context.cpp:3662) -> wait; both grow triggers fire there
+  between decodes. HTTP threads never touch the ctx: /metrics
+  (server-context.cpp:4667) and /slots (:4729) post tasks
+  (SERVER_TASK_TYPE_METRICS / SLOT_GET); get_metrics (:825)
+  returns a struct copy; get_meta/get_llama_context are
+  main-thread-only by documented contract;
+  common_memory_breakdown_print (server.cpp:545) runs post-
+  shutdown after the joins.
+- llama_kv_cache::resize is lock-free like every other KV mutation
+  (caller-serialized). A one-line doc note was added to
+  llama_context_resize (llama.h:580-584); precedent: the
+  tokenization section ("The API is thread-safe.", llama.h:1172).
+
+Unit tests: tests/test-context-resize.cpp (NEW, user-requested;
+C API only + real GGUF, registered in tests/CMakeLists.txt after
+the test-thread-safety block with FIXTURES_REQUIRED test-download-
+model; model = tinyllamas/stories15M-q4_0.gguf, ~9 MB, already in
+build/). n_batch=1024, n_ubatch=128, n_seq_max=1; deterministic
+tokens = one fixed prompt tiled. Cases:
+  (a) grow preserves KV: ctx 512, decode 400, resize(1536),
+      decode 144 more; final-position logits vs a fresh 1536
+      single-pass reference -> max |logit diff| 7.49e-05 + argmax
+      match (tol 1e-4).
+  (b) grow on an EMPTY cache + 256 rounding: resize(1500) -> true,
+      n_ctx == 1536, then a 300-token decode succeeds.
+  (c) no-op: resize to the current size -> true; and an empty
+      cache shrinks (512 -> 256) -> true.
+  (d) shrink dropping USED cells: ctx 1024, decode 800,
+      resize(512) -> false, n_ctx stays 1024, and the continuation
+      (800..900) is BYTE-EXACT (diff 0) vs a same-split control
+      continuation without the resize call. This is the regression
+      test for the ordering bug above.
+  (e) shrink dropping only the EMPTY tail: decode 320, resize(512)
+      -> true, n_ctx 512, continuation (320..470) byte-exact vs
+      the same-split control - the kept rows survive the buffer
+      copy.
+Results: ctest 100% (test-download-model fixture + test-context-
+resize, ~8.4 s); deterministic across runs (identical diff
+values). The small llama model exercises the plain
+llama_kv_cache path; the hybrid (GDN) path is covered by stage 3
+on the 27B.
+
+Why C API + real GGUF (not the synthetic-model machinery):
+- The synthetic tests (test-kv-mean-center, test-llama-archs) are
+  excluded on WIN32 + BUILD_SHARED_LIBS (tests/CMakeLists.txt:172,
+  if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)); the block is from
+  upstream commit 7f4fbe518 ("allow building all tests on windows
+  when not using shared libs"). Cause: llama_model_saver is
+  internal (src/llama-model-saver.h, not exported from the DLL).
+  llama_model_init_from_user IS exported (llama.h:508) - only the
+  saver blocks that path on this platform.
+- The plain llama arch of stories15M hits the same
+  llama_kv_cache path the server grow uses (the 27B adds the
+  hybrid wrapper, verified in stage 3).
+
+Empirical note (test design driver, not a bug): on this SYCL
+build the ubatch split is NOT fp-invariant for stories15M-q4_0
+(FA disabled: "Flash Attention not supported, set to disabled"):
+a 2-decode continuation (800|100) diverges from the single-pass
+900 by max |logit diff| 0.448, while (400|144) vs 544 is
+7.49e-05. Same split, no resize: diff 0. So (d)/(e) use a
+same-split control (the resize is the only difference) and only
+(a) crosses splits (tol 1e-4).
+
+Other:
+- llama_n_ctx/llama_n_ctx_seq/llama_n_seq_max return uint32_t
+  (llama.h:573-577): the server trigger code needed (int) casts at
+  the std::min sites (build error fixed in the stage 2 pass).
+- Multi-instance (router) semantics: the adaptive-ctx bounds are
+  PER INSTANCE (set per child, e.g. via the env for router children).
+  Each instance owns its pool; no cross-process state, no lock
+  needed. Growth is an allocation: on failure the instance keeps
+  its current size and the request gets the normal
+  EXCEED_CONTEXT_SIZE rejection (no corruption, no effect on
+  siblings). The per-instance cap bounds the worst-case KV
+  footprint per child, so total VRAM can be planned as the sum
+  over children of (weights + KV at cap).
+
+Status (10-27): all stages built green (llama-server + test), ctest
+100% (9.72 s), adaptive-ctx flag family in place, T2 (full actx set
+on gemma-4-E4B) PASS incl. the load-time grow 8192 -> 32768. E2E
+timed matrix (shrink/regrow pause vs the ~2 s gate) is in progress;
+blocked by live-service VRAM fragmentation (F35). Commit + the live
+spawn-line swap (--fit-ctx/--fit-ctx-max -> --adaptive-ctx full /
+--adaptive-ctx-max 262144 / --adaptive-ctx-idle 30) are pending.
+
+## F35. gemma-4-E4B E2E bisection: init-time crash signatures under live-service VRAM pressure (10-27)
+
+Context: adaptive-ctx E2E (gemma-4-E4B-it-Q4_0, E:\DataVolume)
+alongside the live 27B Q6_K service. Both cards held by the live
+child (~12-14 GiB free each, fragmented; the child restarted 3x in
+3.5 h, see the bad-allocation thread). All runs: build\bin\
+llama-server.exe; BASE set = `--fit on -c 8192 -actx full
+--adaptive-ctx-max 32768 --adaptive-ctx-idle 5 --cache-type-k q5_1
+--cache-type-v q5_1 --flash-attn on --threads 56` (no
+split-mode/batch-size).
+
+Bisection matrix (single flag added to BASE; T2/B1/B2 ran against
+the OLDER live child, B3 + the E2E re-runs against the 3:37 AM
+child 17416):
+- T2 BASE: PASS. Prints `adaptive ctx: mode=full base=8192
+  max=32768 idle=5s`; n_ctx_slot 8192 -> 32768 at load (the fit
+  grow-to-cap, fit.cpp:573-624).
+- B1 + --batch-size 2048: PASS (no-op: the default is already 2048,
+  common.h:451).
+- B2 + --flash-attn on: PASS (no-op for gemma4: gemma4.cpp never
+  sets f_attn, FA is auto-on everywhere).
+- B3 + --split-mode tensor: 3 load-time crash variants (sig 3-4).
+- T1 BASE + all 3 perf flags: loaded, then CRASH in warmup decode
+  (sig 1).
+- BASE re-runs (the E2E set) vs the new child: run 1 = silent
+  0xC0000409 after a ~26 s slow load, zero stderr (sig 5); run 2 =
+  clean SYCL alloc failure at model load (sig 2). Same args PASSed
+  (T2) and fail depending on the child's VRAM layout: non-
+  deterministic under this VRAM state.
+
+Signatures (all PRE-EXISTING; our fit/actx code exonerated - T2 PASS
+the full actx set, and every crash site is at/after model load,
+before the server's first `adaptive ctx:` line):
+1. 64-pool assert (T1): warmup-decode graph build (window:
+   common.cpp:1417 threadpools.init -> common.cpp:1520-1556 warmup,
+   11-13 ms after the threadpool line) hits ggml.c:1822
+   GGML_ASSERT allocating a 65th tensor into a no_alloc-style pool
+   of exactly 23552 B = 64 x 368 (ggml_tensor_overhead(), ggml.c:
+   1483); needed 23920. Owner NOT identified: every ggml_init_params
+   site checked - kv per-layer pool = 2*(1+n_stream)*368 (would need
+   n_stream=31, excluded: kv_unified forces 1), k_bar ctxs =
+   layers*368 (too small), recurrent = 2*n_layer*368 (gemma4 has no
+   recurrent layers), loader/model ctx (load-time, too big), sched
+   ctx (graph-sized), sampler probe (1024), meta reduce
+   (n_reduce_steps=0), graph_copy (CPU-only), hadamard (1).
+2. Fit layer-split contiguity failure (E2E run 2): `alloc FAILED:
+   1123.035 MiB direct` on SYCL0 (1177587584 B) at model load,
+   clean exit=1. Mechanism: fit's layer mode gives each device a
+   CONTIGUOUS slice of the model (fit.cpp:804-805,
+   set_ngl_tensor_split_tbo :864) and the allocator groups
+   consecutive same-buft tensors into ONE buffer alloc, segment-
+   capped by the buft max_size (ggml-alloc.c:1168-1206, the
+   :1187 max_size split) - one ~1.12 GiB segment that fragmented
+   SYCL0 cannot serve. Free totals unchanged vs the T2 pass
+   (~12.1 GiB): contiguity, not capacity.
+3. B3 #1: load-time CPU malloc NULL, ggml.c:1661 GGML_ASSERT
+   (ctx->mem_buffer != NULL) (ggml_init, mem_buffer = NULL path).
+4. B3 #2 + re-run: load-time SYCL0 alloc failure 1652.622 MiB
+   (1732899584 B) + ggml-backend-meta.cpp:1744 GGML_ASSERT
+   (meta_buf_ctx->bufs[i]) - the meta/tensor-split path needs an
+   even bigger per-device contiguous block for gemma, so the
+   production-parity `--split-mode tensor` variant is NOT a
+   workaround in this state.
+5. Silent 0xC0000409 (E2E run 1): ~26 s slow load (the other runs
+   load in ~3 s; even the CPU-only minimal control took ~25 s -
+   system-wide commit pressure from the 20.47 GiB live child), then
+   abort with ZERO stderr. Do not assume a silent 0xC0000409 is a
+   GGML_ASSERT; buffered stdout W/I lines are lost on abort.
+
+Placement notes (checked while unblocking):
+- Non-fit `-ngl all` uses the SAME contiguous-ratio split
+  (llama-model.cpp:1736-1748, upper_bound on cumulative splits) -
+  NOT a workaround for sig 2.
+- Tensor-mode fit never reassigns weights: "the split of the
+  weights is fixed by the model ... only the context size is
+  fitted" (fit.cpp:179-183) - the live production line
+  (--fit on --split-mode tensor, 27B) does not take the
+  layer-placement path of sig 2; it is exposed to sigs 3-4 instead,
+  which have been observed on this box with that flag combination.
+- The CPU-only minimal control (no fit, no -ngl) loads fine in the
+  same state: binary/model healthy.
+
+E2E status: the timed matrix (b -> 8 s idle shrink -> d regrow ->
+restart capped -> e over-cap) is BLOCKED on the above; T2 + the unit
+tests are the current evidence base.
+
+Two OUR-side code bugs found during the first full E2E run (both
+fixed, uncommitted):
+1. Idle hook never fires on a purely idle server:
+   server_queue::start_loop handles the 1 s wait_for timeout inside
+   the inner loop (server-queue.cpp:357-370) without re-entering the
+   outer loop, so callback_update_slots (the all-idle branch with the
+   shrink hook) only ran when a task re-entered the queue. Fix: on
+   timeout, unlock the lock, tick callback_update_slots, relock, and
+   shift time_last_task by the tick duration (same rule as
+   :311-317: tick time is not idle). Verified invariants: callbacks
+   always run without mutex_tasks held (outer-loop call site :310
+   runs before the lock at :314); the all-idle branch is idempotent
+   (server-context.cpp:2854-2872 early return); metrics_flush_idle
+   no-ops when n_prompt_queued == 0 (:4217-4224), so the ~1/s
+   cadence is free.
+2. iswa wrapper had no resize override: llama_kv_cache_iswa derives
+   from llama_memory_i (a wrapper around TWO llama_kv_cache
+   sub-caches: kv_base non-SWA + kv_swa SWA ring) and did not
+   override resize, so every SWA model (gemma3n, gemma4, ...) hit
+   the silent base default return false (llama-memory.h:118) ->
+   the observed 6 us `E memory_resize: failed to resize the memory
+   to 8192 cells`. Stage 1 covered llama_kv_cache +
+   llama_memory_hybrid, missed the iswa wrapper. Fix: store swa_full
+   + the unpadded ring cap n_swa*(unified ? n_seq_max : 1) + n_ubatch
+   as ctor members; resize = ring first (swa_full ? new_size :
+   GGML_PAD(min(new_size, n_swa_cap), 256), mirroring the ctor
+   sizing), then base; roll the ring back (with an error log if the
+   rollback fails) when the base fails. Ordering rationale: each
+   sub-resize is atomic (resize_keep fails before mutating; the
+   layer regrow rolls back on failure), and a base failure leaves a
+   ring SMALLER than the base, which still wraps safely (never OOB),
+   while the reverse would leave the base smaller than cparams
+   (OOB). The dsa-iswa sibling (llama-kv-cache-dsa-iswa.h) has the
+   same gap; out of scope, noted only.
+   SWA ring row-copy safety (checked before writing the fix):
+   find_slot allocates free cells from the head with wrap-around
+   (llama-kv-cache.cpp:1083-1242), overwrite safety is per-cell via
+   is_masked_swa position masking, so the regrow row copy is correct
+   for the position-indexed base (rows = positions) and for the ring
+   (grow: used-block row indices are invariant; shrink:
+   resize_keep fails if any dropped cell is used).
+
+Log forensics note: the .out file loses buffered stdout (all I/W
+lines) on a force-kill; only stderr (E lines) survives. Timestamps
+are event-time: the 6 us gap between the shrink line and the error
+is real elapsed time, i.e. an immediate early return, not a slow
+allocation failure. The E2E run's hook firing 532 s after the last
+task (t=48.47 min) was because a /slots HTTP poll posted a task that
+re-entered the outer loop - it proved the tick gap, not a
+replacement for the fix.
+
+Known limitation (no fix, production line unaffected): an
+--sleep-idle-seconds shorter than --adaptive-ctx-idle makes the
+queue enter the sleep state before the shrink can fire (the
+sleep-state wait, server-queue.cpp:336-338, blocks the update_slots
+cadence until a task wakes it). The production spawn line does not
+set --sleep-idle-seconds (default -1), so this is only a trap for
+future flag combinations.
+
+Third OUR-side bug (fixed, uncommitted): the idle shrink retried
+every second after a failure (E-line spam for the whole idle
+period). Root cause: retained slot KV. The server keeps a finished
+slot's KV until the NEXT task lands on that slot (release() only
+prompt_clears child slots; n_cache_reuse is a separate KV-shift
+feature, default 0; t_last_used only drives slot-steal selection
+when a new task arrives, so nothing frees retained cells during a
+pure idle). A shrink below the max retained cell boundary then
+correctly fails (resize_keep, llama-kv-cells.h:75, is
+all-or-nothing), and the old code retried every tick. Fix:
+actx_shrink_blocked member (server-context.cpp:871) - on a failed
+attempt set the flag and skip further attempts until a new task
+arrives (the else branch at :2883 clears it, same place that resets
+t_idle_start_ms). Rationale: while idle the cell state cannot
+change, so a retry within the same idle period can never succeed.
+The no-op case (already at the floor) also sets the flag, which is
+harmless: it is cleared by the same new-task event that is required
+to push the cache above the floor again (a grow) or free retained
+KV.
+
+E2E on the final binary (gemma-4-E4B, port 18100, all far under the
+2 s gate; times in ms):
+- load 32768 (mode=full) -> 5 s idle shrink 32768->8192: 19 ms
+  (4-slot run), 21 ms (--parallel 1 run)
+- phase d (9616-token prompt) grow 8192->12288: 19 ms (both runs)
+- post-d idle shrink 12288->8192: correctly BLOCKED by the slot's
+  9623 retained cells, exactly ONE attempt (I + 2 E lines), then
+  silent for 20+ s of further idle (pre-fix binary: 1 attempt/s)
+- --parallel 1 full cycle: phase f (small task, same slot) frees
+  the retained KV at task start -> next 5 s idle mark shrinks
+  12288->8192 in 26 ms -> post-shrink requests OK (prefix reuse
+  still works: f_keep = 0.958 on an identical-prompt follow-up)
+- note: with N>1 slots a shrink only succeeds once every slot that
+  retains KV above the floor has received a new task; with
+  LCP/LRU slot selection that takes one request per such slot. No
+  slot-pinning API exists in this build (POST /slots/:id is the
+  slot-save feature only).
+- production-scale extrapolation (27B Q6_K, 262144->16284, ~6.3
+  GiB q5_1 KV, copy-bound): order ~0.5-1 s, still under the gate.
+
+Retained-KV shrink policy fork (OPEN, presented to user):
+- A: on idle shrink, clear the idle slots' retained KV first, then
+  shrink to the floor (full VRAM reclaim; a resumed long session
+  pays re-prefill of its whole history)
+- B: shrink only to the retained boundary (max used_max_p1() over
+  streams, llama-kv-cells.h:124) - needs a new core accessor;
+  iswa/dsa-iswa lack get_cell_usage overrides (base returns {})
+- C (shipped interim, recommended): never touch retained KV; one
+  attempt per idle period (the fix above). Still reclaims
+  262144->16284 (~4 GiB at production scale) once traffic has
+  cycled through the retaining slots.
 
 ## For consideration (not approved, no code written)
 

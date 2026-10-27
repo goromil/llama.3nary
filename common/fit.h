@@ -36,6 +36,7 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                            uint32_t   n_ctx_max_user,        // opt-in: grow the context up to this total size, 0 = do not grow
+                           uint32_t * n_ctx_base,            // out: the settled context size before growing, nullptr if not needed
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
