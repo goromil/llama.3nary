@@ -1,6 +1,45 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-28 (late) - timing-log gate committed +
+Last refresh: 2026-10-28 (16:12) - BUILD RECOVERY GREEN after
+the user's VS-2022-shell botched configure. Root cause
+(confirmed by an isolated child-shell test): the user's window
+was already a VS 2022 dev environment (Developer PowerShell
+for VS 2022, or a terminal opened from VS 2022); with the VS
+2022 env vars (VCINSTALLDIR/VSINSTALLDIR/PATH) preset, the
+script's Launch-VsDevShell (VS 2026) import is a complete NO-OP
+and still prints "imported successfully" - `where cl` stays at
+VS 2022 14.44.35207. CMake's bare cl then resolved to VS 2022
+!= cached VS 2026 cl -> the known CMake 4.4.4 cache wipe that
+DROPS the -D args (a Debug + cl-as-CXX reconfigure started).
+Ctrl+C mid-configure left build\CMakeCache.txt DELETED (never
+rewritten), the prompt stuck in build\ (Push-Location not
+popped), and the `&&` chain dead, so `-Portable -InstallOnly`
+never ran. No source touched; objects + the old lock intact.
+build-sycl.ps1 HARDENED (local, gitignored, NOT committed):
+(1) after the VS import the script now FORCES the intended
+VS's cl dir onto PATH (newest VC\Tools\MSVC\*\bin\Hostx64\x64
+under the detected VS root, prepended; prints "Forced cl
+directory: ..."), so a no-op import can no longer matter;
+(2) the resolved cl full path is PINNED in .build-info-sycl.json
+- a session pointing at a different VS now fails with a clean
+lock mismatch BEFORE CMake (fix: -Clean) instead of triggering
+the destructive wipe; locks written before the `cl` key existed
+are tolerated. Recovery rerun from a clean shell: lock check
+passed, fresh configure with the correct Release/VS 2026
+cl/icx args (cache verified: C = cl 14.51.36231, CXX = icx);
+the interrupted reconfigure had invalidated ninja's restat
+state, so the fast TUs fully recompiled (247 steps) while the
+slow SYCL TU obj survived (ggml-sycl.dll untouched, still the
+03:24 VS 2026 one). build\bin back at e78fe1b51 code state
+(HEAD is dff5d5cfe, docs-only). Rule for the user: run
+build-sycl.ps1 from a PLAIN PowerShell window (start menu),
+never a Developer PowerShell or a VS terminal - the script now
+self-defends, but a plain shell is the zero-surprise path.
+The throwaway proof script
+(C:\Users\admin\AppData\Local\Temp\opencode\test-vsdevshell.ps1)
+is deletable.
+
+Previous refresh: 2026-10-28 (late) - timing-log gate committed +
 built (e78fe1b51): the periodic tg line printed every 3 s
 regardless of change (~200-350 lines per long task; 75% of the
 current live llama.log - 65347 of 86566 lines) - now printed
@@ -35,7 +74,7 @@ fit.cpp:219 throws on an MTP draft with SPLIT_MODE_TENSOR, and
 the 10-27 tensor child with --fit-ctx 16284 still started at
 n_ctx_slot = 262144.
 
-Previous refresh: 2026-10-28 - B17 HANDOVER DONE (user-executed
+Older refresh: 2026-10-28 - B17 HANDOVER DONE (user-executed
 ~02:32): install dir now ACTX (the child starts on --adaptive-ctx, which
 the PRE-ACTX binary rejects), spawn line swapped to --adaptive-ctx
 full, model moved Q5_K_S -> Qwen3.8-27B-UD-Q6_K. New live: router
@@ -107,7 +146,21 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   that DROPS the original -D args (observed: Debug + cl-as-CXX
   for both languages, then a C2059 at server-context.cpp:3848 -
   a cl artifact, the tree compiles clean under icx); after ANY
-  compiler change, rebuild with -Clean. Recipe: NOTES.md N3.
+  compiler change, rebuild with -Clean. GOTCHA 10-28 (second
+  trigger mode): a calling shell that is ALREADY a VS dev
+  environment (Developer PowerShell for VS 2022, or a terminal
+  opened from VS 2022) makes the script's VS 2026
+  Launch-VsDevShell import a no-op (verified in an isolated
+  test; it still prints success), so bare cl resolves to the
+  session's VS -> same destructive wipe. HARDENED 10-28: the
+  script now forces the intended VS's cl dir onto PATH after
+  the import (prints "Forced cl directory:") and pins the
+  resolved cl into .build-info-sycl.json, so a stale session's
+  cl fails with a clean lock mismatch pre-CMake instead of a
+  wipe. Still: run from a PLAIN PowerShell window. After a
+  wipe, a rerun from a clean shell = fresh configure + full
+  recompile of the fast TUs (the SYCL TU obj survives).
+  Recipe: NOTES.md N3.
 - Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-28 ~02:32
   swap DONE by the user - now holds the ACTX binaries; the live
   child runs from here, see Services). Swap = copy build\bin over
@@ -307,18 +360,21 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `e78fe1b51` (server : gate
-  periodic tg/tp log lines on a >= 10% rate change). Before it:
-  `796c40945` (docs : private sync after B17 handover - F39
-  pipeline assessment, VS 2026 build recipe, live state),
+- branch `main`, pushed HEAD: `dff5d5cfe` (docs : private sync
+  after the timing-log gate - build state, 129 ms shrink record,
+  F40 status). Before it: `e78fe1b51` (server : gate periodic
+  tg/tp log lines on a >= 10% rate change), `796c40945`
+  (docs : private sync after B17 handover - F39 pipeline
+  assessment, VS 2026 build recipe, live state),
   `2b10cfb42` (docs : private sync after B15 complete -
   F36/F37/F38, B17, handover ready), `2822ce088` (server : skip
   the idle KV shrink while retained slot KV does not fit),
   `5b8aa1fad` (llama : copy KV rows on device in the in-place
   cache regrow), `9c8772ed8` (llama : adaptive ctx, in-place
   runtime resize), `1011b639d` (fit : tensor-mode context
-  fitting). The docs commit for THIS round (timing-gate state +
-  F40 status) is PENDING. Full list: NOTES.md N12.
+  fitting). The docs commit for THIS round (VS-2022-shell
+  recovery + script hardening) is PENDING. Full list:
+  NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
@@ -326,6 +382,14 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Binaries
 
+- `build\bin`: 10-28 16:12 RECOVERY REBUILD GREEN via the
+  hardened build-sycl.ps1 (post VS-2022-shell cache wipe; see
+  header): fresh configure, full recompile of the fast TUs
+  (247 steps), same VS 2026 toolchain (cl 14.51.36231 + icx
+  2026.1.1, Release); ggml-sycl.dll untouched (the 03:24 wide
+  rebuild obj survived). build\bin @ e78fe1b51 code state =
+  the (late) entry below; NOT deployed: install dir still
+  holds the 10-28 ACTX binaries (2822ce088 tree).
 - `build\bin`: 10-28 (late) INCREMENTAL build via build-sycl.ps1
   at HEAD e78fe1b51 (the timing-log gate), same VS 2026 toolchain,
   249 steps: only server-context.cpp.obj recompiled (step 243) +
