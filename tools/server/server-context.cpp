@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -36,6 +37,9 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// print periodic slot timings only if the rate moved by at least this fraction vs the last printed value
+constexpr double TIMINGS_PRINT_CHANGE = 0.10;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -325,6 +329,9 @@ struct server_slot {
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
+    double tg_print_last     = 0.0; // last printed rate values, 0.0 = never printed
+    double tg_win_print_last = 0.0;
+    double pp_print_last     = 0.0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -353,6 +360,9 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        tg_print_last     = 0.0;
+        tg_win_print_last = 0.0;
+        pp_print_last     = 0.0;
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -569,13 +579,22 @@ struct server_slot {
         const double n_gen_second     = stats.n_gen_tps();
         const double n_gen_second_win = 1e6 / (t_now - t_print_last) * (stats.n_gen - n_gen_last);
 
-        t_print_last = t_now;
-        n_gen_last = stats.n_gen;
+        // skip if both rates are within TIMINGS_PRINT_CHANGE of the last printed values
+        if (tg_print_last > 0.0 && tg_win_print_last > 0.0 &&
+            std::abs(n_gen_second     - tg_print_last)     < TIMINGS_PRINT_CHANGE * tg_print_last &&
+            std::abs(n_gen_second_win - tg_win_print_last) < TIMINGS_PRINT_CHANGE * tg_win_print_last) {
+            return;
+        }
+
+        t_print_last      = t_now;
+        n_gen_last        = stats.n_gen;
+        tg_print_last     = n_gen_second;
+        tg_win_print_last = n_gen_second_win;
 
         SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
     }
 
-    void print_timings_pp() const {
+    void print_timings_pp() {
         const double t_prompt_total = stats.t_prompt_ms();
 
         if (t_prompt_total < 3000.0) {
@@ -583,6 +602,14 @@ struct server_slot {
         }
 
         const double n_prompt_second = stats.n_prompt_tps();
+
+        // skip if the rate is within TIMINGS_PRINT_CHANGE of the last printed value
+        if (pp_print_last > 0.0 && std::abs(n_prompt_second - pp_print_last) < TIMINGS_PRINT_CHANGE * pp_print_last) {
+            return;
+        }
+
+        pp_print_last = n_prompt_second;
+
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
         SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
