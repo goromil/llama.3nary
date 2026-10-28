@@ -1799,6 +1799,72 @@ cards at max ctx simultaneously, the ~2x KV headroom justifies the
 pipeline; otherwise B14 (DP + router) delivers the same aggregate
 with existing execution models and half the risk.
 
+[measured 10-28] The MEASURE step, run on the live dual-card
+service with the DEFAULT spawn line (no --parallel):
+- The default config IS a batching config: the server auto branch
+  (tools/server/server.cpp:152-157) sets n_parallel = 4 and
+  kv_unified = true when --parallel is absent. Two concurrent
+  chats landed on separate slots (3 and 1) and decoded in ONE
+  batch of 2 seqs (llama.log :178425-178437, child 51396):
+  per-stream tg_3s 10.7-10.8, SUM ~21.4 t/s (user-reported ~20).
+- Solo finals, same child: 20.02 @ 8.5K, 14.03 @ 34.8K, 15.17 @
+  53.4K, 13.99 @ 67.5K, 12.90 @ 84.8K (the 12.53 @ 91559 baseline
+  continues the curve).
+- Verdict: the 2-chat sum is ~76% of the 2/H roofline (solo ~14
+  at the comparable ~35K ctx) - the 2-seq batch step costs ~93 ms
+  vs the ~71 ms solo step at that ctx. Batching works without any
+  flag; the gap to 2/H is per-step 2-seq overhead, not a config
+  problem.
+- The overlapped chats were 27.6K + 7K tokens: NOT pinning both
+  cards at max ctx. The pre-registered gate (pipeline justified
+  only if the workload pins BOTH cards at max ctx simultaneously)
+  is NOT met. Concrete boundary: the unified 262144-row ring holds
+  two ~131K chats; the largest live conversation so far is 106815.
+  The capacity question becomes real only above that.
+
+[certain 10-28] The -np 2 anomaly (child 57327), root-caused in
+code:
+- Explicit --parallel 2 skips the auto branch, so kv_unified keeps
+  its default FALSE (common/common.h:575) -> per-slot KV:
+  n_stream = n_seq_max (llama-kv-cache.cpp:86, K/V tensors are
+  3D [n_embd_gqa, kv_size, n_stream], :231-232). Total KV doubles:
+  2 x 262144 rows ~= 14.4 GiB (~7.2 GiB per card) vs ~7.2 GiB
+  unified.
+- The adaptive-ctx TOTAL cap doubled accordingly BY DESIGN:
+  n_ctx_max = n_ctx_train * n_streams (common/fit.cpp:456-458,
+  :528) = 262144 x 2 = 524288 (child log :178613); the no_alloc
+  fit measured it and granted it (the per-slot share stays capped
+  at n_ctx_train). "The adaptive ctx does not account for -np" is
+  half right: it DOES account - by doubling the total.
+- The child was HEALTHY: model loaded at 1.09 min, listening,
+  task 0 launched, and zero SYCL alloc errors/warnings anywhere in
+  its log section (checked: pool-malloc ERROR ggml-sycl.cpp:
+  1674-1678, FA buffer GGML_ABORT fattn-buffers.cpp:39-42,
+  reorder host-fallback WARN :3913-3919, pinned-host fallback
+  WARN :1528-1531 - every fallback logs, none present).
+- The user's monitor showed GPU2 full->0 + CPU ~+30 GB, read as a
+  load failure; UNPROVEN - no code path moves model+KV to host
+  silently. +30 GB ~= model 17.5 GB + per-slot KV 14.4 GiB ~=
+  32 GB is consistent with host residency, but remains a
+  hypothesis (the monitor source was not identified).
+- The service then fully restarted (user): old router died ~3.32
+  min (llama-error.log:16752), new router, child 49822 respawned
+  at 10.27 min with the ORIGINAL config (no --parallel) - not a
+  child crash.
+- Recommendation: drop -np 2 from the bisection. Per-slot
+  isolation buys nothing for 2 chats (unified KV already
+  interleaves them on one ring) and costs 2x KV memory + a 2x
+  total adaptive-ctx cap. Keep the default (auto 4 slots +
+  unified KV).
+
+[decision 10-28] Pipeline: NOT building. The measured 2-chat
+workload (27.6K + 7K) does not pin both cards at max ctx, so the
+~2x KV headroom - the pipeline's only real win - is not on the
+table; B14 (DP + router) stays the capacity vehicle if the
+workload ever grows past ~131K per concurrent chat. The 76% batch
+efficiency is the only open number; if it ever needs to move, it
+is a per-step overhead question, not a pipeline question.
+
 ## For consideration (not approved, no code written)
 
 Deferred design options for the KV/memory wall, in the order discussed

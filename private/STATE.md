@@ -1,6 +1,36 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-28 (16:12) - BUILD RECOVERY GREEN after
+Last refresh: 2026-10-28 (afternoon) - F39 measurement DONE +
+the -np 2 anomaly root-caused (full analysis in FINDINGS F39,
+[measured]/[certain]/[decision] blocks): on the DEFAULT spawn
+config (no --parallel -> auto 4 slots + unified KV,
+server.cpp:152-157) two concurrent chats DID batch - separate
+slots, one decode batch of 2 seqs, per-stream tg_3s 10.7-10.8,
+SUM ~21.4 t/s (~76% of the 2/H roofline vs solo ~14 at the
+comparable ~35K ctx); the overlapped chats were 27.6K + 7K, NOT
+pinning both cards at max ctx, so the pre-registered pipeline
+gate is not met - pipeline stays unbuilt, B14 remains the
+capacity vehicle. The -np 2 child (57327) root cause: explicit
+--parallel skips the auto branch, kv_unified silently keeps its
+default false (common.h:575) -> per-slot KV (total 2x, ~14.4
+GiB) and the adaptive-ctx TOTAL cap doubles to 524288 BY DESIGN
+(fit.cpp:528 = n_ctx_train x n_streams; the no_alloc fit
+granted it); the child itself was HEALTHY (loaded 1.09 min,
+served, zero SYCL alloc errors/warnings in its whole log
+section); the user's GPU2 full->0 + CPU +30 GB read is
+UNPROVEN (hypothesis: model + per-slot KV host residency ~=
+32 GB; no silent code path exists - every fallback logs); the
+user then restarted the whole service. Recommendation: drop
+-np 2, keep the auto default. Live state changed by that
+restart: NEW router on 0.0.0.0:8080 (PID not recorded), current
+child 49822 on 127.0.0.1:49822 with the ORIGINAL config
+(4 auto slots, unified KV, n_ctx_slot 262144); the user also
+INSTALLED the latest build\bin (e78fe1b51, the timing-gate
+binaries) into the install dir - the gated tg print behavior is
+confirmed live in llama.log. F40 write-up still pending user
+confirmation (analysis state below).
+
+Previous refresh: 2026-10-28 (16:12) - BUILD RECOVERY GREEN after
 the user's VS-2022-shell botched configure. Root cause
 (confirmed by an isolated child-shell test): the user's window
 was already a VS 2022 dev environment (Developer PowerShell
@@ -52,11 +82,12 @@ unchanged. Incremental build GREEN (249 steps, same VS 2026
 toolchain, build\bin @ e78fe1b51): only server-context.cpp.obj
 recompiled (step 243) + llama-server-impl.dll / llama-server.exe
 relinked (245-246); the rest is the build-info.cpp timestamp
-cascade (harmless relink of the downstream targets). NOT
-deployed: the install dir still holds the 10-28 ACTX binaries
-(2822ce088 tree, the B17 swap source) - swap at the next stop
-window. If the 10% trigger feels wrong after live use: one
-constant to edit, ~5 min incremental rebuild. Also recorded:
+cascade (harmless relink of the downstream targets). NOT deployed
+AT THAT TIME (SUPERSEDED 10-28 afternoon: the user installed
+these e78fe1b51 binaries into the install dir - the timing-gate
+llama-server.exe is LIVE; see Services). If the 10% trigger
+feels wrong after live use: one constant to edit, ~5 min
+incremental rebuild. Also recorded:
 first live 27B-scale shrink 262144 -> 163840 in 129 ms
 (llama.log :168535-168537, 10-28 ~02:34, 30 s idle after the
 73319-token conversation) - far under the 0.5-1 s estimate;
@@ -161,16 +192,15 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   wipe, a rerun from a clean shell = fresh configure + full
   recompile of the fast TUs (the SYCL TU obj survives).
   Recipe: NOTES.md N3.
-- Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-28 ~02:32
-  swap DONE by the user - now holds the ACTX binaries; the live
-  child runs from here, see Services). Swap = copy build\bin over
-  this dir (service stop window: running exe/DLLs are locked) +
-  swap the macube spawn line (hands-off) = B17, COMPLETE. The
-  next swap (when build\bin is newer than the install dir) needs
-  the same stop window; the install dir is BEHIND build\bin
-  (build\bin @ 2b10cfb42 10-28 rebuild, not yet deployed - it
-  has no code changes vs the install dir's tree state, it is the
-  same tree recompiled on the VS 2026 toolchain).
+- Install tree: `C:\Users\admin\.local\3nary-sycl\` - the live
+  child spawns from here. NOW holds the e78fe1b51 (timing-gate)
+  binaries: the user copied build\bin over it on 10-28
+  (afternoon, after the 16:12 recovery rebuild) - the gated tg
+  print behavior is confirmed live in llama.log. Before: the
+  ACTX binaries (2822ce088 tree) since the 10-28 ~02:32 B17
+  swap. Swap procedure (for the next one): copy build\bin over
+  this dir at a service stop window (running exe/DLLs are
+  locked). The install dir is IN SYNC with build\bin.
   F30 note stands: the dlopen path is dead in this fork; SYCL works
   only via the static link in a SYCL=ON build.
 - Workspace: working dir `C:\Users\admin\source\ai\llama.3nary`,
@@ -182,11 +212,20 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 ## Services (macube)
 
 - LIVE (do not disturb, user-owned): model Qwen3.8-27B-UD-Q6_K,
-  child PID 2296 on 127.0.0.1:65299 (WS 13.7 GB), router PID
-  27804 on 0.0.0.0:8080. The child spawns the INSTALL-dir exe
-  (C:\Users\admin\.local\3nary-sycl\llama-server.exe) - ACTX
-  binaries since the 10-28 ~02:32 swap. Spawn line VERBATIM
-  (llama-error.log :15408-15473): --adaptive-ctx full --api-key-
+  CURRENT child 49822 on 127.0.0.1:49822 (layer mode, 4 auto
+  slots, unified KV, n_ctx_slot 262144), NEW router on
+  0.0.0.0:8080 (PID not recorded) - the user restarted the whole
+  service after the F39 -np 2 test (old router died ~3.32 min,
+  llama-error.log:16752; 49822 spawned at 10.27 min with the
+  ORIGINAL config, :16786+). Child rotation since the handover:
+  2296 -> 53777 -> 51396 (F39 test 1, default config) -> 57327
+  (F39 test 2, --parallel 2) -> 49822. The child spawns the
+  INSTALL-dir exe (C:\Users\admin\.local\3nary-sycl\llama-
+  server.exe) - now the e78fe1b51 (timing-gate) binaries,
+  user-installed 10-28 (afternoon). Spawn line VERBATIM
+  (llama-error.log :15408-15473; re-confirmed WITHOUT --parallel
+  for 51396 at :16565-16628 and for 49822 at :16786+):
+  --adaptive-ctx full --api-key-
   file C:\Users\admin\source\macube\config\local\llama-api-keys.
   txt --alias Qwen3.8-27B-UD-Q6_K --batch-size 6144 --cache-type-
   k q5_1 --cache-type-v q5_1 --ctx-size 163840 --flash-attn on
@@ -211,20 +250,36 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   rows x ~27.5 KB/token (q5_1 KV) ~ 2.65 GiB on-device copy per
   direction. First post-handover decode: 91559-token
   conversation tg 12.53 t/s (single-stream baseline for F39),
-  prompt eval 186.29 t/s. The F37 risk zone is LIVE (full 262144
-  ctx + 8 GiB default host prompt cache + 91k-token
-  conversations); if the bad-alloc class recurs, add --cache-ram
-  0 to the spawn line at the next stop window (user-owned
-  config). Future `adaptive ctx: KV cache shrunk/grown in place
-  in X ms` timings land in macube/logs/llama.log - record the
-  first shrink + regrow pair into FINDINGS (closes B17). The
-  user is still bisecting the extraArgs tail (-ngl 99, -np 2,
-  -c 262144); outcome pending (prediction table in F31).
+  prompt eval 186.29 t/s. F39 MEASURED 10-28 (afternoon) on this
+  config: two concurrent chats batched (2 of the 4 auto slots,
+  one 2-seq decode batch), per-stream tg_3s 10.7-10.8, SUM ~21.4
+  t/s ~ 76% of the 2/H roofline vs solo ~14 at comparable ctx;
+  the chats were 27.6K + 7K (NOT max-ctx-pinned) -> the
+  pre-registered pipeline gate is not met (FINDINGS F39
+  [measured]/[decision]). The extraArgs bisection: -np 2
+  ANSWERED + root-caused (kv_unified silently false -> per-slot
+  KV 2x + total adaptive-ctx cap 524288 by design; child healthy;
+  the user's GPU2/CPU monitor read UNPROVEN - F39 [certain]);
+  -ngl 99 / -c 262144 outcome still pending (prediction table in
+  F31). The F37 risk zone is LIVE (full 262144 ctx + 8 GiB
+  default host prompt cache + 82k-106k-token conversations); if
+  the bad-alloc class recurs, add --cache-ram 0 to the spawn line
+  at the next stop window (user-owned config). Future `adaptive
+  ctx: KV cache shrunk/grown in place in X ms` timings land in
+  macube/logs/llama.log - the first live shrink (129 ms,
+  262144 -> 163840, in the previous refresh entry) + the first
+  regrow still need to land in FINDINGS (closes B17; regrow
+  needs a > 163840-token conversation, largest so far 106815).
   Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080 -State
   Listen` then the child via ParentProcessId (process details
   access-denied for non-service ports).
-- History: 27804/2296 (10-28 ~02:32 router/child, CURRENT - ACTX
-  install, --adaptive-ctx full, Q6_K), 15516/22456 (10-27 evening
+- History: (new router, PID not recorded)/49822 (10-28 afternoon,
+  CURRENT - e78fe1b51 install, original config after the user's
+  post-F39 restart), 27804/2296 (10-28 ~02:32 router/child -
+  ACTX install, --adaptive-ctx full, Q6_K, the B17 handover;
+  replaced by the user's post-F39 restart), 51396 (F39 test-1
+  child, default config, 2-chat TG measured), 57327 (F39 test-2
+  child, --parallel 2, healthy), 15516/22456 (10-27 evening
   router/child @ 52439, layer mode after the user's tensor
   revert; replaced 10-28 ~02:32 by the B17 handover), 15516/19760
   (10-27 9:11 AM router/child, tensor, replaced by the user's
@@ -360,9 +415,11 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `dff5d5cfe` (docs : private sync
-  after the timing-log gate - build state, 129 ms shrink record,
-  F40 status). Before it: `e78fe1b51` (server : gate periodic
+- branch `main`, pushed HEAD: `722ce512c` (docs : private sync -
+  build recovery GREEN, VS-2022-shell root cause + build-
+  sycl.ps1 hardening). Before it: `dff5d5cfe` (docs : private
+  sync after the timing-log gate - build state, 129 ms shrink
+  record, F40 status), `e78fe1b51` (server : gate periodic
   tg/tp log lines on a >= 10% rate change), `796c40945`
   (docs : private sync after B17 handover - F39 pipeline
   assessment, VS 2026 build recipe, live state),
@@ -372,9 +429,9 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   `5b8aa1fad` (llama : copy KV rows on device in the in-place
   cache regrow), `9c8772ed8` (llama : adaptive ctx, in-place
   runtime resize), `1011b639d` (fit : tensor-mode context
-  fitting). The docs commit for THIS round (VS-2022-shell
-  recovery + script hardening) is PENDING. Full list:
-  NOTES.md N12.
+  fitting). The docs commit for THIS round (F39 outcome + -np 2
+  root cause + the post-F39 service restart) is PENDING.
+  Full list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
@@ -388,8 +445,9 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   (247 steps), same VS 2026 toolchain (cl 14.51.36231 + icx
   2026.1.1, Release); ggml-sycl.dll untouched (the 03:24 wide
   rebuild obj survived). build\bin @ e78fe1b51 code state =
-  the (late) entry below; NOT deployed: install dir still
-  holds the 10-28 ACTX binaries (2822ce088 tree).
+  the (late) entry below; DEPLOYED 10-28 (afternoon) by the
+  user: the install dir now holds these e78fe1b51 binaries (the
+  timing-gate llama-server.exe is LIVE; see Services).
 - `build\bin`: 10-28 (late) INCREMENTAL build via build-sycl.ps1
   at HEAD e78fe1b51 (the timing-log gate), same VS 2026 toolchain,
   249 steps: only server-context.cpp.obj recompiled (step 243) +
@@ -483,35 +541,49 @@ block; grep by port 8080/58452.
 
 ## Next (10-28)
 
-1. Record the first live 27B-scale `adaptive ctx: KV cache shrunk
-   in place in X ms` + the first regrow timing from macube/logs/
-   llama.log (262144 <-> 163840, ~2.65 GiB per direction) into
-   FINDINGS - closes B17.
+1. F40 (bad-alloc) write-up into FINDINGS - analysis done (the
+   "Previous refresh" entry above holds the state: machine
+   commit-exhaustion root cause, the prompt-cache site CATCHES
+   bad_alloc + self-throttles 0.4x, all bad_alloc ports were
+   TENSOR-mode children, the [NNNNN] prefix is the PORT not a
+   PID); write it on user confirmation (now or at the stop
+   window).
 2. [B] The user's call on --cache-ram 0 (the F37 risk zone is
    LIVE: full 262144 ctx + 8 GiB default host prompt cache +
-   91k-token conversations); if the bad-alloc class recurs, add
-   it to the spawn line at the next stop window (user-owned
-   config).
-3. F39 measurement: 2-slot TG (two concurrent chats) vs the
-   12.53 t/s single-stream baseline on the live dual-card setup;
-   the decision gate for the pipeline (the ~2x KV headroom is
-   worth it only if the workload pins both cards at max ctx).
-4. B14 draft re-presentation (priority RAISED by F37/F38 - the
-   structural fix for BOTH reported issues); implement only on
-   explicit user confirmation.
-5. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
-   -c 262144; prediction table in F31) - fold into FINDINGS when
-   reported.
-6. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
+   82k-106k-token conversations); the F40 recommendation feeds
+   it; if the bad-alloc class recurs, add it to the spawn line
+   at the next stop window (user-owned config).
+3. DONE 10-28 (afternoon): F39 measurement - FINDINGS F39
+   [measured]/[certain]/[decision]: 2 chats batched on the
+   default config (sum ~21.4 t/s, ~76% of 2/H, chats 27.6K+7K,
+   NOT max-ctx-pinned) -> pipeline gate not met, NOT building;
+   -np 2 root-caused (per-slot KV 2x + total adaptive-ctx cap
+   524288 by design; child healthy; monitor read unproven) ->
+   recommended dropped, default (auto 4 slots + unified KV)
+   kept.
+4. Record the first live 27B-scale `adaptive ctx: KV cache grown
+   in place in X ms` regrow timing from macube/logs/llama.log
+   (262144 <-> 163840, ~2.65 GiB per direction) into FINDINGS -
+   closes B17 (the 129 ms shrink is recorded in the previous
+   refresh entry; regrow needs a > 163840-token conversation,
+   largest so far 106815).
+5. B14 draft re-presentation (priority RAISED by F37/F38 - the
+   structural fix for BOTH reported issues; F39 keeps B14 as
+   the capacity vehicle); implement only on explicit user
+   confirmation.
+6. [B] Await the user's extraArgs bisection outcome, remainder:
+   -ngl 99 / -c 262144 (-np 2 is ANSWERED, F39) - fold into
+   FINDINGS when reported (prediction table in F31).
+7. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
    tensor bench (N17; GDN correctness check first).
-7. B7a (this fork, next code item): startup loud-fail on unfittable
+8. B7a (this fork, next code item): startup loud-fail on unfittable
    ctx/KV + closed -sm/-dev gate (the old tensor warn-then-continue
    target is GONE - F32; remaining: the non-tensor startup ctx/KV
    loud-fail + the parse gate).
-8. B13 recon (read-only, clone hosts live service): diff fork vs
+9. B13 recon (read-only, clone hosts live service): diff fork vs
    clone meta backend (upstream PRs #26490/#27574), ternary enum
    mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
    divergent work map (F25), the seq_rm fix question (server-
    context.cpp ~:3444, relevant to F28). THEN port commit-by-
    commit on user-confirmed scope.
-9. Refresh private/ + commit+push at each milestone.
+10. Refresh private/ + commit+push at each milestone.
