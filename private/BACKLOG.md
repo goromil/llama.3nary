@@ -42,7 +42,14 @@ Each item: what / why / how / exit criteria / status.
 > 2822ce088 green); B14 priority RAISED (F37 tensor-only bad
 > allocation + F38 structural two-chat TG halving both point at
 > B14); B17 added (install-dir swap + spawn-line handover, incl.
-> the proposed --cache-ram 0, user call).
+> the proposed --cache-ram 0, user call). 10-28: B17 HANDOVER DONE
+> (user-executed ~02:32: install dir now ACTX, spawn line on
+> `--adaptive-ctx full`, model now Qwen3.8-27B-UD-Q6_K, child 2296
+> @ 65299, ctx loaded at the 262144 max; 27B idle cycle re-sized to
+> 262144 <-> 163840 = ~2.65 GiB per direction); F39 (two-chat
+> pipeline assessment: no throughput win over B14, real win = ~2x
+> KV headroom) recorded; build recipe moved to VS 2026 (14.51 +
+> oneAPI 2026.1.1, -Clean rebuild green).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -415,6 +422,33 @@ Each item: what / why / how / exit criteria / status.
 - exit: service up on the new line; child log shows the adaptive-ctx
   load-shrink to 16284 and on-demand grow/shrink; no bad-alloc
   recurrence; 27B-scale regrow timing recorded in FINDINGS.
-- status: OPEN (10-27 evening) - binaries READY (build\bin @
-  2822ce088, wide rebuild green 10-27 evening); awaits the user stop
-  window + the user's call on --cache-ram 0.
+- status: HANDOVER DONE 10-28 ~02:32 (executed by the user;
+  verified from the macube logs, spawn line at llama-error.log
+  :15408-15473). The install dir now holds the ACTX binaries (the
+  child starts on `--adaptive-ctx`, which the PRE-ACTX binary
+  rejects); the spawn line was swapped (`--fit-ctx 16284
+  --fit-ctx-max 262144` deleted, `--adaptive-ctx full` added) and
+  the model moved to Qwen3.8-27B-UD-Q6_K. The user OMITTED
+  --adaptive-ctx-min/-max/-idle (auto resolution) and did NOT add
+  --cache-ram 0 (still the user's open call). Resolved params
+  (child startup: `adaptive ctx: mode=full base=163840 max=262144
+  idle=30s`, then `n_ctx_slot = 262144`): base = 163840 (from
+  --ctx-size), max = 262144 (auto = all free memory, capped by the
+  262144 training ctx; the full-mode load-fit settled at the max),
+  idle = 30 s (default). NOTE: the 4096 auto-min is NOT the shrink
+  target - try_shrink_ctx_idle (server-context.cpp:1702-1770)
+  shrinks to BASE (n_slot_floor = n_ctx_base / (unified ? 1 :
+  n_seq_max)), so the 27B idle cycle here is 262144 <-> 163840 =
+  98304 rows x ~27.5 KB/token (q5_1 KV) = ~2.65 GiB on-device copy
+  per direction; this SUPERSEDES the 262144->16284 ~6.3 GiB
+  estimate (that one assumed the old fit floor as the base). First
+  post-handover decode: 91559-token conversation at tg 12.53 t/s
+  (layer mode, single stream; prompt eval 186.29 t/s on 364
+  tokens) - the single-stream baseline for the F39 measurement.
+  Remaining before CLOSED: (a) record the first live `adaptive
+  ctx: KV cache shrunk in place in X ms` + the first regrow timing
+  from llama.log (the 2.65 GiB 27B-scale cycle) into FINDINGS;
+  (b) watch for the F37 bad-alloc class - the risk zone is LIVE
+  (full 262144 ctx + the 8 GiB default host prompt cache + 91k-
+  token conversations); if it recurs, add --cache-ram 0 to the
+  spawn line at the next stop window (user-owned config).

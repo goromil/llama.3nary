@@ -1,39 +1,51 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-27 (evening) - B15 COMPLETE, 3 commits
-pushed: 9c8772ed8 (adaptive-ctx core + 3 E2E-found bug fixes),
-5b8aa1fad (llama : regrow KV-row copy on device via
-ggml_backend_tensor_copy between row-limited views, replaces the
-host-buffer round trip up to ~6 GiB), 2822ce088 (server : skip the
-idle KV shrink while retained slot KV does not fit the base floor). E2E on the FINAL binaries (gemma-4-E4B, port 18200): GROW content-
-verified (ZQX-7741 survived 8192->32768 at 15054 tokens; 24054-
-token prompt clean post-grow), FIRST EVER SUCCESSFUL IN-PLACE
-SHRINK 16384->8192 in 68 ms, retained KV intact across the shrink
-(BLT-2489), over-cap clean 400 EXCEED_CONTEXT_SIZE, server still
-serving. Wide rebuild via build-sycl.ps1 green (247 steps, ~3
-min, build\bin @ 2822ce088, reconfigure auto-picked the new HEAD).
-Retained-KV shrink policy: C (never discard retained KV) shipped,
-refined by the pre-check so a blocked shrink never reaches the
-cell resize (F35). The 27B-scale shrink (262144->16284, ~6.3 GiB)
-est. 0.5-1 s - its timing needs the B17 service-stop window. The
-old --fit-ctx/-fitc, --fit-ctx-max/-fitm, --grow-ctx-max flags are
-HARD DELETED: the live spawn line must be swapped at the next
-install or the server will not start. NEW 10-27 (evening): F36
-(B70 single-GPU references vs the live dual-card setup - the
-41-46 t/s single-card decode floor), F37 (tensor-mode "bad
-allocation" = host-side std::bad_alloc; proven host site = the 8
-GiB default prompt cache; user reverted to -sm layer; --cache-ram
-0 proposed), F38 (two-chat TG halving is structural: per-layer
-blocking P2P waits + no slot pipelining -> B14 priority RAISED).
-Carried: tensor-fit SHIPPED (1011b639d, F32); KV wall two stages
-(F31); SYCL build fixed (F30); B12 DONE (7cb134632); F28 CLOSED
-10-27; B14 PARKED (priority raised); B16 PARKED.
-NEXT: B17 handover (install-dir swap + spawn line, incl. the
-proposed --cache-ram 0 - user call) in a user stop window ->
-measure the 27B-scale on-device copy timing in that window ->
-B14 draft re-presentation -> B7a -> B13 recon. Await the user's
-extraArgs bisection outcome + a free card for the Q5_K_S tensor
-bench (N17).
+Last refresh: 2026-10-28 - B17 HANDOVER DONE (user-executed ~02:32):
+install dir now ACTX (the child starts on --adaptive-ctx, which
+the PRE-ACTX binary rejects), spawn line swapped to --adaptive-ctx
+full, model moved Q5_K_S -> Qwen3.8-27B-UD-Q6_K. New live: router
+PID 27804 @ 0.0.0.0:8080, child PID 2296 @ 127.0.0.1:65299 (WS
+13.7 GB). Adaptive-ctx resolved: mode=full base=163840 max=262144
+idle=30s; the full-mode load-fit settled at the MAX, so
+n_ctx_slot = 262144. The idle shrink goes to BASE (163840), not
+the 4096 auto-min (try_shrink_ctx_idle), so the 27B idle cycle is
+262144 <-> 163840 = 98304 rows x ~27.5 KB/token = ~2.65 GiB
+on-device copy per direction (supersedes the 262144->16284 ~6.3
+GiB estimate). First post-handover decode: 91559-token
+conversation tg 12.53 t/s single-stream, prompt eval 186.29 t/s -
+the single-stream baseline for the F39 measurement. The user
+omitted --adaptive-ctx-min/-max/-idle (auto resolution) and did
+NOT add --cache-ram 0 (open call; the F37 bad-alloc risk zone is
+LIVE: full 262144 ctx + 8 GiB default host prompt cache + 91k-
+token conversations). Build recipe moved to VS 2026: the first
+attempt failed because changing CMAKE_C_COMPILER on the existing
+Ninja cache triggers a cache-wipe re-configure that DROPS the
+original -D args (Debug + cl-as-CXX; the C2059 at
+server-context.cpp:3848 was a cl artifact, not a source bug); the
+-Clean rerun was GREEN (553 steps, C = cl 14.51.36231, CXX = icx
+2026.1.1, Release, build\bin @ 2b10cfb42). Rule: after ANY
+compiler change, rebuild with -Clean. CMake stays standalone
+4.4.4 (VS 2026 bundles 4.3.1, fallback only). build-sycl.ps1 is
+GITIGNORED by design (.gitignore:46 /build*) - machine-local, so
+the recipe change is recorded here, not in a commit. F39
+recorded: two-chat pipeline assessment - steady-state aggregate
+EXACTLY ties the B14-DP aggregate (2/H), per-stream TG tied
+(1/H), the "copy limited" premise FALSE for layer mode (only the
+20 KB residual stream crosses per token, async in the meta
+backend; the blocking q8_1 weight copies are tensor/row-mode
+only); real win = ~2x KV headroom (~40 GB vs ~20 GB DP); real
+cost = a third execution model upstream would not merge;
+recommend MEASURE 2-slot TG vs the 12.53 t/s baseline first.
+Carried: B15 COMPLETE (3 commits pushed, last 2822ce088; E2E on
+the final binaries: first in-place shrink 16384->8192 in 68 ms,
+grow content-verified, retained KV intact, over-cap clean); B14
+still PARKED (priority raised, F37/F38); B16 PARKED.
+NEXT: record the first live 27B-scale shrink + regrow timings
+from llama.log into FINDINGS (closes B17) -> --cache-ram 0 user
+call (next stop window if F37 recurs) -> F39 measurement (2-slot
+TG) -> B14 draft re-presentation -> extraArgs bisection outcome
+-> Q5_K_S tensor bench (N17) when a card is free -> B7a -> B13
+recon.
 
 ## Environment
 
@@ -42,19 +54,32 @@ bench (N17).
   64 GB RAM. GGML_SYCL_DEVICE is a NO-OP in this fork (F9). Pin:
   `-dev SYCL0` or `--split-mode none -mg 0`. Tensor mode INTENTIONALLY
   uses both (`-dev SYCL0,SYCL1`, F19/N14).
-- Build tree: `build/` (Ninja, Release, shared libs, tests OFF
-  since the 10-27 script run). Configure ONLY via build-sycl.ps1:
-  it pins C:\Program Files\CMake\bin\cmake.exe (4.4.4); mixing in
-  the VS-bundled CMake 3.31.6 regenerates the build rules and
-  forces a full rebuild (10-27 root cause of the repeated full
-  builds). Recipe: NOTES.md N3 (oneAPI + vcvars64 Professional +
-  oneAPI lib prepended to LIB).
-- Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-26 16:38
-  install, PRE-ACTX - B15 binaries not in it). The LIVE CHILD RUNS
-  FROM HERE (spawn line re-derived 10-27 evening, see Services).
-  Swap = copy build\bin over this dir (service stop window:
-  running exe/DLLs are locked) + swap the macube spawn line
-  (hands-off) = B17.
+- Build tree: `build/` (Ninja, Release, shared libs, tests OFF).
+  Configure ONLY via build-sycl.ps1 (GITIGNORED by design,
+  .gitignore:46 `/build*` - a machine-local recipe; changes are
+  recorded in this file, never committed). VS 2026 preferred (18.x
+  first, 2022 fallback): C = MSVC 14.51.36231 (cl, VS 18),
+  CXX = IntelLLVM icx 2026.1.1 (oneAPI 2026.1.1), Ninja 1.13.2
+  from VS 18. CMake stays the standalone
+  C:\Program Files\CMake\bin\cmake.exe (4.4.4) - VS 2026 bundles
+  4.3.1 (fallback only); mixing CMake versions regenerates the
+  build rules and forces a full rebuild (10-27 root cause of the
+  repeated full builds). GOTCHA 10-28: changing CMAKE_C_COMPILER
+  on the existing Ninja cache triggers a cache-wipe re-configure
+  that DROPS the original -D args (observed: Debug + cl-as-CXX
+  for both languages, then a C2059 at server-context.cpp:3848 -
+  a cl artifact, the tree compiles clean under icx); after ANY
+  compiler change, rebuild with -Clean. Recipe: NOTES.md N3.
+- Install tree: `C:\Users\admin\.local\3nary-sycl\` (10-28 ~02:32
+  swap DONE by the user - now holds the ACTX binaries; the live
+  child runs from here, see Services). Swap = copy build\bin over
+  this dir (service stop window: running exe/DLLs are locked) +
+  swap the macube spawn line (hands-off) = B17, COMPLETE. The
+  next swap (when build\bin is newer than the install dir) needs
+  the same stop window; the install dir is BEHIND build\bin
+  (build\bin @ 2b10cfb42 10-28 rebuild, not yet deployed - it
+  has no code changes vs the install dir's tree state, it is the
+  same tree recompiled on the VS 2026 toolchain).
   F30 note stands: the dlopen path is dead in this fork; SYCL works
   only via the static link in a SYCL=ON build.
 - Workspace: working dir `C:\Users\admin\source\ai\llama.3nary`,
@@ -66,33 +91,53 @@ bench (N17).
 ## Services (macube)
 
 - LIVE (do not disturb, user-owned): model Qwen3.8-27B-UD-Q6_K,
-  child PID 22456 on 127.0.0.1:52439 (WS 13.36 GB), router PID
-  15516 on 0.0.0.0:8080. The child spawns the INSTALL-dir exe
-  (C:\Users\admin\.local\3nary-sycl\llama-server.exe). Spawn line
-  re-derived 10-27 (evening) from macube/logs/llama-error.log
-  (:14671): --ctx-size 163840 --fit on --fit-ctx 16284
-  --fit-ctx-max 262144 --cache-type-k q5_1 --cache-type-v q5_1
-  --flash-attn on --split-mode layer --batch-size 6144 --threads
-  56 --threads-batch 28 --ubatch-size 6144 --n-gpu-layers all
-  --numa distribute --jinja --rope-scaling yarn --load-mode none
-  --reasoning-budget 4000 --reasoning-preserve
-  --image-min/max-tokens 1024/4000 + api-key-file + mmproj BF16.
-  NOTE 10-27 (evening): the user REVERTED this child to
-  --split-mode layer after the tensor-mode bad-allocation episodes
-  (F37; the day's tensor child was 19760 @ 56762, which had
-  restarted 5x in ~4 h: 54418 -> 14088, -> 23940, -> 17416, ->
-  17680, -> 19760). The old --fit-ctx flags work here only because
-  the install dir is still PRE-ACTX; at the B17 swap the line must
-  move to --adaptive-ctx (the old flags are gone from the new
-  binary). F28's "CLONE tree" claim is STALE (install dir, not
-  clone). The user is still bisecting the extraArgs tail (-ngl 99,
-  -np 2, -c 262144); outcome pending (prediction table in F31).
+  child PID 2296 on 127.0.0.1:65299 (WS 13.7 GB), router PID
+  27804 on 0.0.0.0:8080. The child spawns the INSTALL-dir exe
+  (C:\Users\admin\.local\3nary-sycl\llama-server.exe) - ACTX
+  binaries since the 10-28 ~02:32 swap. Spawn line VERBATIM
+  (llama-error.log :15408-15473): --adaptive-ctx full --api-key-
+  file C:\Users\admin\source\macube\config\local\llama-api-keys.
+  txt --alias Qwen3.8-27B-UD-Q6_K --batch-size 6144 --cache-type-
+  k q5_1 --cache-type-v q5_1 --ctx-size 163840 --flash-attn on
+  --fit on --host 127.0.0.1 --image-max-tokens 4000 --image-min-
+  tokens 1024 --jinja --load-mode none --log-verbosity 3 --model
+  E:\DataVolume\Models\Qwen3.8-27B-UD-Q6_K\Qwen3.8-27B-UD-Q6_K.
+  gguf --mmproj E:\DataVolume\Models\Qwen3.8-27B-UD-Q6_K\mmproj-
+  BF16.gguf --n-gpu-layers all --numa distribute --port 65299
+  --presence-penalty 0.0 --reasoning-budget 4000
+  --reasoning-preserve --rope-scaling yarn --split-mode layer
+  --temperature 1.0 --threads 56 --threads-batch 28 --top-k 20
+  --top-p 0.95 --ubatch-size 6144 --webui-mcp-proxy --min-p 0.0.
+  CHANGES vs the 10-27 line: --fit-ctx 16284 --fit-ctx-max
+  262144 DELETED, --adaptive-ctx full ADDED, model Q5_K_S ->
+  Q6_K; the user OMITTED --adaptive-ctx-min/-max/-idle (auto) and
+  did NOT add --cache-ram 0 (open call). Adaptive-ctx state at
+  handover (child startup): `adaptive ctx: mode=full base=163840
+  max=262144 idle=30s`, load-fit settled at the max ->
+  n_ctx_slot = 262144. The idle shrink target is BASE (163840),
+  not the 4096 auto-min (try_shrink_ctx_idle, server-context.cpp:
+  1702-1770), so the 27B idle cycle = 262144 <-> 163840 = 98304
+  rows x ~27.5 KB/token (q5_1 KV) ~ 2.65 GiB on-device copy per
+  direction. First post-handover decode: 91559-token
+  conversation tg 12.53 t/s (single-stream baseline for F39),
+  prompt eval 186.29 t/s. The F37 risk zone is LIVE (full 262144
+  ctx + 8 GiB default host prompt cache + 91k-token
+  conversations); if the bad-alloc class recurs, add --cache-ram
+  0 to the spawn line at the next stop window (user-owned
+  config). Future `adaptive ctx: KV cache shrunk/grown in place
+  in X ms` timings land in macube/logs/llama.log - record the
+  first shrink + regrow pair into FINDINGS (closes B17). The
+  user is still bisecting the extraArgs tail (-ngl 99, -np 2,
+  -c 262144); outcome pending (prediction table in F31).
   Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080 -State
   Listen` then the child via ParentProcessId (process details
   access-denied for non-service ports).
-- History: 15516/22456 (10-27 evening router/child, CURRENT -
-  layer mode after the user's tensor revert), 15516/19760 (10-27
-  9:11 AM router/child, tensor, replaced by the user's revert),
+- History: 27804/2296 (10-28 ~02:32 router/child, CURRENT - ACTX
+  install, --adaptive-ctx full, Q6_K), 15516/22456 (10-27 evening
+  router/child @ 52439, layer mode after the user's tensor
+  revert; replaced 10-28 ~02:32 by the B17 handover), 15516/19760
+  (10-27 9:11 AM router/child, tensor, replaced by the user's
+  revert),
   14096/17416 (10-27 3:37 AM, replaced), 17680 (10-27 child,
   replaced), 13988/23940 (10-27 00:05 child, replaced),
   54418->14088 (10-27
@@ -224,13 +269,15 @@ bench (N17).
 
 ## Git
 
-- branch `main`, pushed HEAD: `2822ce088` (server : skip the idle
-  KV shrink while retained slot KV does not fit). Before it:
-  `5b8aa1fad` (llama : copy KV rows on device in the in-place
-  cache regrow), `e141ac25b` (docs : private sync after B15 ship),
-  `9c8772ed8` (llama : adaptive ctx, in-place runtime resize),
-  `1011b639d` (fit : tensor-mode context fitting). Full list:
-  NOTES.md N12.
+- branch `main`, pushed HEAD: `2b10cfb42` (docs : private sync
+  after B15 complete - F36/F37/F38, B17, handover ready). Before
+  it: `2822ce088` (server : skip the idle KV shrink while
+  retained slot KV does not fit), `5b8aa1fad` (llama : copy KV
+  rows on device in the in-place cache regrow), `9c8772ed8`
+  (llama : adaptive ctx, in-place runtime resize), `1011b639d`
+  (fit : tensor-mode context fitting). The docs commit for THIS
+  round (B17 handover + F39 + VS 2026 recipe) is PENDING. Full
+  list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
@@ -238,13 +285,21 @@ bench (N17).
 
 ## Binaries
 
+- `build\bin`: 10-28 WIDE REBUILD GREEN via build-sycl.ps1 -Clean
+  at HEAD 2b10cfb42 on the VS 2026 toolchain (C = cl
+  14.51.36231, CXX = icx 2026.1.1, Release, 553 steps; llama-
+  server.exe relinked 550/553, ggml-sycl.dll 492/553). NOT yet
+  deployed: the install dir (C:\Users\admin\.local\3nary-sycl\)
+  holds the 10-28 user-swapped ACTX binaries (built 10-27 evening
+  at 2822ce088, the B17 swap source) - the live service runs
+  those; same tree state, different toolchain, so a redeploy is
+  not urgent (next stop window only, if ever needed).
 - `build\bin`: 10-27 (evening) WIDE REBUILD via build-sycl.ps1 at
   HEAD 2822ce088 - the reconfigure auto-picked the new HEAD (cmake/
   build-info.cmake git rev-parse), 247 ninja steps, ~3 min, all
   targets relinked incl. llama-server.exe; build\bin in sync with
-  the committed tree. This is the B17 swap source. The install dir
-  (C:\Users\admin\.local\3nary-sycl\) is still PRE-ACTX - the swap
-  is B17 (needs the user stop window).
+  the committed tree. This WAS the B17 swap source (installed
+  10-28 ~02:32 by the user).
 - `build\bin`: 10-25 SYCL=ON rebuild (F30): ggml-sycl.dll 62.8 MB
   (~03:05), ggml.dll (~03:11), exes (~03:12) - the one-time ggml-sycl
   TU compile + 297 downstream steps. Supersedes the 10-23 B12 build.
@@ -274,7 +329,8 @@ bench (N17).
 |---|---|---|
 | Ternary PQ2_0 27B (crashing model) | `C:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PQ2_0\` | PQ2_0 gguf 6.71 GB + mmproj-BF16 888 MB. 64 blocks (48 GDN + 16 full-attn at 3,7,...,63), NO MTP nextn, ternary type 142, qwen35 arch. ssm_out [K=6144, N=5120] PQ2_0. |
 | Ternary PTQ1_0 27B (PREFERRED test model) | `E:\DataVolume\TernaryModels\Ternary-Bonsai-2-27B-PTQ1_0\` | PTQ1_0 gguf 5.54 GB + mmproj. B11 kernel applies. |
-| Qwen3.8-27B-UD-Q5_K_S (target, live service) | `E:\DataVolume\Models\Qwen3.8-27B-UD-Q5_K_S\` | 17.38 GB + mtp-Q4_0 draft 1306 MiB + mmproj-BF16. 65 blocks, 16 full-attn + 48 GDN, embd 5120. Tensor mode proven at 160K ctx (31.9 t/s, N10). |
+| Qwen3.8-27B-UD-Q6_K (LIVE SERVICE since 10-28 handover) | `E:\DataVolume\Models\Qwen3.8-27B-UD-Q6_K\` | gguf + mmproj-BF16. 65 blocks, 16 full-attn + 48 GDN, embd 5120. The user moved the live service from Q5_K_S to Q6_K at the B17 swap. First post-handover decode: tg 12.53 t/s single-stream (91559-token conversation). |
+| Qwen3.8-27B-UD-Q5_K_S (previous live service) | `E:\DataVolume\Models\Qwen3.8-27B-UD-Q5_K_S\` | 17.38 GB + mtp-Q4_0 draft 1306 MiB + mmproj-BF16. 65 blocks, 16 full-attn + 48 GDN, embd 5120. Tensor mode proven at 160K ctx (31.9 t/s, N10). Still the N17 tensor-bench candidate. |
 | Ternary family (small) | `E:\DataVolume\TernaryModels\` | 2B PTQ1_0, 4B PQ2_0 + 4B/9B MTP Q8_0 variants (co-residency candidates, F17). 10-25: the 10/20 small re-exports carry prism.hadamard.version=2 and are REJECTED by this tree (v1 gate, llama-model.cpp:1198-1201) - only the 9/20 27B files load (F32 finding 2). |
 
 KV math (F17): KV q5_1 @131072 = 3072 MiB, draft KV q4_0 = 144 MiB,
@@ -310,33 +366,37 @@ srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
 
-## Next (10-27 evening)
+## Next (10-28)
 
-1. B17 handover (TOP, needs the user stop window): stop the
-   service -> copy build\bin over C:\Users\admin\.local\3nary-sycl\
-   -> swap the macube spawn line (delete --fit-ctx/--fit-ctx-max;
-   add --adaptive-ctx full --adaptive-ctx-min 16284
-   --adaptive-ctx-max 262144 --adaptive-ctx-idle 30; PROPOSED
-   --cache-ram 0, user call) -> start.
-2. In that window: measure the 27B-scale on-device copy timing
-   (262144->16284 load-shrink, ~6.3 GiB, est. 0.5-1 s) + verify
-   the adaptive-ctx lines in the child log.
-3. B14 draft re-presentation (priority RAISED by F37/F38 - the
+1. Record the first live 27B-scale `adaptive ctx: KV cache shrunk
+   in place in X ms` + the first regrow timing from macube/logs/
+   llama.log (262144 <-> 163840, ~2.65 GiB per direction) into
+   FINDINGS - closes B17.
+2. [B] The user's call on --cache-ram 0 (the F37 risk zone is
+   LIVE: full 262144 ctx + 8 GiB default host prompt cache +
+   91k-token conversations); if the bad-alloc class recurs, add
+   it to the spawn line at the next stop window (user-owned
+   config).
+3. F39 measurement: 2-slot TG (two concurrent chats) vs the
+   12.53 t/s single-stream baseline on the live dual-card setup;
+   the decision gate for the pipeline (the ~2x KV headroom is
+   worth it only if the workload pins both cards at max ctx).
+4. B14 draft re-presentation (priority RAISED by F37/F38 - the
    structural fix for BOTH reported issues); implement only on
    explicit user confirmation.
-4. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
+5. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
    -c 262144; prediction table in F31) - fold into FINDINGS when
    reported.
-5. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
+6. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
    tensor bench (N17; GDN correctness check first).
-6. B7a (this fork, next code item): startup loud-fail on unfittable
+7. B7a (this fork, next code item): startup loud-fail on unfittable
    ctx/KV + closed -sm/-dev gate (the old tensor warn-then-continue
    target is GONE - F32; remaining: the non-tensor startup ctx/KV
    loud-fail + the parse gate).
-7. B13 recon (read-only, clone hosts live service): diff fork vs
+8. B13 recon (read-only, clone hosts live service): diff fork vs
    clone meta backend (upstream PRs #26490/#27574), ternary enum
    mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
    divergent work map (F25), the seq_rm fix question (server-
    context.cpp ~:3444, relevant to F28). THEN port commit-by-
    commit on user-confirmed scope.
-8. Refresh private/ + commit+push at each milestone.
+9. Refresh private/ + commit+push at each milestone.

@@ -1743,6 +1743,62 @@ and no tensor mode (so the F37 tensor-only bad_alloc class does not
 apply). Status: B14 remains PARKED (draft pending user); this finding
 raises its priority.
 
+## F39. Two-chat pipeline proposal: assessment (10-28)
+
+[proposed] Follow-up to F38: a steady-state DECODE PIPELINE across
+the two cards - the graph is split at the device boundary and the
+next token's half-graph runs on the other card while the current
+one finishes, so two concurrent chats advance in a staggered
+stream (the "phasing" the user described).
+
+[certain] Steady-state throughput: with a half-graph cost
+T_half = H/2 (H = the current serial per-token cost of the layer
+split), the pipeline emits 1 token per T_half = 2/H aggregate -
+EXACTLY the B14 data-parallel aggregate (2 x 1/H). Roofline: a
+system token reads the full weight set W either way (serial layer
+split, two DP streams, or the pipeline), so nothing beats 2/H
+without reducing the W reads. Per-stream TG: the pipeline serves
+each chat at 1/H, TIED with DP. The pipeline buys NO throughput
+over B14.
+
+[likely false] The "copy limited" premise (a pipeline would hide
+the P2P copies) does not hold for LAYER mode: only the residual
+stream crosses the device boundary per token (embd 5120 f32 = 20
+KB), and the meta backend already runs that asynchronously
+(subgraph split only at PARTIAL tensor boundaries,
+ggml-backend-meta.cpp:2176; per-subgraph async enqueue :2418-2424;
+boundary copy via the butterfly, ggml_backend_tensor_copy_async
+:2343, no host-side sync bubble). The large BLOCKING q8_1 weight
+copies (ggml-sycl.cpp:3288-3387) belong to the tensor/row split
+path, which is not active in layer mode. F38's per-layer wait is
+the sync structure of the layer split itself, not a copy stall a
+pipeline would overlap.
+
+[certain] What the pipeline WOULD buy: KV headroom. DP is capped
+by one card's free VRAM per stream (~10 GB/card here => ~20 GB
+total for two chats); the pipeline shares both cards' KV across
+the SAME chat pair (~20 GB/card => ~40 GB total) - ~2x the usable
+context for the two-chat case at the same 2/H aggregate.
+
+[certain] What it would COST: a third execution model in this
+tree - the graph split at the device boundary, a two-phase async
+decode API on the server, a stage scheduler that pairs the two
+chats, stage-imbalance handling (the 48 GDN + 16 full-attn hybrid
+does not split evenly by device), and MTP/speculative breakage
+(the draft model + reasoning-budget path assumes one blocking
+decode per token). Upstream would not merge it: no mainline
+dual-card SYCL pipeline exists; it is a fork-specific capacity
+hack layered on the meta backend.
+
+[recommendation] Do NOT build it now. B17 is done (10-28); next
+MEASURE: 1-stream TG vs 2-slot TG on the live dual-card setup
+(single-stream baseline recorded 10-28: 12.53 t/s on a 91559-
+token conversation, layer mode). If the measured 2-slot TG lands
+near the 1/H expectation and the workload genuinely pins BOTH
+cards at max ctx simultaneously, the ~2x KV headroom justifies the
+pipeline; otherwise B14 (DP + router) delivers the same aggregate
+with existing execution models and half the risk.
+
 ## For consideration (not approved, no code written)
 
 Deferred design options for the KV/memory wall, in the order discussed
