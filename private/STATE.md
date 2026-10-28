@@ -1,7 +1,42 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-28 - B17 HANDOVER DONE (user-executed ~02:32):
-install dir now ACTX (the child starts on --adaptive-ctx, which
+Last refresh: 2026-10-28 (late) - timing-log gate committed +
+built (e78fe1b51): the periodic tg line printed every 3 s
+regardless of change (~200-350 lines per long task; 75% of the
+current live llama.log - 65347 of 86566 lines) - now printed
+only when tg or tg_3s moved >= 10% vs the last printed value,
+and the prompt-processing tps line got the same gate. One file
+(tools/server/server-context.cpp): TIMINGS_PRINT_CHANGE = 0.10
+constant + per-slot last-printed fields (zeroed in reset()); the
+3 s minimum interval and the final per-task summary are
+unchanged. Incremental build GREEN (249 steps, same VS 2026
+toolchain, build\bin @ e78fe1b51): only server-context.cpp.obj
+recompiled (step 243) + llama-server-impl.dll / llama-server.exe
+relinked (245-246); the rest is the build-info.cpp timestamp
+cascade (harmless relink of the downstream targets). NOT
+deployed: the install dir still holds the 10-28 ACTX binaries
+(2822ce088 tree, the B17 swap source) - swap at the next stop
+window. If the 10% trigger feels wrong after live use: one
+constant to edit, ~5 min incremental rebuild. Also recorded:
+first live 27B-scale shrink 262144 -> 163840 in 129 ms
+(llama.log :168535-168537, 10-28 ~02:34, 30 s idle after the
+73319-token conversation) - far under the 0.5-1 s estimate;
+regrow still pending (needs a > 163840-token conversation,
+largest so far 85807). F40 (bad-alloc) investigation ~80%, NOT
+yet written into FINDINGS: root cause = machine commit
+exhaustion (25.2 GB free commit now vs ~23 GB on 10-27); the
+prompt-cache site (server_prompt_cache::alloc) CATCHES bad_alloc
+and self-throttles 0.4x, so the decode-path bad_alloc is a host
+new surfacing at an arbitrary site; every bad_alloc port was a
+TENSOR-mode child (up to 62 lines on one port), all four layer
+ports (52439/65299/56762/52420) 0 lines; the [NNNNN] child
+prefix is the PORT, not a PID (F37/STATE PIDs to be corrected);
+fit.cpp:219 throws on an MTP draft with SPLIT_MODE_TENSOR, and
+the 10-27 tensor child with --fit-ctx 16284 still started at
+n_ctx_slot = 262144.
+
+Previous refresh: 2026-10-28 - B17 HANDOVER DONE (user-executed
+~02:32): install dir now ACTX (the child starts on --adaptive-ctx, which
 the PRE-ACTX binary rejects), spawn line swapped to --adaptive-ctx
 full, model moved Q5_K_S -> Qwen3.8-27B-UD-Q6_K. New live: router
 PID 27804 @ 0.0.0.0:8080, child PID 2296 @ 127.0.0.1:65299 (WS
@@ -40,12 +75,15 @@ Carried: B15 COMPLETE (3 commits pushed, last 2822ce088; E2E on
 the final binaries: first in-place shrink 16384->8192 in 68 ms,
 grow content-verified, retained KV intact, over-cap clean); B14
 still PARKED (priority raised, F37/F38); B16 PARKED.
-NEXT: record the first live 27B-scale shrink + regrow timings
-from llama.log into FINDINGS (closes B17) -> --cache-ram 0 user
-call (next stop window if F37 recurs) -> F39 measurement (2-slot
-TG) -> B14 draft re-presentation -> extraArgs bisection outcome
--> Q5_K_S tensor bench (N17) when a card is free -> B7a -> B13
-recon.
+NEXT: F40 write-up + 129 ms shrink record + port-not-PID
+corrections into FINDINGS -> --cache-ram 0 user call (the F40
+recommendation feeds it; the F37 risk zone is LIVE; the
+timing-gate binary waits for the same stop window) -> F39
+measurement (2-slot TG vs the 12.53 t/s baseline; recipe: two
+concurrent chats, per-slot tg read from llama.log) -> B17
+regrow timing (needs a > 163840-token conversation) -> B14
+draft re-presentation -> extraArgs bisection outcome -> Q5_K_S
+tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Environment
 
@@ -269,15 +307,18 @@ recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `2b10cfb42` (docs : private sync
-  after B15 complete - F36/F37/F38, B17, handover ready). Before
-  it: `2822ce088` (server : skip the idle KV shrink while
-  retained slot KV does not fit), `5b8aa1fad` (llama : copy KV
-  rows on device in the in-place cache regrow), `9c8772ed8`
-  (llama : adaptive ctx, in-place runtime resize), `1011b639d`
-  (fit : tensor-mode context fitting). The docs commit for THIS
-  round (B17 handover + F39 + VS 2026 recipe) is PENDING. Full
-  list: NOTES.md N12.
+- branch `main`, pushed HEAD: `e78fe1b51` (server : gate
+  periodic tg/tp log lines on a >= 10% rate change). Before it:
+  `796c40945` (docs : private sync after B17 handover - F39
+  pipeline assessment, VS 2026 build recipe, live state),
+  `2b10cfb42` (docs : private sync after B15 complete -
+  F36/F37/F38, B17, handover ready), `2822ce088` (server : skip
+  the idle KV shrink while retained slot KV does not fit),
+  `5b8aa1fad` (llama : copy KV rows on device in the in-place
+  cache regrow), `9c8772ed8` (llama : adaptive ctx, in-place
+  runtime resize), `1011b639d` (fit : tensor-mode context
+  fitting). The docs commit for THIS round (timing-gate state +
+  F40 status) is PENDING. Full list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
@@ -285,6 +326,16 @@ recon.
 
 ## Binaries
 
+- `build\bin`: 10-28 (late) INCREMENTAL build via build-sycl.ps1
+  at HEAD e78fe1b51 (the timing-log gate), same VS 2026 toolchain,
+  249 steps: only server-context.cpp.obj recompiled (step 243) +
+  llama-server-impl.dll / llama-server.exe relinked (245-246);
+  the other 246 steps are the build-info.cpp timestamp cascade
+  (everything downstream of llama.dll relinked - known harmless
+  behavior when build-info regens). NOT deployed: install dir
+  still holds the 10-28 ACTX binaries (2822ce088 tree); the
+  timing-gate llama-server.exe swaps in at the next stop window
+  (full build\bin copy = established procedure).
 - `build\bin`: 10-28 WIDE REBUILD GREEN via build-sycl.ps1 -Clean
   at HEAD 2b10cfb42 on the VS 2026 toolchain (C = cl
   14.51.36231, CXX = icx 2026.1.1, Release, 553 steps; llama-
