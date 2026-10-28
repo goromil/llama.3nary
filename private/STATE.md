@@ -1,6 +1,46 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-28 (afternoon) - F39 measurement DONE +
+Last refresh: 2026-10-28 (evening) - user reply to the F39 report,
+four things:
+(1) The -np 2 host placement is CONFIRMED by the user (supersedes
+the afternoon "UNPROVEN" read in F39/STATE): with -np 2 the MODEL
++ KV sit on the HOST - child 57327 could not generate a single
+token (task 0 launched, zero timing lines); after the first
+unload the model+KV come back onto GPU2 and it circles, very
+slow, every time lately; one historical -np 2 -c 256k run worked
+with both GPUs full AND CPU mem at 100% all day (TG ~5). The
+user's arithmetic holds: 27G model + 14G KV = 31G on two 32G
+cards should leave ~half a card free; the failed trial showed the
+cards almost empty. New log evidence recorded in F39: 54674
+(Q6_K, -np 2) HARD KV failure (696 MiB direct alloc FAILED on
+SYCL1 - the co-resident 53059 Q5_K_S load stole the card; 53059
+was a MISTAKE load per the user, since unloaded; Q6_K is the
+standing preference), 53777 (Q6_K, -np 2) CPU-class trial (0.49-
+22 t/s prompt eval, zero alloc errors, "cannot start a single
+chat"), and the SYCL-MEMTRACE semantics (FAILED-only by default;
+env GGML_SYCL_MEMTRACE=1/2 for OK traces) - so the 53777/57327
+host placement has NO logged trigger and no known silent code
+path; a clean repro (single Q6_K model, no co-resident child,
+-np 2, GGML_SYCL_MEMTRACE=1) is queued for a stop window.
+(2) B14 (twin-server + router) REJECTED by the user: "I will
+never start. It was dead end." - removed as the capacity vehicle
+(F39 [decision], BACKLOG B14, and this file updated).
+(3) The alternating 2-chat pipeline draft project written at
+DESIGN-alternating-pipeline.md (BACKLOG B18) on the user's
+request ("it deserve to look at the project") - design only, no
+code; the idea was recorded in F39 [proposed] (the user asked
+"can you find this idea somewhere?" - yes, that block).
+(4) The 76% batch verdict is DISPUTED by the user (repeated tests
+far from 2x); F39 [disputed] holds the per-step decomposition
+(solo ~= W + A, 2-seq ~= W + 2A, A ~= 22 ms - the weight set IS
+shared, the gap is the stage-idle bubble between the cards'
+halves, not per-seq waste; the measured 1.53x is AT the batching
+ceiling 2/(1+A/H) ~= 1.52x); a controlled same-ctx 2-chat run is
+the open measurement. Live state unchanged since the afternoon
+refresh (new router @ 0.0.0.0:8080, child 49822, original
+config).
+
+Previous refresh: 2026-10-28 (afternoon) - F39 measurement DONE +
 the -np 2 anomaly root-caused (full analysis in FINDINGS F39,
 [measured]/[certain]/[decision] blocks): on the DEFAULT spawn
 config (no --parallel -> auto 4 slots + unified KV,
@@ -256,10 +296,17 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   t/s ~ 76% of the 2/H roofline vs solo ~14 at comparable ctx;
   the chats were 27.6K + 7K (NOT max-ctx-pinned) -> the
   pre-registered pipeline gate is not met (FINDINGS F39
-  [measured]/[decision]). The extraArgs bisection: -np 2
-  ANSWERED + root-caused (kv_unified silently false -> per-slot
-  KV 2x + total adaptive-ctx cap 524288 by design; child healthy;
-  the user's GPU2/CPU monitor read UNPROVEN - F39 [certain]);
+  [measured]/[decision]; the 76% sum is DISPUTED by the user -
+  F39 [disputed], stage-bubble analysis). The extraArgs bisection:
+  -np 2 ANSWERED + root-caused (kv_unified silently false ->
+  per-slot KV 2x + total adaptive-ctx cap 524288 by design);
+  SUPERSEDED 10-28 (evening): the user CONFIRMED the host
+  placement (model + per-slot KV on the host; 57327 generated
+  zero tokens; unload/reload circle) - the "child healthy /
+  monitor read unproven" afternoon read was wrong; 54674 hard KV
+  failure (co-resident mistake Q5_K_S load 53059, since unloaded;
+  Q6_K is the standing preference), 53777 CPU-class trial, and
+  the memtrace semantics are all in F39 [certain]/[confirmed];
   -ngl 99 / -c 262144 outcome still pending (prediction table in
   F31). The F37 risk zone is LIVE (full 262144 ctx + 8 GiB
   default host prompt cache + 82k-106k-token conversations); if
@@ -279,7 +326,11 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   ACTX install, --adaptive-ctx full, Q6_K, the B17 handover;
   replaced by the user's post-F39 restart), 51396 (F39 test-1
   child, default config, 2-chat TG measured), 57327 (F39 test-2
-  child, --parallel 2, healthy), 15516/22456 (10-27 evening
+  child, --parallel 2, zero tokens - user-confirmed host
+  placement + unload/reload circle), 54674 (Q6_K -np 2, hard KV
+  load failure from the co-resident mistake Q5_K_S load 53059),
+  53777 (Q6_K -np 2, CPU-class 0.49-22 t/s, single chat could not
+  start), 15516/22456 (10-27 evening
   router/child @ 52439, layer mode after the user's tensor
   revert; replaced 10-28 ~02:32 by the B17 handover), 15516/19760
   (10-27 9:11 AM router/child, tensor, replaced by the user's
@@ -385,12 +436,18 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   PTQ1_0 tensor-verified; tests/test-hadamard-fold.cpp pins the
   formula. H-C (kernel fusion, zero requant noise) documented in F29
   as the fallback only.
-- B14 (10-25, PARKED): twin-server + router - two pinned children
-  (-dev SYCL0 / -dev SYCL1, -fit off + explicit -ngl) behind a router
-  that aggregates /v1/models and routes by session. PARKED 10-25: the
-  user chose the tensor-fit + growth path first (F32 shipped, F33
-  drafted); B14 remains the alternative CAPACITY vehicle. See
-  BACKLOG B14.
+- B14: REJECTED 10-28 (evening) by the user ("I will never start.
+  It was dead end."): the twin-server + router is not being built,
+  no re-presentation. History: 10-25 PARKED (the user chose the
+  tensor-fit + growth path first, F32 shipped, F33 drafted);
+  10-27 priority raised (F37/F38). The capacity path now: the
+  in-place ring growth (B15, shipped) + the unified ring; the
+  remaining 2x-aggregate design on record is the alternating
+  pipeline draft (B18). See BACKLOG B14.
+- B18 (10-28 evening, DRAFT): alternating 2-chat decode pipeline -
+  design only, no code (DESIGN-alternating-pipeline.md); written on
+  the user's request; its stage-bubble analysis is the current
+  explanation of the disputed 76% batch number (F39 [disputed]).
 - B7a: startup-side loud-fail (unfittable ctx/KV) + closed --dev gate.
   Status: APPROVED 10-22, OPEN - next code candidate in this fork.
   The 10-25 runtime KV work is additive, NOT B7a. NOTE 10-25 (evening):
@@ -415,9 +472,11 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `722ce512c` (docs : private sync -
-  build recovery GREEN, VS-2022-shell root cause + build-
-  sycl.ps1 hardening). Before it: `dff5d5cfe` (docs : private
+- branch `main`, pushed HEAD: `8a14e491b` (docs : private sync
+  after F39 - 2-chat TG measured, -np 2 root cause, post-F39
+  restart). Before it: `722ce512c` (docs : private sync - build
+  recovery GREEN, VS-2022-shell root cause + build-sycl.ps1
+  hardening), `dff5d5cfe` (docs : private
   sync after the timing-log gate - build state, 129 ms shrink
   record, F40 status), `e78fe1b51` (server : gate periodic
   tg/tp log lines on a >= 10% rate change), `796c40945`
@@ -429,8 +488,10 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   `5b8aa1fad` (llama : copy KV rows on device in the in-place
   cache regrow), `9c8772ed8` (llama : adaptive ctx, in-place
   runtime resize), `1011b639d` (fit : tensor-mode context
-  fitting). The docs commit for THIS round (F39 outcome + -np 2
-  root cause + the post-F39 service restart) is PENDING.
+  fitting). The docs commit for THIS round (user-confirmed -np 2
+  host placement + the 54674/53777 evidence, B14 REJECTED, the
+  76% dispute + stage-bubble analysis, the B18 draft project) is
+  PENDING.
   Full list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
@@ -553,37 +614,47 @@ block; grep by port 8080/58452.
    82k-106k-token conversations); the F40 recommendation feeds
    it; if the bad-alloc class recurs, add it to the spawn line
    at the next stop window (user-owned config).
-3. DONE 10-28 (afternoon): F39 measurement - FINDINGS F39
-   [measured]/[certain]/[decision]: 2 chats batched on the
-   default config (sum ~21.4 t/s, ~76% of 2/H, chats 27.6K+7K,
-   NOT max-ctx-pinned) -> pipeline gate not met, NOT building;
-   -np 2 root-caused (per-slot KV 2x + total adaptive-ctx cap
-   524288 by design; child healthy; monitor read unproven) ->
-   recommended dropped, default (auto 4 slots + unified KV)
-   kept.
+3. DONE 10-28 (afternoon + evening): F39 measurement - FINDINGS
+   F39 [measured]/[disputed]/[certain]/[confirmed]/[decision]: 2
+   chats batched on the default config (sum ~21.4 t/s, ~76% of
+   2/H, chats 27.6K+7K, NOT max-ctx-pinned) -> pipeline gate not
+   met, NOT building; the 76% is DISPUTED by the user (repeated
+   tests far from 2x) - the stage-bubble analysis (the 2-seq step
+   pays W + 2A, the cards idle between the pair's stages) is the
+   current explanation; a controlled same-ctx 2-chat run is the
+   open measurement; -np 2 root-caused (per-slot KV 2x + total
+   adaptive-ctx cap 524288 by design) + host placement USER-
+   CONFIRMED (57327 zero tokens, unload/reload circle; 54674
+   hard KV failure from the mistake 53059 Q5_K_S load; 53777
+   CPU-class; memtrace semantics) -> dropped, default (auto 4
+   slots + unified KV) kept.
 4. Record the first live 27B-scale `adaptive ctx: KV cache grown
    in place in X ms` regrow timing from macube/logs/llama.log
    (262144 <-> 163840, ~2.65 GiB per direction) into FINDINGS -
    closes B17 (the 129 ms shrink is recorded in the previous
    refresh entry; regrow needs a > 163840-token conversation,
    largest so far 106815).
-5. B14 draft re-presentation (priority RAISED by F37/F38 - the
-   structural fix for BOTH reported issues; F39 keeps B14 as
-   the capacity vehicle); implement only on explicit user
-   confirmation.
-6. [B] Await the user's extraArgs bisection outcome, remainder:
+5. B18 draft review: DESIGN-alternating-pipeline.md is on the
+   table (the user asked for the project; the idea lived in F39
+   [proposed]); B14 re-presentation REMOVED (B14 REJECTED 10-28).
+6. [B] The -np 2 clean repro at the next stop window (user-owned):
+   single Q6_K model, no co-resident child, -np 2, spawn env
+   GGML_SYCL_MEMTRACE=1 -> the OK-alloc trace shows which device
+   each model tensor + the per-slot KV lands on (SYCL0/SYCL1/
+   host); capture the user's monitor read at the same time.
+7. [B] Await the user's extraArgs bisection outcome, remainder:
    -ngl 99 / -c 262144 (-np 2 is ANSWERED, F39) - fold into
    FINDINGS when reported (prediction table in F31).
-7. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
+8. [B] Await a free card (re-derive VRAM first) -> run the Q5_K_S
    tensor bench (N17; GDN correctness check first).
-8. B7a (this fork, next code item): startup loud-fail on unfittable
+9. B7a (this fork, next code item): startup loud-fail on unfittable
    ctx/KV + closed -sm/-dev gate (the old tensor warn-then-continue
    target is GONE - F32; remaining: the non-tensor startup ctx/KV
    loud-fail + the parse gate).
-9. B13 recon (read-only, clone hosts live service): diff fork vs
-   clone meta backend (upstream PRs #26490/#27574), ternary enum
-   mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
-   divergent work map (F25), the seq_rm fix question (server-
-   context.cpp ~:3444, relevant to F28). THEN port commit-by-
-   commit on user-confirmed scope.
-10. Refresh private/ + commit+push at each milestone.
+10. B13 recon (read-only, clone hosts live service): diff fork vs
+    clone meta backend (upstream PRs #26490/#27574), ternary enum
+    mapping (fork non-standard PQ2_0=142/PTQ1_0=143), missing/
+    divergent work map (F25), the seq_rm fix question (server-
+    context.cpp ~:3444, relevant to F28). THEN port commit-by-
+    commit on user-confirmed scope.
+11. Refresh private/ + commit+push at each milestone.

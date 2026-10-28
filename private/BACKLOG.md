@@ -49,7 +49,15 @@ Each item: what / why / how / exit criteria / status.
 > 262144 <-> 163840 = ~2.65 GiB per direction); F39 (two-chat
 > pipeline assessment: no throughput win over B14, real win = ~2x
 > KV headroom) recorded; build recipe moved to VS 2026 (14.51 +
-> oneAPI 2026.1.1, -Clean rebuild green).
+> oneAPI 2026.1.1, -Clean rebuild green). 10-28 (evening): F39
+> MEASURED (2 chats batched by default, sum ~21.4 t/s ~= 76% of
+> 2/H - DISPUTED by the user from repeated tests; stage-bubble
+> analysis in F39 [disputed]); -np 2 anomaly CONFIRMED by the user
+> (model + per-slot KV host-resident, no token generated,
+> unload/reload circle; Q5_K_S child 53059 was a mistake load,
+> since unloaded, Q6_K is the standing preference); B14 REJECTED
+> by the user ("dead end"); B18 added (alternating pipeline draft
+> at DESIGN-alternating-pipeline.md, user-requested, no code).
 > Restart recipe: STATE.md, then NOTES.md (N2 setvars, N3 build, N4
 > detached launch, N7 repro args, N14 tensor-mode repro), FINDINGS.md
 > for conclusions.
@@ -266,7 +274,7 @@ Each item: what / why / how / exit criteria / status.
   one. (b) recon NOT started (read-only: the clone hosts the live
   service).
 
-## B14. Twin-server + router (data parallel, DEFERRED - draft pending user)
+## B14. Twin-server + router (data parallel, REJECTED 10-28 by user)
 - what: two llama-server children, one pinned -dev SYCL0 and one
   -dev SYCL1 (one physical card each, -fit off + explicit -ngl, no
   cross-card split), fronted by a router that aggregates /v1/models and
@@ -289,10 +297,13 @@ Each item: what / why / how / exit criteria / status.
   to the user; implement only on explicit confirmation.
 - exit: user confirms or drops; if confirmed, recon notes to private/
   then staged implementation.
-- status: PARKED (10-25) - the user chose the tensor-fit + growth path
-  first (F32 shipped, F33 drafted). B14 remains the alternative
-  CAPACITY vehicle if per-slot growth (B15) is insufficient or dropped;
-  re-present the B14 draft before any B14 work. NOTE 10-27 (evening):
+- status: REJECTED (10-28, user, final): "I will never start. It was
+  dead end." - the twin-server + router is not being drafted or built;
+  no re-presentation. History: PARKED (10-25) - the user chose the
+  tensor-fit + growth path
+  first (F32 shipped, F33 drafted); it had been the alternative
+  CAPACITY vehicle if per-slot growth (B15) were insufficient. NOTE
+  10-27 (evening):
   priority RAISED - F38 (two-chat TG halving is structural: per-layer
   blocking P2P waits + no slot pipelining) and F37 (bad allocation is
   tensor-mode-only) both point at B14 as the fix for BOTH reported
@@ -452,3 +463,38 @@ Each item: what / why / how / exit criteria / status.
   (full 262144 ctx + the 8 GiB default host prompt cache + 91k-
   token conversations); if it recurs, add --cache-ram 0 to the
   spawn line at the next stop window (user-owned config).
+
+## B18. Alternating 2-chat decode pipeline (DRAFT, user-requested 10-28)
+- what: a steady-state DECODE PIPELINE across the two cards on the
+  existing layer-mode split - the two chats advance staggered, the
+  next token's stage 1 on SYCL0 running while the current token's
+  stage 2 runs on SYCL1 ("2 chats, 1 token per half round"). Full
+  design: DESIGN-alternating-pipeline.md (roofline, the stage-
+  bubble analysis of the measured 76% batch ceiling, design
+  sketch, open questions, exit criteria).
+- why: the 10-28 measurement (F39 [measured]/[disputed]) shows the
+  default 2-seq batch at ~76% of the 2/H roofline (sum 21.4 t/s)
+  and the user disputes the number from repeated tests; the
+  per-step structure (W + 2A per pair, A ~= 22 ms) pins the gap to
+  the STAGE IDLE bubble between the two cards' halves, which the
+  stagger removes (+31% aggregate, 2/H). The pipeline also buys
+  ~2x KV headroom for a two-chat pair (~40 vs ~20 GB) - the
+  capacity path now that B14 (DP) is REJECTED.
+- how: DRAFT ONLY - nothing approved, no code written. The crux
+  design question (doc section 6.1): whether the ctx/slot state
+  tolerates 2 submitted not-yet-sampled tokens (KV reservation,
+  sampler queue); if yes, the minimum change is a non-blocking
+  submit path in the slot loop (the device-side stagger is free -
+  the per-graph device dependency already enqueues s1 -> s2
+  asynchronously, meta backend). Staged like B15 if ever approved:
+  stage 1 core (in-flight window), stage 2 server (flag + slot
+  loop), stage 3 verify (2-chat staggered TG vs the 21.4 baseline,
+  flag-off path byte-identical).
+- exit: user confirms or drops (the draft is on the table for
+  review); if confirmed, the open questions in the doc are
+  answered with a staged plan; F39's gate (workload pins both
+  cards at max ctx) is re-checked against the then-current
+  workload before any implementation.
+- status: DRAFT 10-28 (evening) - written on the user's request
+  ("it deserve to look at the project"); NOT building (F39
+  [decision]); supersedes nothing, adds no code.

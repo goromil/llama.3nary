@@ -1749,7 +1749,10 @@ raises its priority.
 the two cards - the graph is split at the device boundary and the
 next token's half-graph runs on the other card while the current
 one finishes, so two concurrent chats advance in a staggered
-stream (the "phasing" the user described).
+stream (the "phasing" the user described; user phrasing 10-28:
+"2 chats, 1 token per half round"). DRAFT PROJECT written 10-28
+(evening) at DESIGN-alternating-pipeline.md on the user's request
+(design only, no code; BACKLOG B18).
 
 [certain] Steady-state throughput: with a half-graph cost
 T_half = H/2 (H = the current serial per-token cost of the layer
@@ -1822,6 +1825,33 @@ service with the DEFAULT spawn line (no --parallel):
   two ~131K chats; the largest live conversation so far is 106815.
   The capacity question becomes real only above that.
 
+[disputed 10-28 (evening)] The user tested 2-chat throughput
+several times: the sum is FAR from 2x the solo TG - the 76% above
+is one overlap sample (27.6K + 7K) and the verdict is disputed,
+not settled. The per-step numbers pin down the structure of the
+gap:
+- The 2-seq step (93 ms) is NOT 2x the solo step (71 ms; else
+  >= 142 ms): the weight set IS read once for both seqs - the
+  weight sharing the user expects is real and already happening.
+- Decomposition: solo ~= W + A, 2-seq ~= W + 2A, A ~= 22 ms (one
+  seq's attention/KV/GDN-state share, A/H ~= 0.31). The measured
+  1.53x is AT the batching ceiling 2/(1 + A/H) ~= 1.52x: default
+  batching is not misconfigured, it is already doing the right
+  thing.
+- The ceiling's cause is STAGE IDLE, not per-seq waste: in layer
+  mode the 2-seq batch is one graph - [both seqs' stage 1 on
+  SYCL0] -> [both seqs' stage 2 on SYCL1] - so SYCL1 idles for
+  the whole stage-1 work of the pair (and vice versa); the pair
+  takes (W/2 + A) x 2 = W + 2A = H + A. The alternating pipeline
+  (DESIGN-alternating-pipeline.md) overlaps stage 2(token N) with
+  stage 1(token N+1): both cards continuously busy, pair takes H,
+  aggregate 2/H = 28.2 t/s, +31% over the measured 21.4. The per-
+  seq A is unchanged (each seq still reads its own KV); only the
+  idle bubble disappears.
+- Open: a controlled same-ctx 2-chat run (both ~35K, equal load)
+  to pin A and check for a per-seq fixed overhead beyond KV
+  (GDN state update, per-seq sampling, non-fused attn kernels).
+
 [certain 10-28] The -np 2 anomaly (child 57327), root-caused in
 code:
 - Explicit --parallel 2 skips the auto branch, so kv_unified keeps
@@ -1836,34 +1866,83 @@ code:
   fit measured it and granted it (the per-slot share stays capped
   at n_ctx_train). "The adaptive ctx does not account for -np" is
   half right: it DOES account - by doubling the total.
-- The child was HEALTHY: model loaded at 1.09 min, listening,
-  task 0 launched, and zero SYCL alloc errors/warnings anywhere in
-  its log section (checked: pool-malloc ERROR ggml-sycl.cpp:
-  1674-1678, FA buffer GGML_ABORT fattn-buffers.cpp:39-42,
-  reorder host-fallback WARN :3913-3919, pinned-host fallback
-  WARN :1528-1531 - every fallback logs, none present).
-- The user's monitor showed GPU2 full->0 + CPU ~+30 GB, read as a
-  load failure; UNPROVEN - no code path moves model+KV to host
-  silently. +30 GB ~= model 17.5 GB + per-slot KV 14.4 GiB ~=
-  32 GB is consistent with host residency, but remains a
-  hypothesis (the monitor source was not identified).
+- SUPERSEDED (10-28 evening, user CONFIRMED): the child was NOT
+  serving - the model itself was unable to generate a single
+  token (57327 launched task 0 and produced zero timing lines),
+  and with -np 2 the MODEL + KV sit on the HOST, not the GPUs
+  (the GPU2 full->0 + CPU ~+30 GB monitor read was correct). The
+  arithmetic holds: 27G model + 14G KV = 31G across two 32G cards
+  should leave ~half a card free; the failed trial showed the
+  cards almost empty. After the first unload the model+KV come
+  back onto GPU2 and it circles, very slow; it does this every
+  time lately. One historical exception (user memory): one
+  -np 2 -c 256k run worked - both GPUs full AND CPU memory at
+  100% all day, TG ~5 (model+KV co-resident on the GPUs AND the
+  host). +30 GB ~= model ~17.5 GB + per-slot KV 14.4 GiB ~= 32
+  GB matches the confirmed host residency.
+- New log evidence from the pre-178327 -np 2 trials (found this
+  round): 58561 + 62981 (Qwen3.6-27B-Q6_K, -np 2) loaded in
+  2.26/2.16 min and were killed on "exit command"; 53059
+  (Qwen3.8-27B-UD-Q5_K_S, 17.38 GB) was a MISTAKE load (user:
+  loaded by mistake, since unloaded; Q6_K is the standing
+  preference) and never printed a "model loaded" line; 54674
+  (Q6_K, -np 2, started 2 ms AFTER 53059 - a concurrent double
+  load) HARD FAILED (llama.log :178227-178243): `alloc FAILED:
+  696.000 MiB direct` -> `can't allocate 729808896 Bytes ... on
+  device` -> `failed to allocate buffer for kv cache` ->
+  `exiting due to model loading error` - the co-resident 53059
+  left SYCL1 with < 696 MiB free for 54674's first per-slot KV
+  slice. So -np 2 KV placement dies at load under ANY VRAM
+  contention (~0.7 GiB unavailable on one card is fatal).
+- 53777 (Q6_K, -np 2, clean single-model load, warm page cache,
+  loaded in ~46 s) is the "cannot start a single chat" trial:
+  task 0 (slot 1) prompt eval 22.66 -> 19.17 -> 11.16 t/s, task 2
+  (slot 0) 0.49 t/s (124.5 s / 61 tokens) then 13.54 t/s -
+  CPU-class decode with ZERO alloc errors in its whole section.
+- SYCL-MEMTRACE semantics (ggml-sycl/memtrace.cpp): FAILED device
+  allocs log at E level ALWAYS; OK allocs need the env
+  GGML_SYCL_MEMTRACE=1 (per-type totals) or =2 (per-alloc). Zero
+  MEMTRACE lines in the 53777/57327 sections => no device alloc
+  ever FAILED in those children. Combined with "every fallback
+  logs" (pool-malloc ERROR ggml-sycl.cpp:1674-1678, FA buffer
+  GGML_ABORT fattn-buffers.cpp:39-42, reorder host-fallback WARN
+  :3913-3919, pinned-host fallback WARN :1528-1531 - none
+  present), the host placement in 53777/57327 has NO logged
+  trigger: no code path in this tree is known to move model+KV to
+  host silently. The user's observation is the ground truth; the
+  mechanism that places -np 2 model+KV on the host (and the
+  unload -> reload-on-GPU2 circle) is still unproven in code.
+- Repro to catch it (needs a stop window, user-owned): ONE Q6_K
+  model, no co-resident child, -np 2, spawn env
+  GGML_SYCL_MEMTRACE=1 - the OK-alloc trace shows, buffer by
+  buffer, which device (SYCL0/SYCL1/host) each model tensor and
+  the per-slot KV lands on; capture the user's monitor read at
+  the same time.
 - The service then fully restarted (user): old router died ~3.32
   min (llama-error.log:16752), new router, child 49822 respawned
   at 10.27 min with the ORIGINAL config (no --parallel) - not a
   child crash.
-- Recommendation: drop -np 2 from the bisection. Per-slot
-  isolation buys nothing for 2 chats (unified KV already
+- Recommendation (unchanged): drop -np 2 from the bisection.
+  Per-slot isolation buys nothing for 2 chats (unified KV already
   interleaves them on one ring) and costs 2x KV memory + a 2x
-  total adaptive-ctx cap. Keep the default (auto 4 slots +
-  unified KV).
+  total adaptive-ctx cap, and now also shows host placement + a
+  load-time fragility. Keep the default (auto 4 slots + unified
+  KV).
 
 [decision 10-28] Pipeline: NOT building. The measured 2-chat
 workload (27.6K + 7K) does not pin both cards at max ctx, so the
 ~2x KV headroom - the pipeline's only real win - is not on the
-table; B14 (DP + router) stays the capacity vehicle if the
-workload ever grows past ~131K per concurrent chat. The 76% batch
-efficiency is the only open number; if it ever needs to move, it
-is a per-step overhead question, not a pipeline question.
+table. B14 (DP twin-server + router) was REJECTED by the user
+10-28 (evening): "I will never start. It was dead end." - it is
+no longer the capacity vehicle; the capacity path for > ~131K
+per concurrent chat is the in-place ring growth (B15, shipped) +
+the unified ring, with the alternating pipeline (DESIGN-
+alternating-pipeline.md, B18) as the drafted - and only
+remaining - 2x-aggregate design on record. The 76% batch
+efficiency is DISPUTED by the user (repeated tests far from 2x;
+see [disputed] above) - the stage-bubble analysis is the current
+explanation; a controlled same-ctx 2-chat run is the open
+measurement.
 
 ## For consideration (not approved, no code written)
 
