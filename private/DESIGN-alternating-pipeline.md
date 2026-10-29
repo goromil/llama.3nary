@@ -30,8 +30,9 @@ mode):
   - t0:       X.s1 on SYCL0
   - t0+H/2:   Y.s1 on SYCL0  ||  X.s2 on SYCL1
   - t0+H:     X2.s1 on SYCL0 ||  Y.s2 on SYCL1
-  - ... every token's stage 2 runs on one card while the next
-    token's stage 1 runs on the other.
+  - ... every token's stage 2 runs on card 2 (SYCL1) while, in
+    the same time, on card 1 (SYCL0) runs stage 1 of the alt
+    stream's token.
 - One full token lands every H/2 (H = the current solo per-token
   step, ~71 ms at ~35K on this machine) = aggregate 2/H, each chat
   served at 1/H. "1 token per half round."

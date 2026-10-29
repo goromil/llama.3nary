@@ -1972,3 +1972,126 @@ landing and the fit-time auto-size; these are what is left on the table:
    SUPERSEDED: the per-(layer, buft) restructure makes the regrow
    affordable (peak = old total + one layer). The VA-page version
    is parked as BACKLOG B16 (future optimization).
+
+## F40. MTP draft-mtp trials: fit-abort root cause (10-29)
+
+Post-F39 root cause of the user's MTP trials on the current
+ternary mains: DEVICE_LOST at 262144 ctx (51823), fit-abort at
+163840 with max stuck at the base 163840 (56146), pass at 131072
+on a free card (59148). User clue 10-29: "draft model is not
+split and offloads on GPU2. GPU reports 31.7G utilized memory no
+matter how small the model (for example teste PQ2 and PTQ1)".
+Backlog: B19.
+
+[proven] speculative.cpp:3172 is NOT a bug. The server builds
+params_dft = common_base_params_to_speculative(params_base)
+(server-context.cpp:1136-1142) and the draft load redirects to
+params_spec.mparams - the draft mparams, whose path is the mtp
+gguf. The current binary loads the real 1.28 GB MTP file in
+~1.7 s. The old 10/21 llama-sycl install took 46.8 s to "load"
+the draft - a second full main copy; which tree commit that
+install was built from is unverified, accepted as an old-build
+artifact. The "31.7G no matter how small the model" part of the
+clue rides on that same artifact.
+
+[proven] Two MTP load modes (speculative.cpp:3138-3210):
+(a) has_draft - a standalone mtp gguf via --model-draft (the
+    user's config): a separate 1.28 GB draft model at :3172 plus
+    an MTP context at :3190; the fit extra is shares_model =
+    false, so the fit projects the draft weights + KV + compute.
+(b) spec_mtp only - the built-in nextn layers: NO second model
+    load, the MTP context runs on model_tgt at :3202; the fit
+    extra is shares_model = true, only ctx + compute projected.
+
+[proven] Draft placement: the draft ngl defaults to -1 (common.h:339)
+and tensor_split is inherited; an all-zero tensor_split is the
+DEFAULT SPLIT BY FREE MEMORY (llama-model.cpp:1704-1721). A
+1-layer MTP model has nothing to split, so the whole draft lands
+on one card - measured: SYCL1, the higher-free card. Expected
+behavior, matching "not split and offloads on GPU2".
+
+[measured 10-29] The draft extra is COMPUTE-BUFFER dominated, not
+weights. Exact 56146 arg set (Q5_K_S main + mtp-Q4_0 draft,
+draft-mtp, KV q5_1/q5_1 main + q4_0/q4_0 draft, FA on, no -ts),
+llama-fit-params -lv 4, run while the live child 49822 and the
+user's trials co-resided - every number below is co-residency
+dependent (free at measurement: SYCL0 ~3070 / SYCL1 ~3978 MiB of
+31906 each):
+- ctx 131072, batch 6144: the draft extra, whole on SYCL1 =
+  model 774 + ctx 144 + compute 8569 = 9488 MiB. The weights are
+  774 MiB; the 1-layer draft's graph reservation at a 6144-token
+  batch is 8.4 GiB.
+- batch scaling (ctx 163840, ngl 999): batch 2048 -> draft
+  compute 3369 MiB (extra 4324); batch 1024 -> 1685 MiB (extra
+  2639). Roughly 1.6 MiB per batch token.
+- pinned ngl (999 or all), batch 6144: ALL ctx abort with
+  "n_gpu_layers already set by user to 999/-2, abort". Initial
+  projections: 131072 -> SYCL0 16439 used (-13369 free), SYCL1
+  35083 used (-31105 free), "need to use 46522 MiB less in
+  total"; 163840 -> 18311/38623 (need 51934 less); 262144 ->
+  23927/49243 (need 68166 less). 131072 passed fit on the
+  user's free-card trial (59148); under co-residency even it
+  aborts.
+- ngl auto (default -1) + --adaptive-ctx full: fit "succeeds"
+  only by the step-3 redistribution walking ALL layers off the
+  GPUs: 47 -> 0 layers in 68.6-68.8 s, result -c 131072 -ngl 0 /
+  -c 262144 -ngl 0. The unpinned-NGl "workaround" is silently an
+  ALL-CPU model when the cards are full.
+
+[proven] The abort mechanics (common/fit.cpp, all source-proven):
+- explicit --ctx-size sets n_ctx_auto = false (:459), so the
+  step-2 ctx shrink never runs (:709-772; otherwise "context
+  size set by user to N -> no change" :771).
+- the grow phase (:573-624) runs only when n_ctx_max_user > 0
+  and sets fit_ctx_base = user ctx (:575-577) BEFORE the margin
+  check. Adaptive NONE (default) -> n_ctx_max_user = 0, grow
+  skipped. Adaptive FULL without --adaptive-ctx-max ->
+  n_ctx_max_user = UINT32_MAX (common.cpp:1323-1324), cap =
+  hp_nct (262144); already over budget at the user ctx -> limit
+  = 0, silent no-grow (:600-602).
+- margin check fails -> :779-781: ngl pinned (999 or all = -2,
+  both != the default -1) -> throw "n_gpu_layers already set by
+  user to N, abort".
+- the server catches the exception, warns, and loads with the
+  user's exact params (proven in the trial logs).
+
+[proven] "max stuck at base 163840" (adaptive FULL + abort): the
+grow phase set fit_ctx_base = the user ctx before the abort; the
+server then sets n_ctx_base = fit_ctx_base and n_ctx_max = n_ctx,
+and n_ctx is the user ctx because fit changed nothing
+(server-context.cpp:1114-1121) -> base == max -> zero runtime
+grow span.
+
+[proven] The DEVICE_LOST consequence (51823): ctx 262144 +
+pinned ngl + fit on -> fit aborts -> the load proceeds at the
+user's 262144 with ngl pinned -> the REAL allocation OOMs the
+GPU -> DEVICE_LOST. The crash is a consequence of the
+warn-and-continue at an over-budget ctx, not a fit crash.
+
+[proven] The "13x prompt gap" is a big-vs-small prompt confound,
+NOT an MTP penalty: every trial (including the no-MTP 65498) is
+bimodal - big prompts (7.7k-88k tokens) 230-720 t/s, small
+prompts (19-1700 tokens) 4-200 t/s. MTP adds no measurable
+prompt-eval penalty. Decode-side accept rate: not yet measured.
+
+[proven] The fit measurement itself is fully no-alloc: the model
+load uses dummy 0-size buffers and early-returns
+(llama-model.cpp:2014-2073), and the KV cache + graph reserve
+respect hparams.no_alloc. Safe to run alongside the live
+service.
+
+[recommendation] Operational workarounds (no code): (1) do not
+combine a pinned ngl with an over-budget ctx - cap the ctx to
+the card budget (llama-fit-params --fit-print on shows the
+projection) or run the MTP trial when the cards are actually
+free; (2) dropping the pinned ngl does NOT save it - under
+co-residency the fit "solution" is -ngl 0 (all CPU); (3) --fit
+off only removes the warning, same OOM class. Code-fix options
+(user call, B19): (a) log/UX only - print the per-device deficit
+at WARN on the pinned-ngl abort (the projection table is LOG_TRC,
+-lv 4, only); (b) behavior - on the adaptive-FULL abort do not
+leave fit_ctx_base = user ctx (or have the server use the grow
+cap for n_ctx_max), so a nonzero runtime grow span survives;
+(c) optional - one log line for where the draft lands (card +
+model/ctx/compute MiB). Any code change = wide rebuild + stop-
+window deploy.

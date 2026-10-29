@@ -498,3 +498,36 @@ Each item: what / why / how / exit criteria / status.
 - status: DRAFT 10-28 (evening) - written on the user's request
   ("it deserve to look at the project"); NOT building (F39
   [decision]); supersedes nothing, adds no code.
+
+## B19. MTP + --adaptive-ctx full: fit-abort UX / fix options (10-29)
+- what: the user's draft-mtp trials on the current ternary mains
+  failed three ways (51823 DEVICE_LOST @ 262144, 56146 fit-abort
+  @ 163840 with max stuck at base, 59148 pass @ 131072 on a free
+  card). Full root cause in FINDINGS F40. The mechanism is
+  BY-DESIGN: explicit --ctx-size + pinned ngl + over-budget
+  projection -> fit throws "n_gpu_layers already set by user" ->
+  the server catches, warns, loads the user's exact params ->
+  over-budget ctx OOMs at the real allocation (DEVICE_LOST) or
+  loads at a stuck base == max grow span (adaptive FULL).
+- why: the failure signature is misleading - the abort message
+  names ngl, but the deficit (measured: 46-68 GiB over while the
+  live service co-resides; the draft extra alone is 9.5 GiB, of
+  which 8.4 GiB is the 1-layer draft's compute reservation at
+  batch 6144) is never shown at the default verbosity (the
+  projection table is LOG_TRC, -lv 4 only), and the adaptive-FULL
+  abort silently zeroes the runtime grow span.
+- options (user call; any code change = wide rebuild + stop
+  window): (a) log/UX only - on the pinned-ngl abort, print the
+  per-device deficit (lift the existing LOG_TRC projection lines
+  or repeat them at WARN); (b) behavior - on the adaptive-FULL
+  abort do not leave fit_ctx_base = user ctx (or make the server
+  use the grow cap for n_ctx_max), so base < max survives;
+  (c) optional - one log line for where the draft lands (card +
+  model/ctx/compute MiB). (a) is the minimal, safest piece.
+- exit: user picks none / (a) / (a)+(b) / more; until then the
+  operational workaround is F40's (cap ctx to the fit projection
+  while co-resident, or run MTP trials on free cards; do NOT
+  rely on dropping the pinned ngl - under co-residency the fit
+  "solution" is -ngl 0, an all-CPU model).
+- status: OPEN 10-29 - findings recorded (F40), no code written,
+  no user decision yet.
