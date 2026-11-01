@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "common.h"
 
 #include "log.h"
 
@@ -211,13 +212,42 @@ static bool tensor_measure_ctx(
     return true;
 }
 
+// same, with the contexts of both models resident at once, as in the runtime
+static bool tensor_measure_ctx_two(
+        llama_model * model_a, const llama_context_params & cparams_a,
+        llama_model * model_b, const llama_context_params & cparams_b,
+        uint32_t n_ctx,
+        const std::vector<ggml_backend_dev_t> & devs, const std::vector<int64_t> & free_before,
+        std::vector<int64_t> & used_mem) {
+    llama_context_params cparams_a_copy = cparams_a;
+    cparams_a_copy.n_ctx = n_ctx;
+    llama_context_params cparams_b_copy = cparams_b;
+    cparams_b_copy.n_ctx = n_ctx;
+
+    llama_context * ctx_a = llama_init_from_model(model_a, cparams_a_copy);
+    if (ctx_a == nullptr) {
+        return false;
+    }
+    llama_context * ctx_b = llama_init_from_model(model_b, cparams_b_copy);
+    if (ctx_b == nullptr) {
+        llama_free(ctx_a);
+        return false;
+    }
+
+    used_mem.resize(devs.size());
+    for (size_t i = 0; i < devs.size(); i++) {
+        used_mem[i] = free_before[i] - get_dev_free_mem(devs[i]);
+    }
+
+    llama_free(ctx_b);
+    llama_free(ctx_a);
+    return true;
+}
+
 static void common_params_fit_tensor_impl(
         const char * path_model, llama_model_params * mparams, llama_context_params * cparams,
         size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, uint32_t * n_ctx_base,
-        const common_fit_extra_model * extra, ggml_log_level log_level) {
-    if (extra != nullptr) {
-        throw common_params_fit_exception("an extra (draft/MTP) model is not supported with SPLIT_MODE_TENSOR, abort");
-    }
+        int32_t adaptive_ctx, const common_fit_extra_model * extra, ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
 
     struct logger_guard_t {
@@ -315,12 +345,61 @@ static void common_params_fit_tensor_impl(
             __func__, ggml_backend_dev_name(devs[i]), (free0[i] - free1[i])/MiB, free0[i]/MiB, free1[i]/MiB);
     }
 
+    // an extra (draft/MTP) model with its own weights competes for the same cards:
+    // real-load it too, so its per-card weights + ctx join the budget below
+    llama_model * model_extra = nullptr;
+    std::vector<int64_t> free_extra;
+    if (extra != nullptr) {
+        if (extra->shares_model) {
+            throw common_params_fit_exception(
+                "an MTP context sharing the main model's weights is not supported with SPLIT_MODE_TENSOR, abort");
+        }
+        model_extra = llama_model_load_from_file(extra->path_model, *extra->mparams);
+        if (model_extra == nullptr) {
+            throw std::runtime_error("failed to load the extra (draft) model");
+        }
+        const ggml_backend_dev_t meta_extra = llama_model_get_device(model_extra, 0);
+        if (llama_model_n_devices(model_extra) != 1 || !ggml_backend_dev_is_meta(meta_extra)
+                || ggml_backend_meta_dev_n_devs(meta_extra) != nd) {
+            llama_model_free(model_extra);
+            throw std::runtime_error("the extra (draft) model must use one meta device over the same cards in SPLIT_MODE_TENSOR");
+        }
+        for (size_t i = 0; i < nd; i++) {
+            if (ggml_backend_meta_dev_simple_dev(meta_extra, i) != devs[i]) {
+                llama_model_free(model_extra);
+                throw std::runtime_error("the extra (draft) model must span the same cards as the main model in SPLIT_MODE_TENSOR");
+            }
+        }
+        free_extra.resize(nd);
+        for (size_t i = 0; i < nd; i++) {
+            free_extra[i] = get_dev_free_mem(devs[i]);
+        }
+        LOG_TRC("%s: memory of the real extra model load [MiB]:\n", __func__);
+        for (size_t i = 0; i < nd; i++) {
+            LOG_TRC("%s:   - %s: %6" PRId64 " extra model, %6" PRId64 " free before, %6" PRId64 " free after\n",
+                __func__, ggml_backend_dev_name(devs[i]), (free1[i] - free_extra[i])/MiB, free1[i]/MiB, free_extra[i]/MiB);
+        }
+    }
+    // free after every model is resident: the weight footprint and the baseline of the context measurements
+    const std::vector<int64_t> & free_models = (extra != nullptr) ? free_extra : free1;
+
     // two measurement points of the per-device context memory, both at or below the trained context size
     const uint32_t n_ctx_pt_lo = std::min<uint32_t>(2048, std::max<uint32_t>(1, n_ctx_train));
     const uint32_t n_ctx_pt_hi = std::min<uint32_t>(32768, std::max<uint32_t>(2*n_ctx_pt_lo, n_ctx_train));
 
+    // measure the per-device context memory at the given n_ctx,
+    // with the draft context resident too when there is a draft, as in the runtime
+    auto measure_ctx = [&](uint32_t n_ctx, std::vector<int64_t> & used_mem) -> bool {
+        if (model_extra == nullptr) {
+            return tensor_measure_ctx(model, *cparams, n_ctx, devs, free_models, used_mem);
+        }
+        return tensor_measure_ctx_two(model, *cparams, model_extra, *extra->cparams,
+                                      n_ctx, devs, free_models, used_mem);
+    };
+
+    // the combined context (main + optional draft) at the two points, all models stay resident
     std::vector<int64_t> used_lo;
-    if (!tensor_measure_ctx(model, *cparams, n_ctx_pt_lo, devs, free1, used_lo)) {
+    if (!measure_ctx(n_ctx_pt_lo, used_lo)) {
         throw common_params_fit_exception("the model and a minimal context do not fit into the device memory, abort");
     }
     for (size_t i = 0; i < nd; i++) {
@@ -333,10 +412,10 @@ static void common_params_fit_tensor_impl(
     {
         std::vector<int64_t> used_hi;
         uint32_t n_ctx_hi = n_ctx_pt_hi;
-        bool have_hi = tensor_measure_ctx(model, *cparams, n_ctx_hi, devs, free1, used_hi);
+        bool have_hi = measure_ctx(n_ctx_hi, used_hi);
         while (!have_hi && n_ctx_hi > 2*n_ctx_pt_lo) {
             n_ctx_hi /= 2;
-            have_hi = tensor_measure_ctx(model, *cparams, n_ctx_hi, devs, free1, used_hi);
+            have_hi = measure_ctx(n_ctx_hi, used_hi);
         }
 
         if (have_hi) {
@@ -345,7 +424,7 @@ static void common_params_fit_tensor_impl(
             for (size_t i = 0; i < nd; i++) {
                 const int64_t rate = (used_hi[i] - used_lo[i]) / (int64_t) (n_ctx_hi - n_ctx_pt_lo);
                 const int64_t fixed = used_lo[i] - rate * n_ctx_pt_lo;
-                const int64_t used_model = free0[i] - free1[i];
+                const int64_t used_model = free0[i] - free_models[i];
                 const int64_t budget = free0[i] - used_model - fixed - (int64_t) margins_s[i];
                 if (budget <= 0) {
                     n_ctx_fits = 0;
@@ -362,7 +441,7 @@ static void common_params_fit_tensor_impl(
             while (hi - lo > 1) {
                 const uint32_t mid = lo + (hi - lo)/2;
                 std::vector<int64_t> used_mid;
-                if (tensor_measure_ctx(model, *cparams, mid, devs, free1, used_mid)) {
+                if (measure_ctx(mid, used_mid)) {
                     lo = mid;
                 } else {
                     hi = mid;
@@ -373,6 +452,7 @@ static void common_params_fit_tensor_impl(
     }
 
     llama_model_free(model);
+    llama_model_free(model_extra);
 
     const uint64_t n_ctx_max = std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
     // n_ctx_min == UINT32_MAX means the user requested the full context (-c 0), no reduction is allowed:
@@ -413,10 +493,29 @@ static void common_params_fit_tensor_impl(
     }
 
     if ((uint64_t) cparams->n_ctx > n_ctx_fits) {
+        const uint32_t anchor = cparams->n_ctx;
+        const uint64_t n_ctx_new = n_ctx_from_cap(std::min<uint64_t>(n_ctx_fits, n_ctx_max));
+        if (adaptive_ctx != COMMON_ADAPTIVE_CTX_NONE && n_ctx_new >= n_ctx_min_total) {
+            // the adaptive ctx is privileged over the requested context size, settle the context down
+            cparams->n_ctx = (uint32_t) n_ctx_new;
+            if (n_ctx_base != nullptr) {
+                *n_ctx_base = (uint32_t) n_ctx_new;
+            }
+            LOG_WRN("%s: the requested context size of %" PRIu32 " does not fit, settled the context down to %" PRIu32 "\n",
+                __func__, anchor, cparams->n_ctx);
+            return;
+        }
+        if (adaptive_ctx != COMMON_ADAPTIVE_CTX_NONE) {
+            LOG_TRC("%s: the minimum context size of %" PRIu64 " does not fit, max fitting is %" PRIu32 "\n",
+                __func__, n_ctx_min_total, n_ctx_fits);
+            throw common_params_fit_exception(
+                "the minimum context size of " + std::to_string((uint32_t) n_ctx_min_total) +
+                " does not fit into the device memory, abort");
+        }
         LOG_TRC("%s: the user context size of %" PRIu32 " does not fit, max fitting is %" PRIu32 "\n",
-            __func__, cparams->n_ctx, n_ctx_fits);
+            __func__, anchor, n_ctx_fits);
         throw common_params_fit_exception(
-            "the user context size of " + std::to_string(cparams->n_ctx) +
+            "the user context size of " + std::to_string(anchor) +
             " does not fit into the device memory, abort");
     }
 
@@ -439,9 +538,10 @@ static void common_params_fit_tensor_impl(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, uint32_t * n_ctx_base, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, uint32_t n_ctx_max_user, uint32_t * n_ctx_base,
+        int32_t adaptive_ctx, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        common_params_fit_tensor_impl(path_model, mparams, cparams, margins_s, n_ctx_min, n_ctx_max_user, n_ctx_base, extra, log_level);
+        common_params_fit_tensor_impl(path_model, mparams, cparams, margins_s, n_ctx_min, n_ctx_max_user, n_ctx_base, adaptive_ctx, extra, log_level);
         return;
     }
     constexpr int64_t MiB = 1024*1024;
@@ -686,6 +786,9 @@ static void common_params_fit_impl(
         }
     }
 
+    // if the adaptive settle demoted the context to the floor in step 2, the original requested context size
+    uint32_t ctx_demote_anchor = 0;
+
     // step 2: try reducing memory use by reducing the context size
 
     {
@@ -767,6 +870,83 @@ static void common_params_fit_impl(
                             __func__, n_ctx_max, n_ctx_min_total);
                     }
                 }
+            } else if (adaptive_ctx != COMMON_ADAPTIVE_CTX_NONE && cparams->n_ctx >= n_ctx_min_total) {
+                // the adaptive ctx is privileged over the requested context size: settle the context down
+                // into the free memory of the current weight placement, the requested size is not enforced
+                const uint32_t anchor = cparams->n_ctx;
+                const uint32_t floor  = n_ctx_min_total;
+
+                cparams->n_ctx = floor;
+                dmds_t dmds_floor = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                add_extra_memory(dmds_floor);
+                cparams->n_ctx = anchor;
+
+                uint64_t limit = anchor;
+                bool infeasible = false;
+                for (size_t id = 0; id < nd; id++) {
+                    const int64_t used_anchor = (int64_t) dmds_full[id].mb.total();
+                    const int64_t used_floor  = (int64_t) dmds_floor[id].mb.total();
+                    const int64_t budget_anchor = dmds_full[id].free - used_anchor - margins[id];
+                    const int64_t budget_floor  = dmds_floor[id].free - used_floor - margins[id];
+                    if (budget_floor < 0) {
+                        infeasible = true; // does not fit even at the minimum context
+                        continue;
+                    }
+                    if (budget_anchor >= 0) {
+                        continue; // fits at the anchor, nothing to do on this device
+                    }
+                    const int64_t rate = (used_anchor - used_floor) / (int64_t) (anchor - floor);
+                    if (rate <= 0) {
+                        infeasible = true; // over budget but not growing with the context
+                        continue;
+                    }
+                    const int64_t delta = (-budget_anchor + rate - 1) / rate; // ctx tokens to free the budget
+                    limit = std::min(limit, (uint64_t) (anchor - delta));
+                }
+
+                if (!infeasible && limit < anchor) {
+                    // the minimum context fits on all devices, the settled size meets the margin on every device
+                    const uint32_t align = (uint32_t) std::lcm<uint32_t>(16384, n_streams);
+                    const uint32_t settled = std::max<uint32_t>((uint32_t) ((limit / align) * align), floor);
+                    cparams->n_ctx = settled;
+                    if (n_ctx_base != nullptr) {
+                        *n_ctx_base = settled;
+                    }
+                    if (extra != nullptr) {
+                        extra->cparams->n_ctx = settled;
+                    }
+                    LOG_WRN("%s: the requested context size of %" PRIu32 " does not fit, settled the context down to %" PRIu32 "\n",
+                        __func__, anchor, settled);
+                    return;
+                }
+                if (infeasible && nd > 0 && mparams->n_gpu_layers == default_mparams.n_gpu_layers) {
+                    // the minimum context does not fit, but the weight placement is not pinned:
+                    // demote the context to the floor, step 3 redistributes the weights, and for a dense
+                    // model a growth pass in step 3 then tries to grow the context back into the slack
+                    cparams->n_ctx = floor;
+                    if (n_ctx_base != nullptr) {
+                        *n_ctx_base = floor;
+                    }
+                    if (extra != nullptr) {
+                        extra->cparams->n_ctx = floor;
+                    }
+                    dmds_full = dmds_floor; // keep the initial measurement consistent with the demoted context
+                    ctx_demote_anchor = anchor;
+                    LOG_WRN("%s: the minimum context size of %" PRIu32 " does not fit with the current weight placement, demoting the context to the floor and redistributing the weights\n",
+                        __func__, floor);
+                } else if (infeasible) {
+                    // the minimum context does not fit and the weight placement cannot be changed
+                    std::string msg = "the requested context size of " + std::to_string(anchor) +
+                        " does not fit into the device memory and the minimum of " + std::to_string(floor) + " does not fit either:";
+                    for (size_t id = 0; id < nd; id++) {
+                        const int64_t deficit = (int64_t) dmds_floor[id].mb.total() + margins[id] - dmds_floor[id].free;
+                        if (deficit > 0) {
+                            msg += "\n  - " + dev_names[id] + " needs " + std::to_string(deficit/MiB) + " MiB less even at the minimum context";
+                        }
+                    }
+                    throw common_params_fit_exception(msg + ", abort");
+                }
+                // here the context was demoted to the floor above, fall through to step 3 for the weight redistribution
             } else {
                 LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
             }
@@ -974,7 +1154,7 @@ static void common_params_fit_impl(
     }
 
     std::vector<ngl_t> ngl_per_device(nd);
-    std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+    std::vector<int64_t> mem;
 
     // optimize the number of layers per device using the method of false position:
     //   - ngl_per_device has 0 layers for each device, lower bound
@@ -983,65 +1163,124 @@ static void common_params_fit_impl(
     //   - check memory use of our guess, replace either the low or high bound
     //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
     //   - the last device has the output layer, which cannot be a partial layer
-    if (hp_nex == 0) {
-        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
-    } else {
-        LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
-    }
-    for (int id = nd - 1; id >= 0; id--) {
-        uint32_t n_unassigned = hp_ngl + 1;
-        for (size_t jd = id + 1; jd < nd; ++jd) {
-            assert(n_unassigned >= ngl_per_device[jd].n_layer);
-            n_unassigned -= ngl_per_device[jd].n_layer;
+    // a second pass re-runs the fill at the grown context, see the growth pass at the end of the loop
+    for (int pass = 0; pass < 2; pass++) {
+        if (hp_nex == 0) {
+            LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
+        } else {
+            LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
         }
+        ngl_per_device.assign(nd, ngl_t{});
+        mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
 
-        std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
-        ngl_per_device_high[id].n_layer = n_unassigned;
-        if (hp_nex > 0) {
-            ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
-        }
-        if (ngl_per_device_high[id].n_layer > 0) {
-            std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-            if (mem_high[id] > targets[id]) {
-                assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
-                uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
-                LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
-                while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                    step_size = std::max(step_size, uint32_t(1));
-                    step_size = std::min(step_size, delta - 1);
+        for (int id = nd - 1; id >= 0; id--) {
+            uint32_t n_unassigned = hp_ngl + 1;
+            for (size_t jd = id + 1; jd < nd; ++jd) {
+                assert(n_unassigned >= ngl_per_device[jd].n_layer);
+                n_unassigned -= ngl_per_device[jd].n_layer;
+            }
 
-                    std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-                    ngl_per_device_test[id].n_layer += step_size;
-                    if (hp_nex) {
-                        ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
-                            step_size - 1 : step_size; // the first layer is the output layer which must always be full
+            std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+            ngl_per_device_high[id].n_layer = n_unassigned;
+            if (hp_nex > 0) {
+                ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
+            }
+            if (ngl_per_device_high[id].n_layer > 0) {
+                std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+                if (mem_high[id] > targets[id]) {
+                    assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
+                    uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                    LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
+                    while (delta > 1) {
+                        uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                        step_size = std::max(step_size, uint32_t(1));
+                        step_size = std::min(step_size, delta - 1);
+
+                        std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                        ngl_per_device_test[id].n_layer += step_size;
+                        if (hp_nex) {
+                            ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
+                                step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                        }
+                        const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
+
+                        if (mem_test[id] <= targets[id]) {
+                            ngl_per_device = ngl_per_device_test;
+                            mem            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                        } else {
+                            ngl_per_device_high = ngl_per_device_test;
+                            mem_high            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
+                        }
+                        delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                     }
-                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
-
-                    if (mem_test[id] <= targets[id]) {
-                        ngl_per_device = ngl_per_device_test;
-                        mem            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
-                    } else {
-                        ngl_per_device_high = ngl_per_device_test;
-                        mem_high            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
-                    }
-                    delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                } else {
+                    assert(ngl_per_device_high[id].n_layer == n_unassigned);
+                    ngl_per_device = ngl_per_device_high;
+                    mem            = mem_high;
+                    LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
                 }
-            } else {
-                assert(ngl_per_device_high[id].n_layer == n_unassigned);
-                ngl_per_device = ngl_per_device_high;
-                mem            = mem_high;
-                LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+            }
+
+            const int64_t projected_margin = dmds_full[id].free - mem[id];
+            LOG_TRC(
+                "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+                __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        }
+
+        if (pass == 0 && ctx_demote_anchor > 0 && hp_nex == 0) {
+            // the context was demoted to the floor above, and this fill kept every layer on the
+            // devices at the floor, so there is slack to grow the context back into
+            uint32_t n_layers_total = 0;
+            for (size_t id = 0; id < nd; id++) {
+                n_layers_total += ngl_per_device[id].n_layer;
+            }
+            if (n_layers_total == hp_ngl + 1 && ctx_demote_anchor > cparams->n_ctx) {
+                const uint32_t ctx_floor = cparams->n_ctx;
+
+                llama_model_params mparams_floor = *mparams;
+                set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_floor);
+
+                cparams->n_ctx = ctx_demote_anchor;
+                dmds_t dmds_anchor = common_get_device_memory_data_impl(
+                    path_model, &mparams_floor, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                add_extra_memory(dmds_anchor);
+
+                uint64_t limit = ctx_demote_anchor;
+                for (size_t id = 0; id < nd; id++) {
+                    const int64_t used_anchor = (int64_t) dmds_anchor[id].mb.total();
+                    const int64_t used_floor  = mem[id];
+                    if (used_anchor <= targets[id]) {
+                        continue; // fits at the anchor, nothing to do on this device
+                    }
+                    const int64_t rate = (used_anchor - used_floor) / (int64_t) (ctx_demote_anchor - ctx_floor);
+                    if (rate <= 0) {
+                        limit = 0; // over budget but not growing with the context
+                        break;
+                    }
+                    const int64_t delta = (used_anchor - targets[id] + rate - 1) / rate; // ctx tokens to free the budget
+                    limit = std::min(limit, (uint64_t) (ctx_demote_anchor - delta));
+                }
+
+                const uint32_t align = (uint32_t) std::lcm<uint32_t>(16384, n_streams);
+                const uint32_t grown = std::max<uint32_t>((uint32_t) ((limit / align) * align), ctx_floor);
+                if (grown > ctx_floor) {
+                    cparams->n_ctx = grown;
+                    if (n_ctx_base != nullptr) {
+                        *n_ctx_base = grown;
+                    }
+                    if (extra != nullptr) {
+                        extra->cparams->n_ctx = grown;
+                    }
+                    LOG_WRN("%s: the requested context size of %" PRIu32 " does not fit, settled the context down to %" PRIu32 " with the redistributed weights\n",
+                        __func__, ctx_demote_anchor, grown);
+                    continue; // run the fill again at the grown context
+                }
+                cparams->n_ctx = ctx_floor;
             }
         }
-
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_TRC(
-            "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
-            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        break; // a second pass only happens when the growth pass above re-ran the fill
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
@@ -1202,12 +1441,13 @@ enum common_params_fit_status common_fit_params(
         uint32_t n_ctx_min,
         uint32_t n_ctx_max_user,
         uint32_t * n_ctx_base,
+        int32_t adaptive_ctx,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, n_ctx_max_user, n_ctx_base, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, n_ctx_max_user, n_ctx_base, adaptive_ctx, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

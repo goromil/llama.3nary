@@ -479,7 +479,7 @@ struct common_params {
     int32_t adaptive_ctx_idle  = 30;   // idle seconds before shrinking the KV cache in place (full mode), 0 = grow-only
     int32_t fit_params_min_ctx =   -1;  // minimum total ctx size the fit may shrink to, set by --adaptive-ctx-min, -1 = auto
     int32_t fit_params_max_ctx =    0;  // maximum total ctx size the fit may grow to, set by --adaptive-ctx-max, 0 = do not grow
-    uint32_t fit_ctx_base      = 0;    // total ctx size the fit settled before growing, 0 = the fit did not grow the context
+    uint32_t fit_ctx_base      = 0;    // total ctx size the fit settled (before growing, or after settling down), 0 = the fit did not settle the context
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

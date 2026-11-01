@@ -1116,9 +1116,20 @@ private:
         // the floor of the idle shrink: an explicit min wins, otherwise the size the fit settled before growing
         n_ctx_base = params_base.fit_params_min_ctx > 0 ? params_base.fit_params_min_ctx
                 : params_base.fit_ctx_base != 0       ? params_base.fit_ctx_base : n_ctx;
-        n_ctx_max  = params_base.adaptive_ctx == COMMON_ADAPTIVE_CTX_FULL
-                     ? (params_base.fit_params_max_ctx > 0 ? params_base.fit_params_max_ctx : n_ctx)
-                     : 0;
+        // the grow ceiling: an explicit --adaptive-ctx-max wins, otherwise the training context total,
+        // the loaded size only sets the starting point, the allocation gate enforces the physical limit
+        int32_t n_ctx_max_full = 0;
+        if (params_base.adaptive_ctx == COMMON_ADAPTIVE_CTX_FULL) {
+            if (params_base.fit_params_max_ctx > 0) {
+                n_ctx_max_full = params_base.fit_params_max_ctx;
+            } else {
+                const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+                const int n_seq_max   = llama_n_seq_max(ctx_tgt);
+                const int n_streams   = params_base.kv_unified ? 1 : std::max(1, n_seq_max);
+                n_ctx_max_full = n_ctx_train > 0 ? (int32_t) std::min((int64_t) n_ctx_train * n_streams, (int64_t) INT_MAX) : 0;
+            }
+        }
+        n_ctx_max = n_ctx_max_full;
 
         if (params_base.adaptive_ctx != COMMON_ADAPTIVE_CTX_NONE) {
             SRV_INF("adaptive ctx: mode=%s base=%d max=%d idle=%ds\n",

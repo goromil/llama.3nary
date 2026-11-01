@@ -65,6 +65,7 @@ int llama_fit_params(int argc, char ** argv) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), n_ctx_min_user, n_ctx_max_user,
                 &params.fit_ctx_base,
+                params.adaptive_ctx,
                 has_draft || spec_mtp ? &extra : nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {

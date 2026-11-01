@@ -1331,6 +1331,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             n_ctx_min_user,
             n_ctx_max_user,
             &params.fit_ctx_base,
+            params.adaptive_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }

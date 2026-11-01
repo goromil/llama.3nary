@@ -24,9 +24,10 @@ struct common_fit_extra_model {
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state
-//   - only parameters that have the same value as in llama_default_model_params are modified
-//     with the exception of the context size which is modified if and only if equal to 0,
-//     or grown up to n_ctx_max_user when that is non-zero
+//   - only parameters that have the same value as in llama_default_model_params are modified,
+//     except the context size: an auto (0) context is resolved, an explicit one may be grown
+//     up to n_ctx_max_user, and when adaptive_ctx is not NONE an over-budget explicit context
+//     is also settled down into the free memory of the weight placement instead of aborting
 common_params_fit_status common_fit_params(
                          const char * path_model,
                  llama_model_params * mparams,
@@ -37,6 +38,7 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                            uint32_t   n_ctx_max_user,        // opt-in: grow the context up to this total size, 0 = do not grow
                            uint32_t * n_ctx_base,            // out: the settled context size before growing, nullptr if not needed
+                           int32_t    adaptive_ctx,          // common_adaptive_ctx_mode, the fit settles the context down when it is not NONE
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
