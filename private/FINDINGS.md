@@ -445,14 +445,21 @@ second 27B (user accepted that as a future router option, 10-20).
 [certain] The fork has a 4th split mode, EXPERIMENTAL: one Meta device
 wrapping the real backends; weights AND KV are split across devices;
 per-subgraph all-reduce (vLLM-TP style).
-- Run: `--split-mode tensor --fit off -ngl all -dev SYCL0,SYCL1`.
-  An all-zero tensor_split = even split. `--fit off` is effectively
-  mandatory (fit does not understand the meta device).
+- Run: `--split-mode tensor -ngl all -dev SYCL0,SYCL1`.
+  An all-zero tensor_split = even split.
+  [correction 11-01] `--fit off` was mandatory only before F32 (10-25,
+  1011b639d) shipped the tensor fit, which sizes the ctx on the meta
+  device by a real load + ctx creation; it now works for the no-draft
+  case. A draft still aborts the tensor fit (the impl measured only
+  the main model) - tracked in the F40 addendum, fixed 11-01.
 - MTP under tensor mode works. GDN output QUALITY in tensor mode is
   correct for the non-ternary Q5_K_S (user runs fine, 31.9 t/s at 160K
   ctx, 10-22).
 - This finding set (F19-F25) targets making the ternary PTQ1_0/PQ2_0
-  models tensor-mode compatible; the blocker is F20.
+  models tensor-mode compatible; the F20 blocker is RESOLVED by B12
+  (DONE 10-23, 7cb134632, the load-time weight fold): PQ2_0 AND
+  PTQ1_0 27B verified in tensor mode, no assert, sane output
+  (F26/F27).
 
 ## F20. PQ2_0 tensor-mode assert - ROOT CAUSE (confirmed)
 
@@ -2095,3 +2102,411 @@ cap for n_ctx_max), so a nonzero runtime grow span survives;
 (c) optional - one log line for where the draft lands (card +
 model/ctx/compute MiB). Any code change = wide rebuild + stop-
 window deploy.
+
+[implemented 10-29] The B19 fix is in the working tree (NOT
+committed - commit/push gated on explicit user permission,
+deploy needs a stop window, F37 risk zone live). fit.cpp: the
+fit API takes the adaptive-ctx mode (int32_t, threaded from
+common_fit_params; llama-bench passes NONE). In step 2 of the
+explicit-ctx branch, when the mode is not NONE and the
+requested ctx is at or above the min, the requested size is
+NOT enforced: the context is settled down into the free
+memory of the current weight placement (both split modes),
+aligned down by lcm(16384, n_streams), clamped to the
+train-ctx total cap, with a WARN ("the requested context
+size of X does not fit, settled the context down to Y"). If
+the minimum does not fit in the current placement: unpinned
+ngl and nd > 0 demotes the context to the floor, re-measures,
+and falls through to step 3 (the existing weight
+redistribution); pinned ngl or nd == 0 aborts with the
+per-device deficit at the floor ("needs N MiB less even at
+the minimum context"). The old "n_gpu_layers already set by
+user" abort remains for the NONE mode only.
+server-context.cpp: the adaptive-FULL grow ceiling is the
+explicit --adaptive-ctx-max when set, else the training
+context total (unified KV: 1 stream, else max(1, n_seq_max);
+saturated at INT_MAX; train ctx 0 -> 0); the loaded size
+only sets the starting point, the allocation gate keeps
+enforcing the physical limit. Locked semantics: half =
+static load-time settle into [min, a-max], no ring; full =
+half + the runtime ring. The DEVICE_LOST class (51823) is
+closed for the adaptive modes: an over-budget explicit ctx
+settles instead of OOMing at the real allocation, and an
+infeasible floor aborts BEFORE the load with the deficit.
+The NONE behavior is untouched. Known edge, unchanged on
+purpose: ngl unpinned + the floor does not fit anywhere ->
+step 3 walks the weights to CPU and keeps the requested ctx
+(the old all-CPU "solution", recommendation (2) above).
+
+[verified 10-29] llama-fit-params, the 56146 argset, live
+child 49822 co-residing (all numbers co-residency-dependent;
+the measurement is no-alloc, proven above). NONE control
+(163840 + 999): unchanged, the old "n_gpu_layers already set
+by user to 999, abort". New deficit abort, cards full
+(163840 and 131072 + 999): "the requested context size of X
+does not fit into the device memory and the minimum of 4096
+does not fit either: SYCL0 needs 6681-6682 MiB less even at
+the minimum context; SYCL1 needs 14918 MiB less". Exact-
+floor case (4096 + 999): the same deficit message instead of
+the ngl message (after relaxing the branch guard > to >=;
+when anchor == floor the rate division is unreachable, both
+continue guards fire first). Placement probe (ngl 8): SYCL0
+44 MiB, SYCL1 5270 MiB less at the floor - the SYCL1 number
+is the 1-layer draft's compute reservation at batch 6144
+(~1010 MiB at batch 1024). In-budget passes, exit 0,
+--fit-print, cards free at the probe moment: 163840 + 999
+and 163840 + ngl-auto give the identical table (SYCL0
+6983/1966/9625, SYCL1 10125/2471/14701, Host 682/0/7922 MiB,
+model/ctx/compute); 163840 + ngl 4 + batch 1024: SYCL0
+563/252/757, SYCL1 1329/0/1010, Host 15897/4186/500.
+
+[not yet caught 10-29] The settle-down WARN (floor fits,
+anchor over) and the demote-to-floor WARN were NOT observed
+live while the live service co-resides. The card free memory
+swings 6-14 GiB per card within minutes while the user's
+chats allocate/free prompt cache + KV: the 27B Q5_K_S
+weights + the 9.5 GiB draft extra either fit at the anchor
+(free cards -> pass) or not even at the floor (full cards ->
+deficit abort); the settle window is the transient band in
+between. 60 runs so far (12 in the two verification rounds +
+48 across two hunt loops of 16 + 32, alternating pinned-999
+and ngl-auto, 5 s apart) hit only the two terminal states. The branches are simple
+and source-reviewed; re-check at the deploy stop window or
+on actually free cards (the 59148 class).
+
+## F40 addendum. Tensor-mode draft fit (11-01)
+
+Answers the 11-01 question on the tensor-mode draft rejection.
+
+[proven 11-01] The tensor-mode draft rejection (fit.cpp:219-220,
+"an extra (draft/MTP) model is not supported with SPLIT_MODE_
+TENSOR") is a FIT deficiency, not a backend limitation:
+- the runtime loads the draft in tensor mode: it inherits split_mode
+  from the main params (common_base_params_to_speculative,
+  speculative.cpp:3082) and loads on its own meta device over the
+  same cards (speculative.cpp:3172);
+- no runtime site rejects a draft in tensor mode (all 25
+  SPLIT_MODE_TENSOR refs checked); the tensor requirements are FA
+  mandatory (llama-context.cpp:3929-3937), arch sm_tensor, >= 1 dev;
+- the tensor fit (F32) measures the meta device by a REAL load + ctx
+  creation (the split is only known at allocation time, so the no-
+  alloc projection is unusable) and was written for the main model
+  only; the layer fit measures the draft via the no-alloc projection
+  (add_extra_memory, fit.cpp:487-541), which is exactly what cannot
+  work in tensor mode, so the draft measurement was never ported.
+- the "ternary tensor blocker is F20" framing is stale: B12 (DONE
+  10-23, 7cb134632, the load-time weight fold) resolved it; PQ2_0 AND
+  PTQ1_0 27B verified in tensor mode, no assert, sane output
+  (F26/F27). The user's "requant solution" IS that fold (dequant +
+  FWHT + signs + requant of the 128 axis-split weights, graph skips
+  the perm).
+- the production blocker for tensor mode is NOT the fit: the user's
+  tensor runs crash after 2-3 h of work with a host "bad allocation"
+  (investigated, no clear root cause; the bad_alloc thread).
+
+[implemented 11-01, built] The tensor fit now real-loads the extra
+model on the same cards and adds its per-card weights + ctx to the
+per-card budget (working tree, NOT committed; shares_model = false,
+i.e. the separate-draft F40-(a) config; the pure-MTP shares_model =
+true case still aborts). At every measurement point both contexts are
+created resident at the same n_ctx, as in the runtime (speculative.
+cpp:3158 sets the draft n_ctx to the target's), via a new
+tensor_measure_ctx_two helper; the per-card budget baseline moves to
+the free-after-both-models. llama-common built clean.
+This is the tensor-mode draft fit the F40 layer-mode numbers were
+missing.
+
+[measured 11-01] -b/-ub memory probes: 7 no-alloc fits (E:\tmp\
+fitprobe-P1..P7.log, rig E:\tmp\fit-probe.ps1) on the 56146 argset
+(Q5_K_S main + mtp-Q4_0 draft, draft-mtp, KV q5_1 + q4_0 draft, FA
+on, ngl 999, -t 56 -tb 28), live service co-resident (free memory
+swings, numbers co-residency dependent). P1-P5: ctx 163840, b 6144
+(P5: b 2048), ub 512/1024/2048/6144 (P5: 512); P6: ctx 4096 b 2048
+ub 512; P7: ctx 4096 b 6144 ub 6144. All 7 measured; 6 exit 1 on the
+expected fit.cpp:959-961 abort ("n_gpu_layers already set by user")
+after the projection misses the 1024 MiB target with -ngl pinned;
+P6 met the target and exited 0.
+
+model/ctx/compute MiB, SYCL0 / SYCL1 (draft all on SYCL1):
+
+probe  ctx     b     ub    main S0          main S1          draft
+P1     163840  6144  512   8447/2496/ 803   8661/1941/ 1226  774/180/843
+P2     163840  6144  1024  8447/2496/1605   8661/1941/ 2451  774/180/1685
+P3     163840  6144  2048  8447/2496/3209   8661/1941/ 4901  774/180/3369
+P4     163840  6144  6144  8447/2496/9625   8661/1941/14701  774/180/10105
+P5     163840  2048  512   8447/2496/ 803   8661/1941/ 1226  774/180/843
+P6     4096    2048  512   8447/ 390/ 179   8661/ 303/  602  774/  4/ 219
+P7     4096    6144  6144  8447/ 390/1425   8661/ 303/ 4809  774/  4/1745
+
+[proven 11-01] the probe verdicts:
+- -b has ZERO memory footprint: P1 (b 6144) vs P5 (b 2048) are
+  identical to the MiB in every column. The physical -ub is the only
+  memory knob.
+- main CTX is -b/-ub independent: 2496/1941 @163840, 390/303 @4096,
+  constant in every probe of the same ctx.
+- main COMPUTE is linear in ub, zero intercept: @163840 rate 1.5664
+  (SYCL0) / 2.3926 (SYCL1) MiB/token.
+- the earlier "main compute is ctx-independent" note is NOT
+  supported: the per-token rate @4096 drops to 0.348/1.174
+  (179/602 @ub512, 1425/4809 @ub6144, eff ub clamped to 4096) vs
+  1.566/2.393 @163840. Consistent with the effective-ubatch clamp
+  min(ub, b, ctx) plus a ctx-dependent per-token rate.
+- draft compute (SYCL1) is linear in ub, zero intercept: @163840
+  1.645 MiB/token (843/1685/3369/10105 @512/1024/2048/6144); @4096
+  0.427 (219 @512, 1745 @eff 4096). Draft ctx: 180 @163840, 4 @4096.
+- a ctx x ub interaction exists in COMPUTE (4096 -> 163840 delta at
+  equal ub: draft +624 @ub512, +8360 @ub6144; main +624 on both
+  cards @ub512, +8200 S0 / +9892 S1 @ub6144): the ctx scaling of
+  compute is not a fixed per-ctx amount, it grows with ub.
+- the B19 byte rate overstates the draft marginal ctx cost at large
+  -ub (the 6144 delta above); direction is conservative (the fit
+  rejects, never accepts a non-fit). No code change: the service
+  runs the default -ub 512.
+- config guidance: keep -b generous, cap -ub at 512; the draft
+  compute budget at -ub 512 is ~843 MiB on SYCL1 @163840.
+
+## F40 addendum 2. 10-31 crash and hang forensics
+
+The 236.5 MB llama.log range (1108624-3978873) was truncated by the
+user 10-31; this section is the consolidated 11-01 recovery of the
+10-31 analysis (source text E:\tmp\crash-msgs.txt, session DB). All
+10-31 runs used the DEPLOYED pre-B19 binary (C:\Users\admin\.local\
+3nary-sycl\llama-server.exe, 10/30 9:34:31): the evidence is
+pre-B19/B20.
+
+[proven 10-31] the ternary+MTP crash law, corrected:
+- 8/8 DEVICE_LOST before 11-01: 54775/63386/50594 (PTQ), 61600/
+  59425/49704/65335 (PQ), 56807 (PTQ, 10-31, first VERBOSE crash).
+  7/7 before 10-31.
+- CORRECTION: 50323/57928 had NO "loading draft model" line
+  (speculative.cpp:3166) = ran WITHOUT MTP; they do not count.
+  Ternary without MTP is clean.
+- Q4/Q6 + MTP serve: 60406 Q6_K+MTP (1124 tok @ 7.84 t/s); 51358
+  Q4+MTP = the only clean 8192-cliff data (prompt 6201 tok @18.7
+  t/s, 12-15 t/s to total 8191, cliff at 8192 = 2^13, 0.5-2.2 t/s
+  decaying to tg_3s 0.80 at n_gen 2392, GPU 11%/1% = stall,
+  MTP-gated, RS sizing ruled out).
+
+[measured 10-31] 56807 (PTQ+MTP, -lv 4 + GGML_SYCL_DEBUG=1) verbose
+crash anatomy - the device degraded BEFORE the crash:
+- t=2.64 s: 65/65 layers offloaded; t=3.97 s: "constructing
+  llama_context"; then 17 min of degradation; t=17:04: mmproj
+  loaded, 9 more 384 MiB clears, DEVICE_LOST on the next one
+  (ggml-sycl.cpp:821, memset(...).wait()).
+- the 17 min = 74,382 log lines (73,331 [SYCL] call lines + 37
+  buffer_clears + ~114 other) clearing 384 MiB chunks (1.25 GB +
+  1.15 GB RS buffers): 73 lines/s vs 10,500 lines/s in 62509's
+  identical phase (144x slower), ~14 ms/op, ~27 s per 384 MiB clear
+  (~14 MiB/s), i.e. 100-1000x op latency.
+
+[measured 10-31] 62509 (Q4+MTP verbose) - "utterly slow" is a LOG
+RATE ARTIFACT, not a device problem:
+- 57 min, ~330 tokens, gen 0.10-0.24 t/s from the FIRST token
+  (n_gen=102 -> 0.24 t/s; slot 2 at 0.10 t/s, both far below 8192)
+  -> NOT the 8192 cliff; user stopped it (log ends mid-synchronize).
+- ~11,912-11,960 log lines between consecutive gen tokens (617,552
+  [SYCL][OP] lines total) through the macube line-wise logger at
+  0.3-0.8 ms/line = 3.5-9.5 s/token, exactly the observed rate.
+- prefill was alive: 25.4 -> 21.0 -> 14.4 -> 12.3 -> 8.93 t/s (task
+  0 ~27k tok, task 2 6201 tok done @8.93). Confounders: two
+  concurrent prompt tasks + GGML_SYCL_DEBUG. Sample op: blk.52 GDN
+  conv-state cpy to cache_r_l52 (view), ne=[30720, 2] strided.
+- 56828 (Q4+MTP verbose, user-killed at t=7:58): same artifact in
+  the prompt phase (crawling 25.4 -> 20.9 t/s).
+
+[measured 10-31] buffer geometry:
+- 62509 (Q4+MTP, n_ctx=163840, n_rs_seq=3, FA on, 4 slots,
+  adaptive-ctx full base 163840 max 262144 idle 30 s): target SYCL0
+  7216.24 + SYCL1 8836.98 + host 682.03 MiB (16.6 GB, 66/66
+  offloaded); RS SYCL0 1246.88 + SYCL1 1147.12 MiB (2.35 GB); draft
+  SYCL1 774.71 + host 521.00 MiB.
+- 56807 (PTQ+MTP): CPU 265.23 + SYCL0 2646.02 + SYCL1 2749.32 MiB
+  (5.5 GB, 65/65), "loaded 402 Hadamard-folded weight(s)".
+
+[measured 10-31] hangs - the DEVICE_LOST sibling (CPU 0%, silent,
+alive, port Listen), in the post-churn window:
+- 53342: PID 10420, hung t=2.15 s into load, 13.34 GB WS, silent
+  63+ min, 15 s after the prior stack was killed (00:37:54 restart
+  -> 712/8080; child 10420/53342 at 00:38:09). 15 blk.64 unused-
+  tensor warnings (attn_q 51.6 MB, attn_k/v 5.5 MB each,
+  attn_output 25.8 MB, ffn_gate/down/up 73.1 MB each, nextn.eh_proj
+  43 MB, nextn.enorm/hnorm/shared_head_norm 2 KB each) -> plain
+  NON-MTP base-27B load (NOT the PTQ file: 56807 logged zero unused-
+  tensor warnings; n_nextn=0; the Q4 gguf contains full blk.64,
+  unused when non-MTP).
+- 59499: PID 25964, 17:58:25, banner-only log, 0% CPU, ~3.9 GB WS,
+  no "listening on" 40+ min - AFTER the -b/-ub removal, so -b/-ub
+  does not explain every hang.
+- the macube logger lost the first ~200 ms of 53342 (params/build/
+  env/"loading model") and 59499's whole load phase.
+
+[found 10-31, user] -b 6144 -ub 6144 was the PTQ/PQ MTP load-hang
+culprit (removed from the service args, loads resumed). "changing
+-actx full to half did not help me with the issue." It does not
+explain the 59499 hang above.
+
+[refined 10-31, FALSIFIABLE] release-lag window theory: after a
+kill the device holds a release-lag window; MTP adds a 1.3-3.4 GiB
+draft allocation (geometry above) that lands inside it. Small
+ternary targets load in <1 s so the allocation falls in the window;
+Q4/Q6 (17-20 GB, disk-bound >2 s) miss it. PREDICTION: PTQ+MTP
+COLD (no preceding kill) loads clean. The T1 cold test
+(E:\tmp\cold-test.ps1 + T1.bat/T1b.bat, written 10-31, NOT launched)
+decides it; needs an explicit service-stop window.
+
+[measured 10-31] log and service facts:
+- llama.log format "[tag] D.MM.SS.mmm", tag = PORT (proven: 56492 =
+  the port owned by PID 23144); NO [8080] lines ever: router parent
+  -> stderr llama-error.log, model children -> stdout llama.log
+  (port-tagged by the router forwarding).
+- GGML_SYCL_ENABLE_MKL_FA is real (fattn.cpp:150 default 1,
+  ggml-sycl.cpp:340, docs/backend/SYCL.md:804).
+- 3nary-sycl service config (services.json): deployed pre-B19
+  binary, router mode + --ui-mcp-proxy, GGML_SYCL_DEVICE=0 (single-
+  GPU pin), GGML_SYCL_DEBUG=0, GGML_SYCL_MEMTRACE=0,
+  GGML_SYCL_ENABLE_MKL_FA=1, -lv 2, --adaptive-ctx full, defaults
+  -b 2048/-ub 512, NO --fit, NO prompt-cache. eval-3nary-sycl
+  (8090, build\bin) HAS --fit.
+
+[hunted 10-31, OPEN] bad_alloc (uncaught std::bad_alloc, client
+disconnect, Q MTP models, pre-B19 binary; the log context was lost
+to truncation):
+- the ONLY server-side catch = the prompt-cache state alloc
+  (server-task.cpp:1767, commit b8372eecd94, 2025-11-24, in the
+  deployed binary) and prompt-cache is OFF in the config -> RULED
+  OUT; the user's throw is uncaught elsewhere (terminate to stderr).
+- no MTP-path host alloc scales with prompt size: bounded by
+  n_batch=2048 (batch.embd ~42 MiB, unmasked embd_nextn =
+  n_embd_out x n_batch ~42 MiB at llama-context.cpp:2390, verify_h
+  ~42 MiB/ubatch); output_reserve (llama-context.cpp:2357-2525)
+  sizes by n_outputs_max = max(n_outputs, n_seq_max) (chat = 1-4
+  tokens) and allocs via ggml_backend_buft_alloc_buffer -> nullptr
+  + logged error, NON-throwing.
+- remaining theory: host-RAM exhaustion under load (uncaught
+  std::vector/malloc growth). Proposed (awaiting user call):
+  (a) detached log-tail watcher (last ~200 lines of llama.log +
+  llama-error.log to E:\tmp every 3 s); (b) top-level try/catch +
+  stack trace (needs user OK + rebuild + deploy).
+
+[open 10-31] TG-status discrepancy: the user's "TP" = the TG status
+line (n_gen = ..., tg = ... t/s) and -lv 2 was expected to suppress
+it. It is SLT_INF (print_timings_tg, server-context.cpp:594; the
+-lv scale arg.cpp:3936-3949: 2=warning, 3=info) so current source
+SHOULD suppress it at -lv 2 (same for print_timings_pp :597,
+draft-acceptance :663; common_speculative_print_stats
+speculative.cpp:3554 is SPC_TRC). The user's display does not match
+current source - blocked on a sample line (macube UI timings vs CLI
+vs another log line).
+
+## B20. Constrained joint solve over (ctx, weight placement) (10-29/10-30)
+
+[implemented 10-29] In the working tree (NOT committed;
+same two-commit plan as B19, gated on explicit user
+permission; deploy needs a stop window). Design:
+private/DESIGN-adaptive-fit.md. Code: common/fit.cpp only,
+no new API (reuses the adaptive-ctx param B19 added).
+Mechanism: pass 0 is the B19 floor fill (zero extra cost);
+when that fill keeps every layer on the devices (sum ngl ==
+hp_ngl + 1) and the demoted anchor is above the floor, one
+growth pass measures the floor placement once at the anchor
+ctx, computes the per-device byte rate
+(used_anchor - used_floor) / (anchor - floor), and grows
+ctx into the per-device slack to C* (min over devices of
+anchor - ceil((used_anchor - target) / rate), aligned down
+by lcm(16384, n_streams), clamped to the floor); the fill
+then re-runs once at C* (pass 1). Growth WARN: "settled the
+context down to X with the redistributed weights", on top of
+the kept B19 demote WARN (design q1). No growth: n_ctx
+restored to the floor. Dense models only (hp_nex == 0
+guard); MoE and the non-demoted paths run exactly one pass,
+byte-identical to B19 (q3). C* alignment = lcm(16384,
+n_streams) as in B19 (q2).
+
+[deviation 10-29] The design's low-bound sketch is dead,
+source-verified: the KV follows the layers (the KV buffer
+type is the layer's device, llama-kv-cache.cpp:205), so at
+ngl 0 the GPU holds NO KV; the floor placement's low bound
+is the sched workspace (~0), not a KV footprint. The
+growth window itself: on imbalanced cards the initial
+proportional split over-budgets at the floor while the
+fill can still keep all 66 layers on the devices, and the
+slack between the floor and the anchor is what the growth
+pass spends.
+
+[verified 10-29/10-30] llama-fit-params, the 56146 argset,
+live child 49822 co-residing, REAL fit runs (no --fit-
+print; see the [fact] below). All numbers
+co-residency-dependent.
+- v1 NONE control (163840 + 999 + none): exit 1,
+  unchanged "n_gpu_layers already set by user to 999,
+  abort".
+- v2 pinned in-band (163840 + 999 + full): exit 1, the
+  B19 per-device deficit throw, SYCL0 6697 / SYCL1 14919
+  MiB less. Branch unchanged.
+- v5 exact-floor pinned (4096 + 999 + full): exit 1, the
+  same deficit message (SYCL0 needs 6452 MiB less even at
+  the minimum context; SYCL1 needs 15197 MiB less). Branch
+  unchanged.
+- v3 ngl-auto (163840 + full, unpinned): 8 runs (f1-f5
+  10-29, g1-g3 10-30, 10-20 s apart), ALL landed on the
+  full-card terminal state (per-card free at run time
+  ~2.9-3.3 / ~4.2 GiB). Every run: the B19 demote WARN
+  "the minimum context size of 4096 does not fit with the
+  current weight placement, demoting the context to the
+  floor and redistributing the weights" (caught live here;
+  supersedes the [not yet caught 10-29] line of the F40
+  addendum above for the demote WARN specifically), the
+  fill walks SYCL0 47 -> 0 layers (SYCL1 stays at 0 layers,
+  2524 MiB = the draft's 774 + 4 + 1745), the final fill
+  line "SYCL0: 0 layers, 5128 MiB used, -2062..-2093 MiB
+  free", exit 0, fitted args "-c 4096 -ngl 0". The B20
+  growth guard was false in every run (n_layers_total 0,
+  needs 66) - correctly not fired.
+- v6 code review: full B20 hunk diff; invariants hold
+  (see [invariants] below).
+
+[not yet caught 10-30] The B20 growth WARN has NOT been
+observed live: 8/8 ngl-auto runs hit the terminal state.
+The growth band needs imbalanced cards - one card ~10-12
+GiB free so the initial proportional split over-budgets at
+the floor while the fill keeps all 66 layers on the
+devices. Deterministic catch planned for the stop window:
+occupy card 0 with the same 27B (small ctx, ~22-24 GiB),
+then run the probe. The settle-down WARN (floor fits in
+the current placement) is still not caught either (F40
+above).
+
+[fact 10-29] --fit-print on SKIPS the fit entirely
+(fit-params.cpp:35, 103-108: it prints the raw
+common_fit_print projection and exits 0). So the "In-
+budget passes" tables in the F40 [verified 10-29] entry
+above (and the b20 round-1 v2/v3 probes) are raw initial
+projections, NOT fit results - the fit never ran there.
+Real fit probes omit --fit-print; on success the tool
+prints the fitted args (-c X -ngl Y [-ts ...]).
+
+[edge 10-29] Pre-existing silent-violation edge, caught
+live in the terminal state (f1-f5, g1-g3): even the 0-
+layer SYCL0 footprint (5128 MiB at floor ctx = 994 +
+4134) exceeds the per-device target (free ~3.3 GiB minus
+the 1024 MiB margin), so the final fill reports negative
+free (-2062..-2093 MiB) and the fit still prints
+"successfully fit" + "-c 4096 -ngl 0" - there is no final
+per-device check after the fill (B19 behavior, out of
+scope for B20). SYCL1's 0-layer footprint (2524 MiB) is
+under its target, so the bottleneck is SYCL0's draft
+footprint, dominated by the 1-layer draft's compute
+reservation at batch 6144.
+
+[invariants 10-29] The growth pass fires at most once
+(pass guard) and only when pass 0, ctx_demote_anchor > 0,
+hp_nex == 0 (dense), n_layers_total == hp_ngl + 1, and
+ctx_demote_anchor > cparams->n_ctx. The anchor
+measurement is one no-alloc measurement of the floor
+placement at the anchor ctx. The linear estimate decides
+only how much to grow: the fill accepts only slices
+verified by a direct no-alloc measurement at the exact
+settled ctx, so an overestimated C* costs the bottleneck
+device layers in pass 1 (they walk to the host); no device
+overflow is possible, the floor placement fits by
+construction, and the host is the sink with no budget.

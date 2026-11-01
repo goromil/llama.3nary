@@ -524,10 +524,49 @@ Each item: what / why / how / exit criteria / status.
   use the grow cap for n_ctx_max), so base < max survives;
   (c) optional - one log line for where the draft lands (card +
   model/ctx/compute MiB). (a) is the minimal, safest piece.
-- exit: user picks none / (a) / (a)+(b) / more; until then the
-  operational workaround is F40's (cap ctx to the fit projection
-  while co-resident, or run MTP trials on free cards; do NOT
-  rely on dropping the pinned ngl - under co-residency the fit
-  "solution" is -ngl 0, an all-CPU model).
-- status: OPEN 10-29 - findings recorded (F40), no code written,
-  no user decision yet.
+- exit: user picked the behavior fix, refined by the standing
+  rule "adaptive ctx is always privileged": an over-budget
+  explicit ctx is settled DOWN by the fit into the free memory
+  of the weight placement (both split modes) instead of
+  aborting, and the adaptive-FULL grow ceiling becomes the
+  training context total (or an explicit --adaptive-ctx-max)
+  instead of the loaded size. The pinned-abort message is
+  replaced by the per-device deficit at the minimum ctx.
+  Option (c) draft-placement log: REJECTED.
+- status: CLOSED 10-29 - fix implemented, built (build-sycl.ps1),
+  and verified with llama-fit-params (results in the F40
+  addendum). Working tree only: NOT committed - commit/push
+  gated on explicit user permission; deploy needs a stop window
+  (F37 risk zone live).
+
+## B20. Constrained joint solve over (ctx, weight placement) (10-29)
+- what: the B19 fix is sequential: it settles the context into
+  the free memory of the CURRENT weight placement first, and
+  only if the floor does not fit there (with the ngl unpinned)
+  does it demote to the floor and let step 3 redistribute the
+  weights. A joint solve over the (ctx, per-device ngl) lattice
+  could trade ctx size for layer placement in one pass and find
+  a bigger settled ctx than the sequential path.
+- why: the measured 56146 class shows the gap - with the live
+  service co-residing, the weights alone do not fit on the
+  cards, so the sequential path demotes to the floor (4096) and
+  step 3 redistributes (what does not fit walks to CPU); a
+  joint pass that keeps more layers on the cards at a mid ctx
+  could beat that.
+- exit: implemented 10-29 as a constrained two-pass variant
+  (NOT a full lattice search - see the design doc for the
+  scope and why): pass 0 = the B19 floor fill (zero extra
+  cost); when it keeps every layer on the devices, one growth
+  pass measures the floor placement once at the anchor ctx,
+  computes the per-device byte rates, and grows ctx into the
+  per-device slack to C*, then the fill re-runs once at C*.
+  Dense models only (hp_nex == 0 guard); MoE and the
+  non-demoted paths run exactly one pass, byte-identical to
+  B19. Code: common/fit.cpp only (no new API, reuses the
+  adaptive-ctx param B19 added). Working tree, NOT committed
+  (commit/push gated on explicit user permission; deploy needs
+  a stop window).
+- status: implemented + verified (controls) 10-29/10-30,
+  growth WARN not yet caught live (transient imbalanced band;
+  deterministic catch planned for the stop window). Design:
+  private/DESIGN-adaptive-fit.md. Findings: FINDINGS B20.
