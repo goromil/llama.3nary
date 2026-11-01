@@ -2,52 +2,65 @@
 
 Status markers: [x] done, [ ] open, [B] blocked on user.
 
-## IMMEDIATE NEXT STEPS (fresh session starts here, 10-25)
+## IMMEDIATE NEXT STEPS (fresh session starts here, 11-01)
 
-Context: the 10-22 tensor-mode pivot is COMPLETE (B12 DONE 10-23,
-7cb134632). The 10-24/10-25 work was the KV wall, shipped in two
-stages (both user-approved 10-24: "start both" - no-crash first, then
-auto-size; grow step 16K tokens, no further sizing discussion). The
-SYCL build mystery was root-caused + fixed in between (F30). B14
-(twin-server + router) is drafted, pending the user.
+Context: B12 tensor-mode pivot (10-23, 7cb134632) and the KV wall two
+stages (10-25, 6a30f9157 + db5cf4d80) are SHIPPED; B15 adaptive ctx +
+B17 handover (10-27/28) SHIPPED. B19 (fit settle, F40) + B20 (two-pass
+grow) + the tensor-mode draft fit are COMMITTED (c9c4e20f1) and built,
+NOT deployed. B14 (twin-server + router) is REJECTED 10-28 by the user
+(final, dead end) - the record is BACKLOG B14 + F39, no re-presentation.
+11-01 probes closed the batch-6144 memory question (F40 addendum 1);
+10-31 crash/hang forensics in F40 addendum 2.
 
-1. [x] KV wall stage 1: no-crash at the KV wall (6a30f9157, pushed).
-   n_batch == 1 KV exhaustion ends ONLY the failing slot (clean
-   EXCEED_CONTEXT_SIZE to that client); the others keep generating.
-   decode() bool -> int (file-local decode_result enum). F31.
-2. [x] KV wall stage 2: fit-time auto-size -fitm (db5cf4d80, pushed).
-   Opt-in -fitm / --fit-ctx-max grows a pinned -c into free device
-   memory in 16K-token steps up to the cap, before the margin check;
-   no-op when absent. Verified on-device: 32768 -> 65536 grow with
-   margin pass on both cards; over-budget abort; host-only skip. F31.
-3. [x] SYCL build finding (F30): the SYCL=OFF OOM-bypass builds were
-   CPU-only runtimes, no visible error. Fixed: one-time -DGGML_SYCL=ON
-   reconfigure + ggml-sycl TU rebuild at -j 1 + downstream (all
-   green); build-3nary.bat permanently SYCL=ON.
-4. [x] private/ refresh (F30 + F31 + "for consideration"; BACKLOG
-   B12 DONE / B13 unblock / B7a note / B14 new; STATE full refresh;
-   PLAN here). Commit+push private/ ONLY.
-5. [ ] PRESENT: the B14 twin-server + router draft (registry config
-   shape, -dev SYCL0/SYCL1 pins, aggregated /v1/models, budget via
-   fit.cpp projection, idle-offload + pin/lock) for user confirmation.
-   Grounding owed first: per-backend free-memory surface under a pin,
-   build placement (tools/CMakeLists.txt; unified-binary subcommand vs
-   new tool), router location.
-6. [ ] REPORT to the user: qwen35.cpp 9B MTP fix is GONE from the
-   tree (working file matches HEAD); the SYCL finding + fix; stage-2
-   grow verification (SHAs 6a30f9157, db5cf4d80).
-7. [B] Await the user's extraArgs bisection outcome (-ngl 99 / -np 2 /
-   -c 262144; prediction table in F31) - fold into FINDINGS.
-8. [B] Await a free card (re-derive service VRAM first, PID 212452)
-   -> run the Q5_K_S tensor bench (N17; GDN correctness check first).
-9. [ ] B7a (next code item in this fork): startup loud-fail on
-   unfittable ctx/KV + closed --dev gate. Target:
-   common/fit.cpp:182-183 SPLIT_MODE_TENSOR fit throw + the -sm/-dev
-   parse area. The 10-25 runtime KV work is NOT B7a.
-10. [ ] B13 recon (read-only, clone hosts live service): diff fork vs
-    clone meta backend, ternary enum mapping, missing/divergent work
-    map (F25), seq_rm question (F28). THEN port commit-by-commit,
-    scope user-confirmed.
+1. [B] DEPLOY + verify (needs an 8080 stop window): rebuild build\bin
+   (the 11-01 tensor draft fit is in llama-common only, the exes need
+   re-linking), deploy to macube, then the deterministic live growth-
+   WARN catch (B20) + a sanity run of llama-fit-params tensor + draft
+   fit (real loads, ~2 min+, co-residency-sensitive).
+2. [B] T1 cold test (stop window): PTQ+MTP COLD load decides the
+   release-lag theory (F40 addendum 2; prediction: cold loads clean).
+   Kit ready: E:\tmp\cold-test.ps1 + T1.bat/T1b.bat (atomic
+   stop->test->start); result to E:\tmp\T1-result.txt.
+3. [ ] B7a (next code item in this fork): startup loud-fail on
+   unfittable ctx/KV + closed --dev gate. Target: the SPLIT_MODE_TENSOR
+   fit path + the -sm/-dev parse area (re-locate lines, the 10-25
+   numbers are stale). Note: B19 changed what "unfittable" means -
+   over-budget now settles down, so B7a's fail surface is the settled
+   floor + the pinned-ctx deficit report.
+4. [ ] B13 recon (read-only, clone hosts live service): diff fork vs
+   clone meta backend, ternary enum mapping, missing/divergent work
+   map (F25), seq_rm question (F28). THEN port commit-by-commit, scope
+   user-confirmed.
+5. [ ] N17 Q5_K_S tensor bench (GDN correctness check first): still
+   user-run; no free card while the service holds both - run co-
+   resident (11-01 probe style, variance caveat) or in a stop window.
+6. [B] bad_alloc repro: needs the user's real workload + the next
+   occurrence with preserved log context (logs truncate, the catch
+   site is lost). Proposals on the table: detached log-tail watcher
+   (E:\tmp only) / top-level try-catch + stack trace. Await user call.
+7. [B] TG-status line discrepancy: the user's display shows a TG line
+   that -lv 2 should suppress (SLT_INF, server-context.cpp:594);
+   blocked on a sample line from the user.
+
+## 10-25 items - resolved / retired (reference)
+
+- 1-4 [x] KV wall stage 1 (6a30f9157) + stage 2 -fitm (db5cf4d80) +
+  SYCL=OFF root cause (F30) + private/ refresh: done, pushed.
+- 5 [x] B14 PRESENT (twin-server + router draft): REJECTED 10-28 by
+  the user (final: "I will never start. It was dead end."). Tensor
+  split and layer split both work in multi-chat; the successor is the
+  parked B18 (steady-state decode pipeline). Record: BACKLOG B14 +
+  F39 + STATE. No re-presentation.
+- 6 [x] REPORT to the user (9B MTP fix gone from tree, SYCL fix,
+  stage-2 grow): folded into the continuous 10-26..11-01 docs sync;
+  the tree fact re-verified 11-01 (src/models/qwen35.cpp still matches
+  HEAD, the 9B MTP fix still absent).
+- 7 [x] extraArgs bisection (-ngl 99 / -np 2 / -c 262144): outcome
+  never reported; superseded - F39 settled the -np 2 question (drop
+  it, user-confirmed 10-27/28) and the 10-31 forensics took over the
+  crash/hang work. Nothing left to fold.
+- 8: Q5_K_S tensor bench: carried to open item 5 above.
 
 ## PARKED (do not start without user re-scoping, 10-22)
 
@@ -55,12 +68,13 @@ SYCL build mystery was root-caused + fixed in between (F30). B14
   design DROPPED; C0/C1 DROPPED per user). Plan intact in F11 for the
   record only.
 - B7a (startup-side loud-fail on unfittable ctx/KV + closed --dev
-  gate): APPROVED 10-22, NOT parked - implement after B12 lands (same
-  fork; see BACKLOG B7a).
+  gate): APPROVED 10-22, NOT parked - open item 3 above.
 - B5 free-VRAM suite / B6 Part-3 trigger / B8 PQ2_0 sweep / B9 final
   report / B10 small follow-ups: status as in BACKLOG.md (parked /
   open-low). The final report (B9) should include the tensor-mode work
   when it lands.
+- B18 (alternating pipeline / steady-state decode): DRAFT parked,
+  user-requested 10-28 (DESIGN-alternating-pipeline.md), no code.
 
 ## DONE (reference)
 
@@ -84,4 +98,9 @@ SYCL build mystery was root-caused + fixed in between (F30). B14
   fit-time auto-size -fitm (db5cf4d80), both pushed, grow verified
   on-device (F31); SYCL=OFF = CPU-only runtime root-caused + fixed,
   build recipe permanently SYCL=ON (F30); B14 (twin-server + router)
-  drafted, pending user.
+  drafted - REJECTED 10-28 (final).
+- [x] 11-01: B19 settle + B20 two-pass grow + tensor-mode draft fit
+  committed (c9c4e20f1) + private sync with F40 addenda 1+2 and the
+  B20 design doc (0ce10b479); -b/-ub probe matrix ran, batch-6144
+  memory question answered (no code change needed); deploy pending
+  the stop window (open item 1).
