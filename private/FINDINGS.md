@@ -2398,6 +2398,96 @@ speculative.cpp:3554 is SPC_TRC). The user's display does not match
 current source - blocked on a sample line (macube UI timings vs CLI
 vs another log line).
 
+## F40 addendum 3. Co-resident CLI batteries: ternary+MTP live-verified (11-01)
+
+The user rejected the stop-window cold test (the two 8080 service
+PIDs are always running); the batteries instead run CO-RESIDENT
+through the CLI on the B19+fit binary (build b10753-593599d06).
+The 8080 service (PIDs 25740 + 3068) stays up throughout; health
+True before/after every test.
+
+[proven 11-01] llama-cli harness facts (this fork):
+- llama-cli SPAWNS a llama-server child on a random port
+  (tools/cli/cli-server.h:33, cli-context.h:41): server log ->
+  stderr, CLI banner/REPL -> stdout.
+- The default readline REPL does NOT exit on stdin EOF
+  (cli-context.cpp:510-513 skips the empty buffer; readline
+  advanced WEOF -> empty line in common/console.cpp -> infinite
+  '>' prompt spam). Per-test stdin file containing /exit
+  (cli-context.cpp:518 breaks the loop) -> clean exit 0.
+  --simple-io's EOF sends GenerateConsoleCtrlEvent(CTRL_C)
+  (console.cpp:1052) = the 0xC000013A exit codes.
+- Arc teardown after a clean exit: all server work finishes in
+  ~2.5-3.2 s but the process lives ~165-205 s (Level-Zero context
+  release); cosmetic, poll longer, do not misread as a hang.
+- Harness: E:\tmp\cotest.ps1 (v4), E:\tmp\cotest2.ps1 (v5).
+
+Test geometry: 27B main (PTQ1_0 or PQ2_0) + mtp-Q4_0 draft (E:
+\DataVolume\Models\Qwen3.8-27B-UD-Q4_K_XL\mtp-Qwen3.8-27B-Q4_0
+.gguf), -sm tensor, KV q5_1/q5_1, draft KV q4_0/q4_0, FA on,
+-t 56 -tb 28, -n 32, prompt "What is the capital of France?
+Answer in one word." (64 tokens for the 27Bs, 22 for the 9B).
+
+[measured 11-01] Battery v4 (-c 16384, 4/4 exit 0):
+- T0 PTQ1_0 no-draft: pp/tg 23.89/14.76 t/s.
+- T1 PTQ1_0+mtp-Q4_0: 26.35/21.45 t/s (+45% tg); draft REAL-loaded
+  ("loading draft model") and speculating: acceptance 0.43590
+  (17/39), mean len 2.21.
+- T2 PQ2_0+mtp-Q4_0: 25.95/17.24 t/s; acceptance 0.38095 (16/42),
+  mean 2.14.
+- T3 9B PQ2_0 built-in nextn: UNSUPPORTED in this tree. Exact
+  strings: W common_fit_params: "an MTP context sharing the main
+  model's weights is not supported with SPLIT_MODE_TENSOR, abort"
+  (the 11-01 shared-weights fit guard, server then loads without
+  fit); then W llama_verify_hadamard_graph: "latent lookup
+  'mtp_tok_embd-32' consumed by op=RMS_NORM name='norm-32' src0
+  hint=0" -> E llama_init_from_model: "failed to initialize the
+  context: Hadamard-latent table 'token_embd.weight' is read
+  without the inverse transform" -> E common_speculative_init_
+  result: "failed to create MTP context" -> graceful degrade to
+  plain gen (tg 26.48 t/s). Cause: the H-A fold is not applied on
+  the built-in-MTP (shared-weights) draft-ctx path in tensor mode;
+  not a memory issue.
+
+[measured 11-01] Battery v5 (the 10-31 failure regimes, PTQ1_0+mtp,
+4/4 exit 0; the fit PASSES at every size - no fit-abort, no
+n_ctx_slot reduction, the requested ctx is kept):
+- A -c 65536: 26.87/24.33 t/s; acceptance 0.50000 (18/36), mean
+  2.50.
+- B -c 131072: 26.47/23.81; acceptance 0.47368 (18/38), mean 2.38.
+- C -c 131072 -b 6144 -ub 6144 (the 10-31 load-hang culprit
+  argset): 26.45/22.02; acceptance 0.43590 (17/39), mean 2.31 -
+  NO hang.
+- D -c 262144 (the 51823 DEVICE_LOST geometry): 26.31/16.32;
+  acceptance 0.22222 (12/54), mean 1.67 (acceptance and tg fall at
+  full training ctx, KV-bound).
+
+[proven 11-01] The 11-01 real-draft tensor fit is LIVE: fit is on
+by default in every CLI-spawned server and it passed co-resident
+at 16384-262144 with the draft real-loaded (the T3 abort line
+proves the guard path ran). The llama-fit-params sanity sub-item
+of PLAN item 1 is effectively covered.
+
+[measured 11-01] Tensor-mode sampler on CPU: "W set_sampler:
+backend sampling not supported with SPLIT_MODE_TENSOR; using CPU"
++ "W spec common_specu: backend offload failed for seq_id=0; using
+CPU sampler" on every draft test. Harmless, small overhead.
+
+[open 11-01] The 10-31 8/8 DEVICE_LOST law (addendum 2) does NOT
+reproduce on the B19+fit binary, but two variables differ vs 10-31:
+the binary (pre-B19 deployed -> B19+fit) and the split (the 10-31
+failure world was layer-split per the user's "draft offloads on
+GPU2" clue; the batteries ran tensor). The law remains open in the
+layer world. The release-lag theory also stays open: the batteries
+had no kill-churn; C passing churn-free does not falsify it. Clean
+discriminating follow-up (awaiting user OK): run the pre-B19
+deployed binary (C:\Users\admin\.local\3nary-sycl\llama-server.
+exe) standalone on a scratch port, -sm layer, same model pair,
+-c 262144, one HTTP completion, taskkill on hang.
+
+No residue: free VRAM back to baseline after both batteries
+(SYCL0 15451 / SYCL1 12756 MiB free, E:\tmp\free-read4.ps1).
+
 ## B20. Constrained joint solve over (ctx, weight placement) (10-29/10-30)
 
 [implemented 10-29] In the working tree (NOT committed;

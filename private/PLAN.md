@@ -11,17 +11,27 @@ grow) + the tensor-mode draft fit are COMMITTED (c9c4e20f1) and built,
 NOT deployed. B14 (twin-server + router) is REJECTED 10-28 by the user
 (final, dead end) - the record is BACKLOG B14 + F39, no re-presentation.
 11-01 probes closed the batch-6144 memory question (F40 addendum 1);
-10-31 crash/hang forensics in F40 addendum 2.
+10-31 crash/hang forensics in F40 addendum 2; the co-resident CLI
+batteries v4+v5 (ternary+MTP live-verified on B19+fit) in F40
+addendum 3.
 
-1. [B] DEPLOY + verify (needs an 8080 stop window): rebuild build\bin
-   (the 11-01 tensor draft fit is in llama-common only, the exes need
-   re-linking), deploy to macube, then the deterministic live growth-
-   WARN catch (B20) + a sanity run of llama-fit-params tensor + draft
-   fit (real loads, ~2 min+, co-residency-sensitive).
-2. [B] T1 cold test (stop window): PTQ+MTP COLD load decides the
-   release-lag theory (F40 addendum 2; prediction: cold loads clean).
-   Kit ready: E:\tmp\cold-test.ps1 + T1.bat/T1b.bat (atomic
-   stop->test->start); result to E:\tmp\T1-result.txt.
+1. [B] DEPLOY + verify (needs an 8080 stop window): deploy to macube
+   (build\bin re-linked 11-01, b10753-593599d06), then the
+   deterministic live growth-WARN catch (B20). The tensor + draft
+   fit sanity run is COVERED by the 11-01 co-resident batteries
+   (fit on by default, passed 16384-262144, F40 addendum 3).
+2. [x] T1 cold test: RETIRED 11-01 - the user rejected the stop
+   window ("try without stop/starting 8080"); superseded by the
+   co-resident CLI batteries (F40 addendum 3). The release-lag
+   theory is NOT falsified (the batteries had no kill-churn) and
+   joins the 10-31 law under item 2b.
+2b. [B] pre-B19 A/B (binary isolation for the 10-31 8/8 DEVICE_LOST
+   law, F40 addendum 3): the batteries pass on B19+fit + tensor, but
+   10-31 failed on pre-B19 + layer-split; run the pre-B19 deployed
+   binary (C:\Users\admin\.local\3nary-sycl\llama-server.exe)
+   standalone on a scratch port (e.g. 8123), -sm layer, PTQ1_0 +
+   mtp-Q4_0, -c 262144, -lv 4, one HTTP completion, taskkill on
+   hang. Discriminates binary vs split vs churn. Await user OK.
 3. [ ] B7a (next code item in this fork): startup loud-fail on
    unfittable ctx/KV + closed --dev gate. Target: the SPLIT_MODE_TENSOR
    fit path + the -sm/-dev parse area (re-locate lines, the 10-25
@@ -104,3 +114,12 @@ NOT deployed. B14 (twin-server + router) is REJECTED 10-28 by the user
   B20 design doc (0ce10b479); -b/-ub probe matrix ran, batch-6144
   memory question answered (no code change needed); deploy pending
   the stop window (open item 1).
+- [x] 11-01 (pm): co-resident CLI batteries v4+v5 (F40 addendum 3),
+  all on the B19+fit binary with the 8080 service up: v4 4/4 exit 0
+  (draft REAL-loaded + speculating at 16384; 9B built-in nextn
+  UNSUPPORTED - H-A fold missing on the shared-weights MTP path);
+  v5 4/4 exit 0 across the 10-31 failure regimes incl. the -b 6144
+  -ub 6144 argset (no hang) and the 51823 262144 geometry (no
+  DEVICE_LOST); no VRAM residue. 10-31 law not falsified in the
+  layer world (binary + split caveats -> open item 2b); T1 cold
+  test retired.
