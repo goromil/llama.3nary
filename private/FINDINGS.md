@@ -2474,16 +2474,35 @@ backend sampling not supported with SPLIT_MODE_TENSOR; using CPU"
 CPU sampler" on every draft test. Harmless, small overhead.
 
 [open 11-01] The 10-31 8/8 DEVICE_LOST law (addendum 2) does NOT
-reproduce on the B19+fit binary, but two variables differ vs 10-31:
-the binary (pre-B19 deployed -> B19+fit) and the split (the 10-31
-failure world was layer-split per the user's "draft offloads on
-GPU2" clue; the batteries ran tensor). The law remains open in the
-layer world. The release-lag theory also stays open: the batteries
-had no kill-churn; C passing churn-free does not falsify it. Clean
-discriminating follow-up (awaiting user OK): run the pre-B19
-deployed binary (C:\Users\admin\.local\3nary-sycl\llama-server.
-exe) standalone on a scratch port, -sm layer, same model pair,
--c 262144, one HTTP completion, taskkill on hang.
+reproduce on the B19+fit binary. The two differing variables (the
+binary, pre-B19 deployed -> B19+fit; and the split, 10-31 layer-
+split vs the batteries' tensor) were then isolated by the pre-B19
+A/B below: NEITHER reproduces the law. The release-lag theory
+stays open - neither the batteries nor the A/B had kill-churn, and
+the churn around service restarts is the only untested 10-31
+variable; testing it needs a macube restart window.
+
+[measured 11-01] Pre-B19 A/B (E:\tmp\ab1031.ps1, log E:\tmp\
+ab1031-server.err): the deployed pre-B19 build (fingerprint
+b10750-4f4116a3a; files 10/30 16:15; the same build the live 8080
+service runs) standalone on port 8123, service geometry (-sm
+layer, -ngl all, -t 56 -tb 28, FA on, yarn, 4 slots, no --fit),
+PTQ1_0 + mtp-Q4_0, explicit -c 262144, one HTTP completion, co-
+resident with the live service. NO reproduction:
+- fit: projected 29648 MiB vs 25927 free (5768 over), "context
+  size set by user to 262144 -> no change", abort "n_gpu_layers
+  already set by user to -2"; the SPLIT path then demotes: main
+  265.23 MiB to CPU, draft 774.71 MiB on SYCL1 + 521.00 MiB on
+  SYCL_Host - the "draft offloads to GPU2" anatomy, the draft
+  straddles one card + host.
+- load 16.1 s, healthy; completion HTTP 200 in 27.8 s ("Paris",
+  43 tokens incl. reasoning); prompt 2.62 t/s (CPU layers), tg
+  12.51 t/s; draft REAL-loaded, acceptance 0.58333 (28/48), mean
+  2.75 - best acceptance of all runs.
+- teardown clean, service health True throughout, VRAM back to
+  baseline after (SYCL0 15493 / SYCL1 12756 MiB free).
+- the pre-B19 demotion world is slow (CPU + host straddle) but
+  stable over load + gen; the 10-31 crashes remain tied to churn.
 
 No residue: free VRAM back to baseline after both batteries
 (SYCL0 15451 / SYCL1 12756 MiB free, E:\tmp\free-read4.ps1).

@@ -25,13 +25,17 @@ addendum 3.
    co-resident CLI batteries (F40 addendum 3). The release-lag
    theory is NOT falsified (the batteries had no kill-churn) and
    joins the 10-31 law under item 2b.
-2b. [B] pre-B19 A/B (binary isolation for the 10-31 8/8 DEVICE_LOST
-   law, F40 addendum 3): the batteries pass on B19+fit + tensor, but
-   10-31 failed on pre-B19 + layer-split; run the pre-B19 deployed
-   binary (C:\Users\admin\.local\3nary-sycl\llama-server.exe)
-   standalone on a scratch port (e.g. 8123), -sm layer, PTQ1_0 +
-   mtp-Q4_0, -c 262144, -lv 4, one HTTP completion, taskkill on
-   hang. Discriminates binary vs split vs churn. Await user OK.
+2b. [x] pre-B19 A/B (F40 addendum 3, 11-01): the deployed b10750-
+   4f4116a3a build ran standalone on port 8123, -sm layer, PTQ1_0
+   + mtp-Q4_0, -c 262144, 4 slots, one HTTP completion - NO
+   DEVICE_LOST, no hang, clean teardown, service healthy (E:\tmp\
+   ab1031.ps1 + ab1031-server.err). Binary and static split
+   variables ruled out for the 10-31 law; the pre-B19 demotion
+   anatomy captured (main 265 MiB -> CPU, draft 774 MiB SYCL1 +
+   521 MiB SYCL_Host, pp 2.62 t/s). The law is now tied to the
+   churn variable only (release-lag theory); testing it needs a
+   macube restart window - [B] if the user offers one, otherwise
+   wait for a natural occurrence with log capture.
 3. [ ] B7a (next code item in this fork): startup loud-fail on
    unfittable ctx/KV + closed --dev gate. Target: the SPLIT_MODE_TENSOR
    fit path + the -sm/-dev parse area (re-locate lines, the 10-25
@@ -121,5 +125,10 @@ addendum 3.
   v5 4/4 exit 0 across the 10-31 failure regimes incl. the -b 6144
   -ub 6144 argset (no hang) and the 51823 262144 geometry (no
   DEVICE_LOST); no VRAM residue. 10-31 law not falsified in the
-  layer world (binary + split caveats -> open item 2b); T1 cold
-  test retired.
+  layer world (binary + split caveats -> item 2b); T1 cold test
+  retired.
+- [x] 11-01 (evening): pre-B19 A/B (F40 addendum 3) + push
+  c9c4e20f1..71df7aa3b: the deployed pre-B19 build survives the
+  10-31 geometry (layer, 262144, 4 slots, MTP, co-resident) - no
+  DEVICE_LOST, no hang; binary and static split variables ruled
+  out, churn (release-lag) is the only untested 10-31 variable.
