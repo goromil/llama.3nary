@@ -2619,3 +2619,100 @@ settled ctx, so an overestimated C* costs the bottleneck
 device layers in pass 1 (they walk to the host); no device
 overflow is possible, the floor placement fits by
 construction, and the host is the sink with no budget.
+
+## F41. B21 P0: deepseek41 port complete + built (11-03)
+
+[done 11-03] All five source commits pushed (origin/main,
+44f01b2fe -> f760a68da):
+- 95a56055e ggml : add MXFP8 type for the DeepSeek-V4.1 engram
+  table + softplus log1pf fix. Fork-private GGML_TYPE_MXFP8 =
+  144 (COUNT 145), dequant-only: CPU to_float via a 256-entry
+  LUT (kvalues_mxfp8, E8M0 scale 2^(b-127) + 32 signed E4M3,
+  top binade fully finite, max 480); the one new case in
+  ggml_compute_forward_get_rows (get_rows always outputs F32).
+  NOT a reuse of ggml_ue4m3_to_fp32 (NVFP4 convention).
+- 36592840e gguf : remap the engram table file type 43 ->
+  GGML_TYPE_MXFP8 at tensor-info read time.
+- 5507dd074 arch : add the deepseek41 architecture (21 files,
+  +1757/-114, incl. the new 922-line src/models/deepseek41.cpp).
+  LLM_ARCH_DEEPSEEK41 + KV keys (hyper_connection_single_pass,
+  engram layers, the PLE ngram block, 5 new indexer/kv-source
+  keys), ENGRAM_KV/ENGRAM_GATE tensors, is_hybrid + rs_rollback;
+  PLE hparams + engram_pad_id + is_ple/ple_conv_state; the KV
+  cell ext state gains the token the cell was written for plus
+  its (pos, seq_id) pair set (format 8 -> 12 bytes, old states
+  unreadable - accepted); the deepseek41 model + graph (host-
+  side PLE hash of the ngram window -> per_layer_token_embd
+  table row, engram gate as elementwise ggml_mul, mHC single-
+  pass); build_hc_mixes/dsv4_hc_mean/dsv4_rope_attn_factor
+  extracted to deepseek4.cpp; model-saver uint64 scalar add_kv
+  + the V4.1/PLE KV group; the dsv4 K-cache mirror refill
+  simplified (early return + ggml_backend_tensor_copy,
+  comp_kv_src -> comp_il_src); the V4.1 chat template changes
+  (DSML tag leading space, no-reasoning continuation,
+  extra_json).
+- cc41cb618 quant : skip requantizing engram_gate.weight
+  (elementwise ggml_mul weight, not a matmul operand).
+- f760a68da dflash : graph_dsv41, the V4.1 DSpark draft
+  decoder (single-pass mHC, no hc_head, n_swa +1, block queries
+  share the first query's SWA window; dispatch on
+  dsv4_hc_single_pass, ahead of graph_dsv4).
+
+[fact 11-03] Port source = the upstream clone's a07421535 FINAL
+(the fix commit on top of the main V4.1 commit d854d98ba), read
+via read-only git show; the clone's working tree never touched.
+The fix's content: engram_pad_id moved into llama_hparams (after
+ple_n_modules), engram_token_map into struct llama_model,
+build_hc_mixes 7-arg (f32_src dropped), comp_kv_src renamed
+comp_il_src, the K-cache mirror simplification, the model-
+saver simplification. All ported files reconciled to post-fix
+state.
+
+[fact 11-03] Fork-drift resolutions (the fork lacks each of
+these; verified against fork code before use):
+- ggml_prec_set_acc: no fork equivalent (not even ggml_set_prec)
+  -> ggml_mul_mat_set_prec(logits, GGML_PREC_F32) at
+  deepseek41.cpp:873. The fork's build_moe_ffn sets F32 only on
+  its own logits path; the probs_in path (V4.1's) does not, so
+  the explicit call is required.
+- ASSERT_EMBD_OR_TOKEN: the fork has no mixed batches -> dropped
+  from graph_dsv41 (the fork's own graph_dsv4 lacks it too).
+- hparams.n_expert_used: a plain uint32_t field in the fork
+  (not a method).
+- Deliberately skipped fork-absent features: ubatch
+  embd_state/type/decision_order fields, hparams.no_alloc
+  blocks, llama_dsv4_comp_state::hparams member,
+  ASSERT_EMBD_OR_TOKEN in the dsv4_state_write path,
+  llama_prefetch_rows/can_prefetch, TENSOR_READ_LAZY.
+- Residual diff vs a07421535: llama-kv-cache-dsv4.cpp = ONLY
+  those 5 known skips (76 diff lines); .h = ONLY the hparams
+  member (11 diff lines).
+
+[verified 11-03] graph_dsv41 (dflash.cpp :1102-1344, 244 lines)
+is byte-identical to the upstream-final class minus the 2
+adaptations (only the EOF newline differs). All 63 identifiers +
+method chains verified present in the fork (build_attn_inp_
+k_iswa, mctx->get_swa()->cpy_k, llama_mul_mat_hadamard,
+self_k_idxs_swa/self_kq_mask_swa_cnv/self_k_rot_swa,
+build_dspark_markov_head, ubatch.n_seqs_unq, ...).
+
+[verified 11-03] Build GREEN (oneAPI setvars + VS 2026 Ninja
+Release): the llama target (158 steps after the reconfigure,
+llama.dll linked) + the llama-cli target (97 steps: common/
+chat.cpp compiled, llama-common.dll + llama-cli-impl.dll +
+llama-cli.exe linked). Only pre-existing deprecation warnings.
+
+[gotcha 11-03] src/CMakeLists.txt:9 file(GLOB
+LLAMA_MODELS_SOURCES "models/*.cpp") runs at CONFIGURE time: a
+NEW model .cpp needs a `cmake -S . -B build` reconfigure before
+it compiles (the first link failed with 3 unresolved
+llama_model_deepseek41 externals). No `common` ninja target
+exists (a directory of phony targets) - chat.cpp compiles via a
+tool-target build (llama-cli / llama-cli-impl). FULL builds
+still exit 1 at the pre-existing test-dspark-forward LNK2019
+(harmless, as before).
+
+[next 11-03] P1: the chunked bounded-memory table requant (per-
+row f32 staging 3.07 GB; PTQ1_0 43.0 GB / PQ2_0 52.2 GB table
+outputs; streaming writes), then llama-quantize --allow-
+requantize for both targets, 9-shard split preserved.

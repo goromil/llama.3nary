@@ -1,6 +1,30 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-11-02 - DSV4.1 TERNARY project started
+Last refresh: 2026-11-03 - B21 P0 DONE: the deepseek41 arch is
+ported, built, and pushed. Five source commits on origin/main
+(44f01b2fe -> f760a68da): 95a56055e (ggml : MXFP8=144 dequant +
+softplus log1pf), 36592840e (gguf : file-type-43 remap),
+5507dd074 (arch : deepseek41 + PLE hparams/cells/KV + model +
+graph + chat + dsv4 mirror simplification; 21 files
++1757/-114), cc41cb618 (quant : skip the engram_gate requant),
+f760a68da (dflash : graph_dsv41 DSpark draft graph). Port
+source = the clone's a07421535 FINAL (read-only git show; the
+fix commit: engram_pad_id in hparams, engram_token_map in
+llama_model, 7-arg build_hc_mixes, comp_il_src, mirror
+simplification) - all ported files reconciled post-fix. Fork-
+drift resolutions: ggml_prec_set_acc -> ggml_mul_mat_set_prec
+(deepseek41.cpp:873; the fork's build_moe_ffn sets F32 only on
+its own logits path), ASSERT_EMBD_OR_TOKEN dropped (no mixed
+batches), n_expert_used a plain field; the kv-cache-dsv4
+residual diff vs final = the 5 known deliberate skips only
+(F41). Build GREEN: llama.dll + llama-cli (chat.cpp via
+llama-common.dll + exe). Gotchas: the models/*.cpp GLOB is
+configure-time (reconfigure before building a new model .cpp)
++ there is no `common` ninja target (use llama-cli). Working
+tree clean except the user's svelte file. Live service
+UNCHANGED.
+
+Previous refresh: 2026-11-02 - DSV4.1 TERNARY project started
 (BACKLOG B21, ACTIVE): requantize the local
 DeepSeek-V4.1-Flash-1017 UD-Q4_K_XL (9 shards, 501.68 GB,
 E:\DataVolume\Models\...) to the fork's PTQ1_0 + PQ2_0, porting
@@ -507,9 +531,16 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `8a14e491b` (docs : private sync
-  after F39 - 2-chat TG measured, -np 2 root cause, post-F39
-  restart). Before it: `722ce512c` (docs : private sync - build
+- branch `main`, pushed HEAD: `f760a68da` (dflash : add the
+  DeepSeek-V4.1 DSpark draft graph (graph_dsv41)). The B21 P0
+  port, pushed 11-03 (F41): `cc41cb618` (quant : skip
+  requantizing the engram gate), `5507dd074` (arch : add the
+  deepseek41 architecture), `36592840e` (gguf : remap the engram
+  table type on load), `95a56055e` (ggml : add MXFP8 + softplus
+  log1pf), on top of `44f01b2fe` (docs : private sync - B21
+  start). Before that: `8a14e491b` (docs : private sync after
+  F39 - 2-chat TG measured, -np 2 root cause, post-F39 restart),
+  `722ce512c` (docs : private sync - build
   recovery GREEN, VS-2022-shell root cause + build-sycl.ps1
   hardening), `dff5d5cfe` (docs : private
   sync after the timing-log gate - build state, 129 ms shrink
@@ -523,14 +554,15 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   `5b8aa1fad` (llama : copy KV rows on device in the in-place
   cache regrow), `9c8772ed8` (llama : adaptive ctx, in-place
   runtime resize), `1011b639d` (fit : tensor-mode context
-  fitting). The docs commit for THIS round (user-confirmed -np 2
-  host placement + the 54674/53777 evidence, B14 REJECTED, the
-  76% dispute + stage-bubble analysis, the B18 draft project) is
-  PENDING.
+  fitting). The docs commit for THIS round (F41 + this refresh)
+  is PENDING.
   Full list: NOTES.md N12.
 - Working tree: `private/` modified (this refresh, uncommitted) +
   user's file (do not touch):
   `tools/ui/src/lib/stores/models/index.svelte.ts`.
+- B21 P0 source tree is COMMITTED + PUSHED (5 commits, F41):
+  working tree is clean of source changes; only `private/` (this
+  refresh) + the user's svelte file are modified.
 - `private/` = this knowledge library; keep it committed+pushed.
 
 ## Binaries
@@ -635,24 +667,36 @@ srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
 
-## Next (11-02)
+## Next (11-03)
 
-1. B21 P0 (DSV4.1 ternary port, ACTIVE): read the remaining
-   diff hunks (dsv41-1.diff :540-1374 + :2330-2739,
-   chat/parsers :1-251), then apply the 5-commit port order in
-   the PLAN.md DSV4.1 TERNARY section (1: ggml MXFP8=144 +
-   dequant, 2: gguf type-43 remap, 3: deepseek41 arch, 4:
-   llama-quant.cpp, 5: dflash dspark hunk + parsers). Build per
-   N2/N3; FULL builds exit 1 at the pre-existing
-   test-dspark-forward LNK2019 (harmless).
+1. B21 P1 (ACTIVE): chunked bounded-memory table requant path
+   (per-row f32 staging 3.07 GB; PTQ1_0 table output 43.0 GB /
+   PQ2_0 52.2 GB; streaming writes), then llama-quantize
+   --allow-requantize for both targets, 9-shard split preserved.
+   Output targets: PTQ1_0 164.2 GB (152.8 GiB), PQ2_0 199.3 GB
+   (185.3 GiB) (addendum).
+2. B21 P2: [B] needs a macube stop window (user-owned) - hybrid
+   split load + generate + fixed-prompt A/B vs the live
+   UD-Q4_K_XL service, bench vs N10, check the addendum t/s +
+   quality ranges; DSpark drafter optional (files not local);
+   then refresh private/ + commit+push.
+3. Carry the 10-28 list below when its items come up (F40
+   write-up, --cache-ram 0 call, B7a, N17 bench, etc.).
+
+## Next (11-02) (superseded - history)
+
+1. DONE 11-03: B21 P0 (DSV4.1 ternary port) - all 5 commits
+   pushed (44f01b2fe..f760a68da), build GREEN (F41). The
+   chat/parsers hunks landed with commit 3.
 2. B21 P1: chunked bounded-memory table requant path, then
    llama-quantize --allow-requantize for both targets (9-shard
    split preserved). Output targets: PTQ1_0 164.2 GB, PQ2_0
-   199.3 GB (addendum).
+   199.3 GB (addendum). (now Next 11-03 item 1)
 3. B21 P2: [B] needs a macube stop window (user-owned) - hybrid
    split load + generate + fixed-prompt A/B vs the live Q8_K_XL
    service, bench vs N10, check the addendum t/s + quality
-   ranges; then refresh private/ + commit+push.
+   ranges; then refresh private/ + commit+push. (now Next
+   11-03 item 2)
 4. Carry the 10-28 list below when its items come up (F40
    write-up, --cache-ram 0 call, B7a, N17 bench, etc.).
 

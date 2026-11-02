@@ -602,5 +602,6 @@ Each item: what / why / how / exit criteria / status.
   evidence), quality A/B vs the live service recorded.
 - status: RECON DONE 11-02 (shard inventory byte-exact, 748.5B
   params, port diffs generated, user decisions A-D locked);
-  P0 code not started; docs written 11-02 (this item + PLAN +
-  addendum).
+  P0 DONE 11-03 (5 commits pushed 95a56055e..f760a68da, build
+  GREEN, F41); P1 (requant) is next; docs written 11-02 (this
+  item + PLAN + addendum).
