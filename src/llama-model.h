@@ -556,6 +556,10 @@ struct llama_layer {
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
 
+    // deepseek41
+    struct ggml_tensor * engram_kv   = nullptr;
+    struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -594,6 +598,9 @@ struct llama_model {
 
     // for classifier models
     std::vector<std::string> classifier_labels;
+
+    // deepseek41 Engram: token id -> id of its normalized form, hashed into the n-grams
+    std::vector<int32_t> engram_token_map;
 
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
