@@ -1,6 +1,41 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-10-28 (evening) - user reply to the F39 report,
+Last refresh: 2026-11-02 - DSV4.1 TERNARY project started
+(BACKLOG B21, ACTIVE): requantize the local
+DeepSeek-V4.1-Flash-1017 UD-Q4_K_XL (9 shards, 501.68 GB,
+E:\DataVolume\Models\...) to the fork's PTQ1_0 + PQ2_0, porting
+the missing deepseek41 arch from the upstream clone (final state
+after a07421535, read-only). Recon byte-exact: 748.5B params =
+543.58B experts (120 MXFP4 type-39 tensors [884736, 5120] @
+4.25 bpw, shards 2-7, 288.78 GB) + 8.19B Q8_0 (351 tensors,
+8.69 GB) + 196.61B engram table (shard 8, per_layer_token_embd
+[256, 768022850], file type field 43 = MXFP8 33 B/32, 202.76 GB)
++ 0.12B F32 (571 tensors, 0.47 GB, stays); engram only blk.1/
+blk.14; cross-check vs Unsloth's "Rest 297.9 + MXFP8 202.8"
+EXACT. User decisions locked 11-02: A = ternarize the table
+(43.0/52.2 GB), B = both variants, C = keep the 9-shard split,
+D = port the dspark dflash.cpp hunk in P0. Expected outputs:
+PTQ1_0 164.2 GB (152.8 GiB, 1.76 bpw), PQ2_0 199.3 GB (185.3
+GiB, 2.13 bpw). Fit verdict: NOT fully resident on this box
+(152.8 GiB > 128 GB VRAM+RAM) - P2 uses a mixed GPU/CPU/disk
+split (GPU ~50-54 GB weights, table mmap'd from disk, small ctx,
+service stopped); expected standalone decode PTQ1_0 18-25 t/s,
+PQ2_0 12-20 t/s, + DSpark 1.3-1.5x when the drafter files are
+local (they are NOT). Docs: PLAN.md DSV4.1 TERNARY section
+(start point) + NEW DESIGN-dsv41-ternary-expectations.md (sizes,
+fit, perf + quality estimates vs Unsloth v3.1 IQ1/2 + PrismML
+Bonsai references) + BACKLOG B21. No fork code written yet;
+port diffs + adapted upstream files staged in
+%TEMP%\opencode\ (dsv41-1.diff 2752 ln, dsv41-2.diff 393 ln,
+fork-vs-up-deepseek4.diff 255 ln, up-deepseek41-final.cpp 809
+ln, up-deepseek4-{pre,final}.cpp); unread before coding:
+dsv41-1.diff :540-1374 + :2330-2739 and the chat/parsers hunks
+:1-251. Live service UNCHANGED (Q6_K, child 49822 @ 65299,
+router @ 8080 - the P2 validation run needs a service stop
+window, user-owned; re-derive PIDs via Get-NetTCPConnection
+-LocalPort 8080,58452).
+
+Previous refresh: 2026-10-28 (evening) - user reply to the F39 report,
 four things:
 (1) The -np 2 host placement is CONFIRMED by the user (supersedes
 the afternoon "UNPROVEN" read in F39/STATE): with -np 2 the MODEL
@@ -599,6 +634,27 @@ Macube logs: `C:\Users\gorom\source\macube\logs\llama.log` (per-child
 srv-target lines, local clocks per run) + `llama-error.log` (router
 lines + spawn args). The 10-22 service's blocks come after the 52416
 block; grep by port 8080/58452.
+
+## Next (11-02)
+
+1. B21 P0 (DSV4.1 ternary port, ACTIVE): read the remaining
+   diff hunks (dsv41-1.diff :540-1374 + :2330-2739,
+   chat/parsers :1-251), then apply the 5-commit port order in
+   the PLAN.md DSV4.1 TERNARY section (1: ggml MXFP8=144 +
+   dequant, 2: gguf type-43 remap, 3: deepseek41 arch, 4:
+   llama-quant.cpp, 5: dflash dspark hunk + parsers). Build per
+   N2/N3; FULL builds exit 1 at the pre-existing
+   test-dspark-forward LNK2019 (harmless).
+2. B21 P1: chunked bounded-memory table requant path, then
+   llama-quantize --allow-requantize for both targets (9-shard
+   split preserved). Output targets: PTQ1_0 164.2 GB, PQ2_0
+   199.3 GB (addendum).
+3. B21 P2: [B] needs a macube stop window (user-owned) - hybrid
+   split load + generate + fixed-prompt A/B vs the live Q8_K_XL
+   service, bench vs N10, check the addendum t/s + quality
+   ranges; then refresh private/ + commit+push.
+4. Carry the 10-28 list below when its items come up (F40
+   write-up, --cache-ram 0 call, B7a, N17 bench, etc.).
 
 ## Next (10-28)
 

@@ -570,3 +570,37 @@ Each item: what / why / how / exit criteria / status.
   growth WARN not yet caught live (transient imbalanced band;
   deterministic catch planned for the stop window). Design:
   private/DESIGN-adaptive-fit.md. Findings: FINDINGS B20.
+
+## B21. DeepSeek-V4.1 ternary: port deepseek41 + requant to
+     PTQ1_0/PQ2_0 (11-02, ACTIVE)
+- what: port the deepseek41 arch from the upstream clone
+  (final state after a07421535, read-only) into the fork, add
+  the ggml MXFP8 type + the file-type-43 load remap, then
+  requantize the local DeepSeek-V4.1-Flash-1017 UD-Q4_K_XL
+  (9 shards, 501.68 GB) to PTQ1_0 (164.2 GB) + PQ2_0 (199.3 GB),
+  9-shard split preserved, plain PTQ, no imatrix, table
+  ternarized per user decision A.
+- why: the fork's ternary codecs at 1.75/2.125 bpw are ~2.8-3.3x
+  fewer decode bytes/token than the 4.25 bpw source experts;
+  the user wants both variants. Fit on this box: NOT fully
+  resident (152.8 GiB > 128 GB VRAM+RAM) - P2 runs a mixed
+  GPU/CPU/disk split, small ctx, service stopped; expected
+  standalone decode 18-25 t/s (PTQ1_0) / 12-20 t/s (PQ2_0)
+  before the DSpark multiplier (files not local).
+- how: P0 commit order (1) ggml MXFP8=144 + dequant, (2) gguf
+  type-43 remap, (3) deepseek41 port (arch/hparams/models/
+  deepseek41.cpp/kv-cache-dsv4/deepseek4 hc_mixes/context/
+  graph/log1pf/chat), (4) llama-quant.cpp, (5) dflash dspark
+  hunk + parsers. P1 chunked bounded-memory requant (per-row
+  f32 staging 3.07 GB, output staging 43.0/52.2 GB, streaming
+  writes). P2 validate vs the live Q8_K_XL service on fixed
+  prompts. Full plan: PLAN.md DSV4.1 TERNARY; expectations:
+  DESIGN-dsv41-ternary-expectations.md; refs in %TEMP%\opencode\.
+- exit: both GGUFs on disk at the expected sizes, load +
+  generate clean on the hybrid split, decode t/s within the
+  addendum range (or the f8 discount factor revised with
+  evidence), quality A/B vs the live service recorded.
+- status: RECON DONE 11-02 (shard inventory byte-exact, 748.5B
+  params, port diffs generated, user decisions A-D locked);
+  P0 code not started; docs written 11-02 (this item + PLAN +
+  addendum).

@@ -1,8 +1,107 @@
-# PLAN - updated plan (start at IMMEDIATE NEXT STEPS)
+# PLAN - updated plan (start at the DSV4.1 TERNARY section, 11-02)
 
 Status markers: [x] done, [ ] open, [B] blocked on user.
 
-## IMMEDIATE NEXT STEPS (fresh session starts here, 11-01)
+## DSV4.1 TERNARY (11-02, ACTIVE - start here)
+
+Project: requantize DeepSeek-V4.1-Flash-1017 (Unsloth UD-Q4_K_XL,
+9 shards, 501.68 GB, 467 GiB) to the fork's PTQ1_0 + PQ2_0 and
+port the missing deepseek41 arch from the upstream clone
+(C:\Users\admin\source\ai\llama.cpp, final state after
+a07421535, read-only git show, never touch its working tree).
+Size + fit + perf + quality expectations and the Unsloth IQ1/2
++ PrismML Bonsai comparison: DESIGN-dsv41-ternary-expectations.md.
+
+Locked user decisions (11-02):
+A. Ternarize the engram table (per_layer_token_embd, 196.61B
+   params): PTQ1_0 43.0 GB / PQ2_0 52.2 GB (not the upstream
+   BF16 escape hatch).
+B. Produce BOTH PTQ1_0 and PQ2_0.
+C. Keep the 9-shard split (1 = KV, 2-7 = experts, 8 = table,
+   9 = misc).
+D. Port the dspark dflash.cpp hunk now (+~263 ln, P0 item 5).
+
+Source facts (measured 11-02, byte-exact, fork GGUF variant):
+748.5B params = 543.58B experts (120 MXFP4 tensors type 39
+[884736, 5120] @ 4.25 bpw = 4.5298B params each, shards 2-7,
+48.13 GB/shard = 288.78 GB) + 8.19B Q8_0 (351 tensors, 8.69 GB,
+incl engram_kv [6144, 25600] blk.1/14, output/token_embd
+[5120, 129280]) + 196.61B table (shard 8, per_layer_token_embd
+[256, 768022850], file type field 43 = MXFP8 33 B/32, 202.76 GB)
++ 0.12B F32 (571 tensors, 0.47 GB, stays F32). Engram tensors
+only in blk.1/blk.14 (engram_gate.weight [5120, 4] F32). All
+tensor dims 128-multiples. Arch: deepseek41, 40 blocks, 384
+experts / 6 used, embd 5120, ctx 1048576, n_vocab 129280,
+hc_mult 4. Cross-check: our 297.94 + 202.76 GB = Unsloth's
+claimed "Rest 297.9" + "MXFP8 202.8" (exact).
+
+P0 [ ] port into the fork (commit order):
+1. ggml MXFP8 = 144 (33 B/32, COUNT -> 145) + dequant (modeled
+   on the fork MXFP4 dequant) + type_traits.
+2. gguf load-time remap: file type field 43 -> MXFP8, guarded
+   by row-size verification (the fork cannot read type-43
+   files today, so no ambiguity).
+3. deepseek41 arch: llama-arch.{cpp,h} (arch + 2 new
+   LLM_TENSOR engram keys + 5 new indexer KV keys + all 92
+   model KVs), llama-hparams.h (net-new PLE section incl
+   ple_n_modules + dsv4_hc_single_pass), models.h, NEW
+   src/models/deepseek41.cpp (adapted from
+   %TEMP%\opencode\up-deepseek41-final.cpp, f32_src param
+   removed, engram_pad_id in hparams, engram_token_map in
+   llama_model), llama-model.{h,cpp}, kv-cache-dsv4.{h,cpp}
+   (+279/+17: comp_il_src, mirror copy, ngram token history),
+   deepseek4.cpp build_hc_mixes split (no f32_src),
+   llama-context.cpp + llama-graph.cpp dsv41 branches (moe
+   weights_sum: ggml_scale_bias(1.0f, 1e-20f) instead of the
+   F16 clamp), 3 ggml log1pf softplus fixes, chat template
+   V4.1. Skip: conversion/deepseek41.py, convert_hf_to_gguf.py,
+   gguf-py hunks, qwen4exp.cpp hunk, tests.
+4. llama-quant.cpp: engram_gate.weight exclusion + accept
+   MXFP8 (and F8_E4M3, upstream 785322d17 pattern) as
+   requantize inputs. No TENSOR_READ_LAZY port (mmap proven
+   for the 288 GB experts; the table follows the same path).
+5. dflash.cpp dspark hunk (+~263) + parsers.
+Reference material in %TEMP%\opencode\: up-deepseek41-final.cpp
+(809 ln), up-deepseek4-{pre,final}.cpp, dsv41-1.diff (2752 ln),
+dsv41-2.diff (393 ln, fully read), fork-vs-up-deepseek4.diff
+(255 ln, fully read). UNREAD before coding: dsv41-1.diff
+:540-1374 (kv-cache-dsv4/.h, llama-kv-cache.cpp, model-loader,
+model-saver, model.{cpp,h}, quant.cpp) + :2330-2739 (dflash.cpp
++ models.h hunks); chat.cpp + parsers hunks :1-251.
+
+P1 [ ] requant: plain PTQ, NO imatrix,
+llama-quantize --allow-requantize, both targets, 9-shard split
+preserved. Tensor map: 120 MXFP4 experts + all 351 Q8_0 ->
+PTQ1_0/PQ2_0; all 571 F32 stay F32. Table path is chunked
+with bounded memory: per-row f32 staging 3.07 GB, output
+staging 43.0/52.2 GB (fits 64 GB RAM), streaming writes.
+Expected outputs: PTQ1_0 164.2 GB (152.8 GiB, 1.76 bpw),
+PQ2_0 199.3 GB (185.3 GiB, 2.13 bpw) - addendum.
+
+P2 [ ] validate: fit verdict below forbids full residency on
+this box, so hybrid offload (GPU ~50-54 GB weights, rest +
+table on CPU, small ctx, live service stopped); load +
+generate + compare vs the live UD-Q4_K_XL service on fixed
+prompts; bench vs N10 anchors; check the t/s + quality ranges
+in the addendum. DSpark drafter (separate Q8_0 7.98 GB / BF16
+8.51 GB files, not local) optional follow-up for the 1.3-1.5x
+decode multiplier.
+
+Fit verdict for THIS machine (2 x 32 GB B70 = 64 GB VRAM,
+63.9 GB RAM, 128 GB total): A) all-on-GPU 152.8 GiB: NO
+(~2.4x over). B) model on GPU + table on CPU: 112.8 GiB
+weights: still NO (~1.8x over). Any fully-resident split:
+152.8 GiB > 128 GB total -> not runnable fully-resident; only
+a mixed GPU/CPU split with a small ctx and the live service
+stopped, decode then CPU-bandwidth-bound. The engram table
+per-token access is KB-scale (a few gathered rows per token),
+so table off-GPU/CPU/SSD is the intended design (Unsloth ships
+the same offload: --override-tensor ...=CPU + mmap), not a
+bandwidth problem. Unsloth's own floor for 1-bit serving is
+128-145 GB RAM+VRAM.
+
+## 11-01 items (background, still open - superseded as the
+start point by the DSV4.1 TERNARY section above)
 
 Context: B12 tensor-mode pivot (10-23, 7cb134632) and the KV wall two
 stages (10-25, 6a30f9157 + db5cf4d80) are SHIPPED; B15 adaptive ctx +
