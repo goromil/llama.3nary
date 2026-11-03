@@ -1,6 +1,48 @@
 # STATE - snapshot (refresh at each milestone)
 
-Last refresh: 2026-11-03 - B21 P0 DONE: the deepseek41 arch is
+Last refresh: 2026-11-03 (night) - B21 P1 DONE: both ternary
+variants of the 9-shard UD-Q4_K_XL file are requantized,
+verified, and on disk (E:\DataVolume\Models\): PTQ1_0
+DeepSeek-V4.1-Flash-1017-PTQ1_0-0000N-of-00009.gguf 152.77 GiB
+(164.03 GB, 1.75 bpw, 62.6 min) and PQ2_0
+DeepSeek-V4.1-Flash-1017-PQ2_0-0000N-of-00009.gguf 185.45 GiB
+(199.06 GB, 2.13 bpw, 62.0 min) - both an EXACT match of the
+dry-run arbiter, 9 shards / 1043 tensors / 0 dupes, offsets
+monotonic, params 748494643824 = source inventory, round-trip
+--dry-run reload exit 0 on both (model size == quant size). The
+196.6B-param engram table went through the new chunked path on
+both runs (184 chunks; data 43009279600 B / 52225553800 B + pad
++ header). Code: chunked path d7d974c3f + u64 array loader
+0ccbdaf26 (pushed earlier this round) + the MXFP8 validator
+case in ggml_validate_row_data (ggml-quants.c, committed this
+refresh - the first real load died at the table on the missing
+case, same gap class as the u64 one; the E4M3 top binade is
+redefined finite so no byte pattern can be NaN/inf). Details +
+all sizes: FINDINGS F42. Live service UNCHANGED.
+
+Previous refresh: 2026-11-03 (evening) - B21 P1 IN PROGRESS: the
+chunked table requant + the u64 array loader fix are committed
++ pushed (d7d974c3f llama-quant : stream oversized tensors to
+the file in row chunks; 0ccbdaf26 llama-model-loader : accept
+uint64/int64 array elements in get_arr). The first real load of
+the 9-shard UD-Q4_K_XL file exposed the loader gap: the 3 PLE
+hash-constant KVs are arr[u64] (fork-extended GGUF value types
+10/11, the only u64 KVs in the file; P0 never ran against the
+file - port + build only). Dry runs (the arbiter) after the
+fix, both exit 0 over all 1043 tensors: PTQ1_0 156433.78 MiB =
+152.77 GiB = 164.03 GB (1.75 bpw) and PQ2_0 189890.56 MiB =
+185.44 GiB = 199.06 GB (2.13 bpw) - both within the PLAN
+figures (164.18 / 199.26 GB) by the small-tensor fine print
+(~-150 MB: tiny norms stay F32, the [24]/[64] fallbacks). Type
+assignments as planned: table [256, 768022850] mxfp8 -> ternary
+(43.0 / 52.2 GB), token_embd + output + blk.1/14 engram_kv
+q8_0 -> ternary. Real PTQ1_0 run RUNNING in the background
+(log %TEMP%\opencode\quant-ptq1.txt), PQ2_0 follows; then
+verify 9 shards + shard-8 data sizes (PTQ1_0 43009279600 B +
+16 pad; PQ2_0 52225553800 B + 8 pad). Details: FINDINGS F42.
+Live service UNCHANGED.
+
+Previous refresh: 2026-11-03 - B21 P0 DONE: the deepseek41 arch is
 ported, built, and pushed. Five source commits on origin/main
 (44f01b2fe -> f760a68da): 95a56055e (ggml : MXFP8=144 dequant +
 softplus log1pf), 36592840e (gguf : file-type-43 remap),
@@ -531,9 +573,17 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 
 ## Git
 
-- branch `main`, pushed HEAD: `f760a68da` (dflash : add the
-  DeepSeek-V4.1 DSpark draft graph (graph_dsv41)). The B21 P0
-  port, pushed 11-03 (F41): `cc41cb618` (quant : skip
+- branch `main`, pushed HEAD: `0ccbdaf26` (llama-model-loader :
+  accept uint64/int64 array elements in get_arr). This refresh
+  (B21 P1 close-out, F42): one source commit on top (ggml :
+  validate MXFP8 row data as always-finite; ggml-quants.c, the
+  3-line validator case that the first real load tripped on) +
+  the docs commit for THIS refresh (F42 + this), committed +
+  pushed together now. B21 P1, pushed 11-03 evening (F42):
+  `0ccbdaf26` + `d7d974c3f` (llama-quant :
+  stream oversized tensors to the file in row chunks), on top of
+  `b7346e6f7` (docs : private sync - B21 P0 done, F41). The B21
+  P0 port, pushed 11-03 (F41): `cc41cb618` (quant : skip
   requantizing the engram gate), `5507dd074` (arch : add the
   deepseek41 architecture), `36592840e` (gguf : remap the engram
   table type on load), `95a56055e` (ggml : add MXFP8 + softplus
@@ -554,19 +604,24 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   `5b8aa1fad` (llama : copy KV rows on device in the in-place
   cache regrow), `9c8772ed8` (llama : adaptive ctx, in-place
   runtime resize), `1011b639d` (fit : tensor-mode context
-  fitting). The docs commit for THIS round (F41 + this refresh)
-  is PENDING.
-  Full list: NOTES.md N12.
-- Working tree: `private/` modified (this refresh, uncommitted) +
-  user's file (do not touch):
-  `tools/ui/src/lib/stores/models/index.svelte.ts`.
-- B21 P0 source tree is COMMITTED + PUSHED (5 commits, F41):
-  working tree is clean of source changes; only `private/` (this
-  refresh) + the user's svelte file are modified.
+  fitting). Full list: NOTES.md N12.
+- Working tree after this round: only the user's file (do not
+  touch): `tools/ui/src/lib/stores/models/index.svelte.ts`.
+- B21 P0 + P1 source tree is COMMITTED + PUSHED (5 + 3 commits,
+  F41/F42): working tree clean of source + docs changes.
 - `private/` = this knowledge library; keep it committed+pushed.
 
 ## Binaries
 
+- `build\bin`: 11-03 (night, F42 close-out) incremental: the
+  llama-quantize rebuild that picked up the ggml-quants.c MXFP8
+  validator case (ggml-quants.c.obj + ggml.dll + llama.dll +
+  llama-quantize.exe, no new warnings) - this is the binary that
+  ran BOTH the PTQ1_0 and PQ2_0 requants to completion, and it
+  now matches the committed tree (the validator case is
+  committed this refresh). Earlier 11-03 (evening): llama-
+  quantize at HEAD 0ccbdaf26 (the u64 get_arr rebuild); llama +
+  llama-cli targets (F41 P0 build).
 - `build\bin`: 10-28 16:12 RECOVERY REBUILD GREEN via the
   hardened build-sycl.ps1 (post VS-2022-shell cache wipe; see
   header): fresh configure, full recompile of the fast TUs
@@ -633,6 +688,8 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 | Qwen3.8-27B-UD-Q6_K (LIVE SERVICE since 10-28 handover) | `E:\DataVolume\Models\Qwen3.8-27B-UD-Q6_K\` | gguf + mmproj-BF16. 65 blocks, 16 full-attn + 48 GDN, embd 5120. The user moved the live service from Q5_K_S to Q6_K at the B17 swap. First post-handover decode: tg 12.53 t/s single-stream (91559-token conversation). |
 | Qwen3.8-27B-UD-Q5_K_S (previous live service) | `E:\DataVolume\Models\Qwen3.8-27B-UD-Q5_K_S\` | 17.38 GB + mtp-Q4_0 draft 1306 MiB + mmproj-BF16. 65 blocks, 16 full-attn + 48 GDN, embd 5120. Tensor mode proven at 160K ctx (31.9 t/s, N10). Still the N17 tensor-bench candidate. |
 | Ternary family (small) | `E:\DataVolume\TernaryModels\` | 2B PTQ1_0, 4B PQ2_0 + 4B/9B MTP Q8_0 variants (co-residency candidates, F17). 10-25: the 10/20 small re-exports carry prism.hadamard.version=2 and are REJECTED by this tree (v1 gate, llama-model.cpp:1198-1201) - only the 9/20 27B files load (F32 finding 2). |
+| DeepSeek-V4.1-Flash-1017 PTQ1_0 (B21 P1, 11-03) | `E:\DataVolume\Models\DeepSeek-V4.1-Flash-1017-PTQ1_0-0000N-of-00009.gguf` (9 shards) | 152.77 GiB (164.03 GB, 1.75 bpw), 1043 tensors; engram table PTQ1_0 in shard 8 (43.01 GB); requantized from UD-Q4_K_XL. Verified 11-03 (structure + round-trip reload, F42). |
+| DeepSeek-V4.1-Flash-1017 PQ2_0 (B21 P1, 11-03) | `E:\DataVolume\Models\DeepSeek-V4.1-Flash-1017-PQ2_0-0000N-of-00009.gguf` (9 shards) | 185.45 GiB (199.06 GB, 2.13 bpw), 1043 tensors; engram table PQ2_0 in shard 8 (52.23 GB); requantized from UD-Q4_K_XL. Verified 11-03 (structure + round-trip reload, F42). |
 
 KV math (F17): KV q5_1 @131072 = 3072 MiB, draft KV q4_0 = 144 MiB,
 GDN recurrent state 598.50 MiB (no per-token growth).
@@ -669,12 +726,12 @@ block; grep by port 8080/58452.
 
 ## Next (11-03)
 
-1. B21 P1 (ACTIVE): chunked bounded-memory table requant path
-   (per-row f32 staging 3.07 GB; PTQ1_0 table output 43.0 GB /
-   PQ2_0 52.2 GB; streaming writes), then llama-quantize
-   --allow-requantize for both targets, 9-shard split preserved.
-   Output targets: PTQ1_0 164.2 GB (152.8 GiB), PQ2_0 199.3 GB
-   (185.3 GiB) (addendum).
+1. DONE 11-03 (night): B21 P1 - both requants finished +
+   verified + on disk (PTQ1_0 152.77 GiB, 62.6 min / PQ2_0
+   185.45 GiB, 62.0 min; 9 shards / 1043 tensors each, exact
+   arbiter match, round-trip --dry-run reload exit 0; F42
+   [verified]). The MXFP8 validator case + this docs refresh are
+   committed + pushed with this round.
 2. B21 P2: [B] needs a macube stop window (user-owned) - hybrid
    split load + generate + fixed-prompt A/B vs the live
    UD-Q4_K_XL service, bench vs N10, check the addendum t/s +

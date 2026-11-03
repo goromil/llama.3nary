@@ -2716,3 +2716,111 @@ still exit 1 at the pre-existing test-dspark-forward LNK2019
 row f32 staging 3.07 GB; PTQ1_0 43.0 GB / PQ2_0 52.2 GB table
 outputs; streaming writes), then llama-quantize --allow-
 requantize for both targets, 9-shard split preserved.
+
+## F42. B21 P1: chunked table requant + u64 array loader (11-03)
+
+[fact 11-03] First real load of the 9-shard UD-Q4_K_XL file
+(P0 only ported + built, never ran against the file) exposed a
+loader gap: the 3 PLE hash-constant KVs are stored as arr[u64]
+(fork-extended GGUF value types 10/11, the only u64 KVs in the
+file; values exceed u32, e.g. multiplier 76632096046245). The
+gguf reader already stores them (gguf.cpp :594-596), but
+llama_model_loader::get_arr<T> accepted only u32/i32/f32/string
+(+bool in the std::array overload) and threw at :332. Fix
+0ccbdaf26: UINT64/INT64 cases in both get_arr type switches
+(T = int64_t/uint64_t), throw messages updated. The P0 port had
+already added the uint64 explicit template instantiations
+(llama-model-loader.cpp :421-423).
+
+[fact 11-03] Chunked table path d7d974c3f (src/llama-quant.cpp,
++96/-41):
+- llama_tensor_dequantize_impl refactored from ggml_tensor* to
+  (ggml_type type, const uint8_t * data, ...) so a chunk can be
+  dequantized from an offset pointer; logic unchanged.
+- Main loop: stage_fits = nelements * (F32 ? 4 : 8) <= 64 GiB.
+  Fits -> standard path, byte-identical flow. Too big -> row-
+  chunked streaming: nrows_chunk = 4 GiB / (4 * n_per_row)
+  floored to a multiple of the gguf alignment (32); per chunk:
+  dequant (offset = (r0 * n_per_row / blck) * type_size; MXFP8
+  blck 32 / 33 B) -> llama_tensor_quantize_impl -> fout.write +
+  zeros pad. Chunk writes are 32-aligned, so the sequential file
+  offsets stay consistent with the gguf context's GGML_PAD
+  math.
+- For the table: nrows_chunk = 4194304 (2^22), 183 full chunks
+  + final 465218 rows; f32 stage exactly 4 GiB, input 1 GiB
+  per chunk; output 224 MiB (PTQ1_0 row 56 B) / 273 MiB
+  (PQ2_0 row 68 B) per chunk. Total written = exactly
+  GGML_PAD(nrows * row_size, 32).
+- bool streamed guards the epilogue write (skipped for chunked
+  tensors); new_data = nullptr there is safe (gguf stores the
+  pointer only; data is already in the file).
+- Constraints: 2D + no imatrix only (the only size that reaches
+  this path; 3D would throw a clear error).
+
+[verified 11-03] Dry runs (llama-quantize --dry-run --allow-
+requantize --keep-split --pure, nthreads 16), both exit 0 after
+the u64 fix, 1043 tensors:
+- PTQ1_0: quant size 156433.78 MiB = 152.77 GiB = 164.03 GB
+  (1.75 bpw) vs the PLAN figure 164.18 GB - within the small-
+  tensor fine print (~-149 MB: tiny norms stay F32, the
+  [24]-wide hc_*_base / [64] attn_sinks fall back off ternary,
+  the [20480, 24] hc_*_fn DO ternarize).
+- PQ2_0: quant size 189890.56 MiB = 185.44 GiB = 199.06 GB
+  (2.13 bpw) vs PLAN 199.26 GB.
+- Type assignments: per_layer_token_embd [256, 768022850]
+  mxfp8 -> ptq1_0 41016.85 MiB (43.01 GB) / pq2_0 49806.17 MiB
+  (52.23 GB); token_embd + output [5120, 129280] q8_0 -> ternary
+  (138.09 / 167.68 MiB each); blk.1/14 engram_kv q8_0 -> ternary
+  (32.81 / 39.84 MiB each); the 571 small F32 tensors + the 351
+  Q8_0 non-expert tensors otherwise as the dry run shows.
+- Expected shard-8 data size: PTQ1_0 43009279600 B + 16 pad;
+  PQ2_0 52225553800 B + 8 pad.
+
+[fact 11-03] First real run (pre-fix build) died at tensor
+121/1043, the table, as predicted: "ggml_validate_row_data:
+invalid type 144" -> "tensor 'per_layer_token_embd.weight' has
+invalid data". llama-quantize validates every tensor it loads
+(llama-model-loader.cpp:1442, check_tensors on), and the switch
+in ggml_validate_row_data (ggml-quants.c:5596) had cases for the
+other fork-private types (PQ2_0/PTQ1_0/MXFP4/NVFP4) but not
+MXFP8 - P0 added the type without extending the validator, same
+gap class as the u64 get_arr one. Fix: a GGML_TYPE_MXFP8 case
+that validates nothing - the E8M0 scale (2^(b-127), 256 finite
+values) times a kvalues_mxfp8 entry (256 finite values, top
+E4M3 binade redefined as finite, max 480) can never be NaN/inf,
+so no byte pattern is invalid (ggml-common.h:1170).
+
+[verified 11-03] Real runs (relaunched after the validator fix,
+detached via Start-Process so they survive server restarts; log
+%TEMP%\opencode\quant-ptq1.txt / quant-pq2.txt, progress to the
+-err files), no warnings, all 1043 tensors each:
+- PTQ1_0: 62.6 min (3754584 ms), quant size 156433.78 MiB - an
+  EXACT match of the dry run. Output
+  DeepSeek-V4.1-Flash-1017-PTQ1_0-0000N-of-00009.gguf, 9 shards,
+  1043 tensors, 0 dupes, total 164,038,559,104 B = 152.77 GiB:
+  shard 1 = 5780608 B (92 KV meta, 0 tensors), shards 2-7 =
+  19818088000 B each (20 PTQ1_0 expert tensors), shard 8 =
+  43009279808 B (the table, 184 chunks through the new path:
+  data 43009279600 B + 16 pad + 192 B header), shard 9 =
+  2114970688 B (922 tensors: 491 F32 + 431 PTQ1_0). Offsets
+  monotonic per shard. Params F32 79208560 + PTQ1_0
+  748415435264 = 748494643824 - matches the source inventory.
+- PQ2_0: 62.0 min (3722289 ms), quant size 189890.56 MiB - exact
+  match. Same layout: shards 2-7 = 24064820800 B each (20
+  PQ2_0), shard 8 = 52225554016 B (table data 52225553800 B + 8
+  pad + 208 B header), shard 9 = 2500273216 B (922: 491 F32 +
+  431 PQ2_0); total 199,120,532,640 B = 185.45 GiB; same param
+  counts.
+- Table row: mxfp8 -> ptq1_0 193365.13 MiB -> 41016.85 MiB, and
+  -> pq2_0 49806.17 MiB - the chunked path output matches the
+  dry-run arbiter to the MiB on both runs.
+- Round-trip: a --dry-run --keep-split --pure reload of each
+  finished 9-shard output exits 0 over 1043/1043 with model size
+  == quant size (156433.78 / 189890.56 MiB) - the keep-split
+  cross-file resolution + fork value types load back cleanly.
+- The 491 F32 tensors are all non-quantizable norms/biases (they
+  stay F32 in both outputs); the 80 hc_fn ex-F32 tensors
+  ternarized as the dry run predicted.
+
+P1 DONE. P2 (load-test + A/B) needs the macube stop window
+(user-owned).
