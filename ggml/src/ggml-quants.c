@@ -5851,6 +5851,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_MXFP8:
+            // the top E4M3 binade is redefined as finite, so no byte pattern can be NaN/inf
+            break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);
