@@ -87,6 +87,16 @@ in the addendum. DSpark drafter (separate Q8_0 7.98 GB / BF16
 8.51 GB files, not local) optional follow-up for the 1.3-1.5x
 decode multiplier.
 
+P2 staged 11-03: recipe complete in private/P2-RUNBOOK.md -
+flag-verified launch lines (KV F16/F16 + FA auto default,
+-ot ...=CPU, -sm layer, -fit on), paper fit PTQ1_0 -ngl 22
+(62.0 GiB GPU + 50.8 GiB CPU + 40 GiB table on disk) / PQ2_0
+-ngl 18 (61.5 GiB GPU, ~16 GiB backbone paged out), KV at
+-c 32768 ~100 MB (non-constraint), 7-prompt fixed A/B set +
+E:\tmp\ab-dsv41.ps1 capture staged (step 0 baseline runs
+against the live 8080 without a stop; stop window = step 1
+only). Awaiting the user's stop window.
+
 Fit verdict for THIS machine (2 x 32 GB B70 = 64 GB VRAM,
 63.9 GB RAM, 128 GB total): A) all-on-GPU 152.8 GiB: NO
 (~2.4x over). B) model on GPU + table on CPU: 112.8 GiB
