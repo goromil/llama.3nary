@@ -353,14 +353,17 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
 ## Services (macube)
 
 - LIVE (do not disturb, user-owned): model Qwen3.8-27B-UD-Q6_K,
-  CURRENT child 49822 on 127.0.0.1:49822 (layer mode, 4 auto
-  slots, unified KV, n_ctx_slot 262144), NEW router on
-  0.0.0.0:8080 (PID not recorded) - the user restarted the whole
-  service after the F39 -np 2 test (old router died ~3.32 min,
-  llama-error.log:16752; 49822 spawned at 10.27 min with the
-  ORIGINAL config, :16786+). Child rotation since the handover:
-  2296 -> 53777 -> 51396 (F39 test 1, default config) -> 57327
-  (F39 test 2, --parallel 2) -> 49822. The child spawns the
+  CURRENT child 141080 on 127.0.0.1:49802, router 511116 on
+  0.0.0.0:8080 - the user restarted the whole service 11-01
+  ~23:55 (router start 11-01 23:54:55, child 141080 spawned
+  11-02 00:45:05; spawn config NOT re-read - the command line is
+  access-denied, the port pattern matches the original line
+  below). Prior instance: child 49822 on 127.0.0.1:49822 (layer
+  mode, 4 auto slots, unified KV, n_ctx_slot 262144, the
+  post-F39 ORIGINAL config, llama-error.log:16786+). Child
+  rotation since the handover: 2296 -> 53777 -> 51396 (F39 test
+  1, default config) -> 57327 (F39 test 2, --parallel 2) ->
+  49822 -> 141080 (11-02 00:45). The child spawns the
   INSTALL-dir exe (C:\Users\admin\.local\3nary-sycl\llama-
   server.exe) - now the e78fe1b51 (timing-gate) binaries,
   user-installed 10-28 (afternoon). Spawn line VERBATIM
@@ -421,9 +424,11 @@ tensor bench (N17) when a card is free -> B7a -> B13 recon.
   Re-derive PIDs: `Get-NetTCPConnection -LocalPort 8080 -State
   Listen` then the child via ParentProcessId (process details
   access-denied for non-service ports).
-- History: (new router, PID not recorded)/49822 (10-28 afternoon,
-  CURRENT - e78fe1b51 install, original config after the user's
-  post-F39 restart), 27804/2296 (10-28 ~02:32 router/child -
+- History: 511116/141080 (11-02 00:45 child, CURRENT - the
+  11-01 ~23:55 user restart, config not re-read),
+  (new router, PID not recorded)/49822 (10-28 afternoon -
+  e78fe1b51 install, original config after the user's post-F39
+  restart), 27804/2296 (10-28 ~02:32 router/child -
   ACTX install, --adaptive-ctx full, Q6_K, the B17 handover;
   replaced by the user's post-F39 restart), 51396 (F39 test-1
   child, default config, 2-chat TG measured), 57327 (F39 test-2
