@@ -2824,3 +2824,107 @@ detached via Start-Process so they survive server restarts; log
 
 P1 DONE. P2 (load-test + A/B) needs the macube stop window
 (user-owned).
+
+## F43. B21 P2: DSV41 mini GGUF load test + three fixes
+(11-04)
+
+[setup 11-04] The real A/B (the 9-shard files, the macube stop
+window) runs on the other machine; this box only validates
+the DSV41 port itself, via a load+generate pass on a
+shortened mini GGUF:
+E:\DataVolume\Models\DeepSeek-V4.1-Flash-1017-mini-N1.gguf,
+8,815,791,424 B, 87 KVs, 27 tensors (the dsv41mini tool cut
+it down from the full file; source at %TEMP%\opencode\dsv41mini).
+Harness: llama-cli with the user's own A/B flags (--jinja
+--numa distribute -cmoe -fa on -fit on -sm layer
+--adaptive-ctx none -c 8192 --temp 1.0 --top-p 0.95 --top-k 20
+--min-p 0.0 --presence-penalty 0.0 --flash-attn on
+--reasoning-preserve --reasoning-budget 4000 --image-max-
+tokens 4000 --image-min-tokens 1024) plus -n 32 and one prompt.
+The runner pipes stdin to the CLI (see [gotcha 11-04] below).
+
+[fact 11-04] The first real load of the mini GGUF failed on a
+tensor the DSV41 loader did not register: blk.N.
+exp_probs_b_vl.bias (the VL variant of the router bias,
+present in the VL checkpoints, not consumed by the text
+graph). Registered as a layer-repeating tensor with
+TENSOR_NOT_REQUIRED + GGML_OP_NONE (llama-arch.h/.cpp,
+llama-model.h, deepseek41.cpp): counted at load, never
+materialized, absent in the text-only files.
+
+[fact 11-04] Second failure, the one that had looked like an
+OOM on the full model earlier: a deterministic NULL-buffer
+crash in llm_graph_input_out_ids::set_input (the is_host
+assert takes a null buffer). Root cause: the DSV41 graph
+constructor ended at res->t_logits = cur without the final
+ggml_build_forward_expand(gf, cur) that deepseek4.cpp
+(:1349/:1491) and every other model have after the logits.
+Without the expand, ggml_visit_parents_graph never visits the
+final chain, so out_ids (consumed only via ggml_get_rows,
+deepseek41.cpp :910-912) never reaches gf->leafs: no buffer
+is allocated for it, the name stays empty, and the assert
+crashes on null. Fix: the one missing call.
+
+[verified 11-04] The crash reproduces on the 8.2 GB mini, where
+memory pressure is impossible, and is gone after the fix: a
+temporary diagnostic in set_input (removed before commit; the
+clean rebuild verified by artifact mtimes) showed name= empty
++ buffer=0 pre-fix, name=leaf_32 + a valid buffer on all 32
+decode steps post-fix. Revision: the earlier warmup crash of
+the full model on this box was this deterministic bug, not an
+OOM.
+
+[fact 11-04] Third failure: the mini GGUF embeds the Unsloth
+port of the DS41 chat template, which calls dict(iterable,
+kw=...) in 7 places; the fork jinja engine had no dict
+builtin and aborted template parsing. Ported upstream's
+toobject() helper + the {"dict", toobject} builtin, and
+rewrote the existing namespace builtin to delegate to it
+(namespace sets has_builtins = false, so ns.x stays a plain
+attribute as in jinja2). The port was mechanical: the fork's
+value_object_t already carries has_builtins, get_builtins()
+already honors it, and func_args::get_pos(pos, default)
+matches upstream.
+
+[verified 11-04] Full pass (run #7, diagnostics build): prompt
+eval 1099.91 ms / 40 tokens (36.37 t/s), generation 316.37 ms
+/ 32 tokens (97.99 t/s), stopped by limit, n_gen = 32,
+n_predict = 32, finish_reason "length", graphs reused = 31.
+No jinja error, no NULL-buffer assert, all 32 decode steps
+clean. The generated text is incoherent - expected, the mini
+weights are truncated; the target is the load+generate
+pipeline, not quality.
+
+[verified 11-04] Final clean run (diagnostics compiled out,
+detached runner): prompt 901.63 ms / 40 tokens (44.36 t/s),
+generation 208.85 ms / 32 tokens (148.43 t/s), stopped by
+limit, n_gen = 32, n_predict = 32, finish_reason "length", no
+diagnostic output, no asserts.
+
+[gotcha 11-04] llama-cli in this fork does not exit after a
+one-shot -p run. With stdin that never receives EOF (the
+harness background pipe) it enters an interactive REPL ("> "
+prompt) and busy-looped in run #7: the log grew to 16,130,705
+lines of ">" prompts, rc=1. With piped stdin (immediate EOF)
+it instead keeps the embedded server alive in a 1 Hz "all
+slots are idle" loop. Harness artifact, not a product bug.
+[Console]::SetIn does not help (the child inherits the OS
+stdin handle); pipe stdin ($null = '' | .\llama-cli.exe ...,
+or -RedirectStandardInput to an empty file) to suppress the
+REPL. Teardown: record the pid, Stop-Process it (ours, safe).
+
+[gotcha 11-04] The opencode harness restart cancels its
+background shell trees: one rerun's CLI died with
+rc=0xC0000065 (STATUS_FATAL_APP_EXIT, an external kill) even
+though generation had already finished. The robust runner is
+the Start-Process detached pattern (proven on the PQ2_0
+quantize, F42): the CLI gets its own redirected
+stdout/stderr/stdin and survives harness restarts. Caveat:
+Start-Process -ArgumentList does not quote elements with
+spaces - the prompt must be quoted manually, or -p eats only
+its first word and the rest are rejected as positional args.
+
+P2 load test done (this box). The real A/B (PTQ1_0 / PQ2_0 /
+baseline, the 9-shard files) still needs the macube stop
+window on the other machine; the A/B verdict appends to this
+entry.

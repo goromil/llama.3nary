@@ -1,10 +1,11 @@
 # P2 RUNBOOK - DeepSeek-V4.1-Flash-1017 ternary A/B (11-03)
 
-Status: staged. Nothing here touches the live service until
-step 1. Step 0 runs against the running 8080 service and is
-read-only (7 short prompts, sequential, ~5-10 min at the
-baseline t/s). The stop window is step 1 only, one user
-action.
+Status: staged - load test done on this box (11-04, F43),
+the A/B itself still pending. Nothing here touches the live
+service until step 1. Step 0 runs against the running 8080
+service and is read-only (7 short prompts, sequential, ~5-10
+min at the baseline t/s). The stop window is step 1 only,
+one user action.
 
 ## Locked decisions (11-02)
 
@@ -29,11 +30,18 @@ action.
   router pid 511116 @ 0.0.0.0:8080 (recorded 774dbb6e3;
   re-derive via Get-NetTCPConnection -LocalPort 8080 before
   touching anything; child was 141080 @ 127.0.0.1:49802).
-- Binary: build\bin\llama-server.exe (HEAD 774dbb6e3, no
-  source changes since - no rebuild needed).
+- Binary: build\bin\llama-server.exe, rebuilt on the other
+  machine from 75138825b (or later). A pre-F43 build
+  (774dbb6e3 + docs only) has the full port but crashes on
+  any DSV41 load (deterministic NULL-buffer assert from the
+  missing final graph expand, F43).
 - A/B capture: %TEMP%\opencode\ab-dsv41.ps1, copied to
   E:\tmp\ab-dsv41.ps1 at run time; outputs to
   E:\tmp\ab-dsv41\{baseline,ptq1,pq2}\.
+- Mini (load test, F43): E:\DataVolume\Models\DeepSeek-
+  V4.1-Flash-1017-mini-N1.gguf, 8,815,791,424 B; kit for
+  the other machine (tool source + build.bat + ab-dsv41.ps1
+  + runner + inv.txt + README) staged at E:\tmp\dsv41mini.
 
 ## Launch lines (flags verified against common/arg.cpp +
 ## common.h + llama-context.cpp)
@@ -116,6 +124,28 @@ Ladder on startup failure: drop -ngl by 2 (22 -> 20 -> 18 /
 18 -> 16), read the printed estimate first, never raise it
 blindly.
 
+## Load test (this box, done 11-04, F43)
+
+The 9-shard A/B runs on the other machine; this box
+validates the port itself on the mini GGUF:
+llama-cli with the A/B flags (--jinja --numa distribute
+-cmoe -fa on -fit on -sm layer --adaptive-ctx none -c 8192
+--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
+--presence-penalty 0.0 --flash-attn on --reasoning-preserve
+--reasoning-budget 4000 --image-max-tokens 4000 --image-
+min-tokens 1024) + -n 32 + one prompt.
+Runner: %TEMP%\opencode\run-load-test.ps1 (detached
+Start-Process, empty-file stdin, recorded pid; F43 has the
+two CLI gotchas it works around).
+Result: PASS - prompt 44.36 t/s (40 tokens), generation
+148.43 t/s (32 tokens), finish_reason "length", no jinja
+error, no asserts. Output incoherent by construction
+(truncated weights); pipeline verification, not quality.
+Three source fixes came out of it: exp_probs_b_vl
+registration, the missing final ggml_build_forward_expand
+(the deterministic NULL-buffer crash that had looked like
+an OOM), and the jinja dict() builtin.
+
 ## A/B protocol
 
 Fixed prompt set (closes DESIGN section 7, item 2):
@@ -171,8 +201,9 @@ t/s priors (f6 traffic, f7/f8 anchors):
    service; confirm 8080 answers and the child spawned.
 5. Compare: per prompt, read baseline/ptq1/pq2 responses
    side by side; tabulate t/s; write the verdict to
-   PLAN.md P2 + a FINDINGS entry (F43); close DESIGN
-   section 7 item 2; commit private/ + push.
+   PLAN.md P2 + append it to the FINDINGS F43 entry
+   (load test); close DESIGN section 7 item 2; commit
+   private/ + push.
 
 ## Risks and abort criteria
 
