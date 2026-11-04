@@ -203,6 +203,13 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 		try {
 			const response = await ModelsService.listRouter();
 
+			if (!response?.data) {
+				console.warn('[modelsStore] fetchRouterModels: missing response.data');
+				this.routerModels = [];
+
+				return;
+			}
+
 			this.routerModels = response.data;
 			await this.props.fetchModalitiesForLoadedModels();
 
@@ -361,7 +368,9 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 	private buildModelOptions(
 		response: ApiModelListResponse | ApiRouterModelsListResponse
 	): ModelOption[] {
-		return response.data.map((item: ApiModelDataEntry, index: number) => {
+		const dataArray = response?.data ?? [];
+
+		return dataArray.map((item: ApiModelDataEntry, index: number) => {
 			const details = response.models?.[index];
 			const rawCapabilities = Array.isArray(details?.capabilities) ? details?.capabilities : [];
 			const displayNameSource =
@@ -387,6 +396,10 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 	/** Fetch models in MODEL mode (single model, standard OpenAI-compatible). */
 	private async fetchModelModeInternal(): Promise<ModelOption[]> {
 		const response = await ModelsService.list();
+
+		if (!response?.data) {
+			throw new Error('Invalid model list response');
+		}
 
 		return this.buildModelOptions(response);
 	}
@@ -423,6 +436,11 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 
 			if (router) {
 				const response = await ModelsService.listRouter();
+
+				if (!response?.data) {
+					this.error = 'Invalid model list response from server';
+					throw new Error('Invalid model list response');
+				}
 
 				this.routerModels = response.data;
 				this.models = this.buildModelOptions(response);
