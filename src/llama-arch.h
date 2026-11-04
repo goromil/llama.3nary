@@ -726,6 +726,7 @@ enum llm_tensor {
     LLM_TENSOR_DFLY_HC_GATE,
     LLM_TENSOR_DFLY_HC_UP,
     LLM_TENSOR_DFLY_HC_DOWN,
+    LLM_TENSOR_FFN_EXP_PROBS_B_VL,
 };
 
 enum llm_tensor_layer {

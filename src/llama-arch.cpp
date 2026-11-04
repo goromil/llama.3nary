@@ -712,6 +712,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DSPARK_CORR_DOWN,         "dspark.correction_down"         },
     { LLM_TENSOR_ENGRAM_KV,                "blk.%d.engram_kv"               },
     { LLM_TENSOR_ENGRAM_GATE,              "blk.%d.engram_gate"             },
+    { LLM_TENSOR_FFN_EXP_PROBS_B_VL,       "blk.%d.exp_probs_b_vl"          },
 };
 
 // declare information about the model weight tensors:
@@ -900,6 +901,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     { LLM_TENSOR_FFN_GATE_CHEXPS,          { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID } },
     { LLM_TENSOR_FFN_UP_CHEXPS,            { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID } },
     { LLM_TENSOR_FFN_EXP_PROBS_B,          { LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD }        },
+    { LLM_TENSOR_FFN_EXP_PROBS_B_VL,       { LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE }       },
     // altup / laurel (gemma 3n)
     { LLM_TENSOR_PER_LAYER_TOKEN_EMBD,     { LLM_TENSOR_LAYER_INPUT, GGML_OP_GET_ROWS }       },
     { LLM_TENSOR_PER_LAYER_MODEL_PROJ,     { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
